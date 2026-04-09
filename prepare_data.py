@@ -6,6 +6,9 @@ Pulls OHLCV data directly from PostgreSQL and prepares it for ML training.
 Applies trading strategy signals as additional features.
 """
 
+import argparse
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 from typing import Tuple, Dict, List, Optional
@@ -312,6 +315,46 @@ class DataPreparator:
 
         return X_scaled, y
 
+    def _save_dataframe_with_fallback(self, df: pd.DataFrame, file_path: Path) -> Path:
+        """Save a DataFrame to parquet if available, otherwise fall back to CSV."""
+        try:
+            df.to_parquet(file_path, index=False)
+            return file_path
+        except (ImportError, ValueError) as exc:
+            csv_path = file_path.with_suffix('.csv')
+            print(f"  - Parquet save failed ({exc}). Falling back to CSV: {csv_path.name}")
+            df.to_csv(csv_path, index=False)
+            return csv_path
+
+    def save_timeframe_parquets(
+        self,
+        df: pd.DataFrame,
+        output_dir: str = 'data'
+    ) -> None:
+        """
+        Save each timeframe's prepared data into parquet files, with a CSV fallback.
+
+        Args:
+            df: Prepared DataFrame with a 'timeframe' column.
+            output_dir: Relative output folder name.
+        """
+        project_root = Path(__file__).resolve().parent
+        output_path = project_root / output_dir
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        print(f"Saving prepared data to: {output_path}")
+
+        for timeframe in sorted(df['timeframe'].dropna().unique()):
+            timeframe_safe = str(timeframe).replace('/', '_').replace(' ', '_')
+            file_path = output_path / f"{timeframe_safe}.parquet"
+            tf_data = df[df['timeframe'] == timeframe].copy()
+            saved_path = self._save_dataframe_with_fallback(tf_data, file_path)
+            print(f"  - Saved {len(tf_data)} rows for timeframe '{timeframe}' to {saved_path.name}")
+
+        combined_file = output_path / "all_timeframes.parquet"
+        saved_combined = self._save_dataframe_with_fallback(df, combined_file)
+        print(f"  - Saved combined dataset to {saved_combined.name}")
+
     def prepare_data(
         self,
         timeframes: List[str] = None,
@@ -345,6 +388,9 @@ class DataPreparator:
 
         # Step 4: Create lagged features
         data = self.create_lagged_features(data, lag_periods)
+
+        # Save prepared timeframe data to parquet files
+        self.save_timeframe_parquets(data)
 
         # Step 5: Prepare features and target
         X, y = self.prepare_features_and_target(data)
@@ -382,18 +428,31 @@ def prepare_data(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prepare OHLCV data and save parquet files for specified timeframes.")
+    parser.add_argument(
+        "--timeframes",
+        nargs="+",
+        default=["10min"],
+        help="Timeframes to prepare (e.g. 5min 10min 1h). Default: 10min"
+    )
+    parser.add_argument("--start-date", type=str, default=None, help="Start date filter (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default=None, help="End date filter (YYYY-MM-DD)")
+    parser.add_argument("--lag-periods", type=int, default=5, help="Number of lag periods for features")
+
+    args = parser.parse_args()
+
     print("=" * 60)
     print("DATA PREPARATION TEST")
     print("=" * 60)
 
     try:
-        # Test data preparation with sample parameters
         preparator = DataPreparator()
 
-        # Fetch a small sample for testing
         X, y, raw_data = preparator.prepare_data(
-            timeframes=['1min'],
-            lag_periods=5
+            timeframes=args.timeframes,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            lag_periods=args.lag_periods
         )
 
         print("\n" + "=" * 60)
