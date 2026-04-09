@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
 import pandas as pd
 from sqlalchemy import create_engine
+from urllib.parse import quote_plus
 
 
 # Load environment variables from .env file
@@ -50,7 +51,9 @@ class DatabaseConnection:
             self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
             
             # Create SQLAlchemy engine for pandas compatibility
-            db_url = f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+            # URL-encode password to handle special characters
+            encoded_password = quote_plus(self.password)
+            db_url = f"postgresql+psycopg2://{self.user}:{encoded_password}@{self.host}:{self.port}/{self.database}"
             self.engine = create_engine(db_url)
             
             print(f"✓ Connected to PostgreSQL database: {self.database}")
