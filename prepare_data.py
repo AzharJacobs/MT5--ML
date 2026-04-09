@@ -171,6 +171,26 @@ class DataPreparator:
         # Time-based cyclical features (for better pattern recognition)
         df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
         df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+
+        if not pd.api.types.is_numeric_dtype(df['day_of_week']):
+            day_map = {
+                'monday': 0,
+                'tuesday': 1,
+                'wednesday': 2,
+                'thursday': 3,
+                'friday': 4,
+                'saturday': 5,
+                'sunday': 6
+            }
+            df['day_of_week'] = (
+                df['day_of_week']
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .map(day_map)
+            )
+            df['day_of_week'] = pd.to_numeric(df['day_of_week'], errors='coerce').fillna(0).astype(int)
+
         df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
         df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
         df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
