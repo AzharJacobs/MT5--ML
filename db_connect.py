@@ -10,6 +10,7 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
 import pandas as pd
+from sqlalchemy import create_engine
 
 
 # Load environment variables from .env file
@@ -31,6 +32,7 @@ class DatabaseConnection:
         self.password = os.getenv('DB_PASSWORD', '')
         self.connection: Optional[psycopg2.extensions.connection] = None
         self.cursor: Optional[psycopg2.extensions.cursor] = None
+        self.engine = None  # SQLAlchemy engine for pandas
 
     def connect(self) -> bool:
         """
@@ -46,6 +48,11 @@ class DatabaseConnection:
                 password=self.password
             )
             self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+            
+            # Create SQLAlchemy engine for pandas compatibility
+            db_url = f"postgresql+psycopg2://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+            self.engine = create_engine(db_url)
+            
             print(f"✓ Connected to PostgreSQL database: {self.database}")
             return True
         except psycopg2.Error as e:
@@ -98,7 +105,7 @@ class DatabaseConnection:
             self.connect()
 
         try:
-            df = pd.read_sql_query(query, self.connection, params=params)
+            df = pd.read_sql_query(query, self.engine, params=params)
             return df
         except Exception as e:
             print(f"✗ Failed to fetch DataFrame: {e}")
