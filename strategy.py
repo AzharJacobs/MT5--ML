@@ -39,246 +39,519 @@ import pandas as pd
 import numpy as np
 from typing import Optional
 
-
 # =============================================================================
 # STRATEGY CONFIGURATION
 # =============================================================================
-
-# Number of previous candles to consider for pattern recognition
-LOOKBACK_PERIODS = 5
-
+ 
+# Number of previous candles to consider for zone detection and pattern recognition
+LOOKBACK_PERIODS = 20
+ 
 # Strategy name (for logging purposes)
-STRATEGY_NAME = "Custom Trading Strategy"
-
+STRATEGY_NAME = "Zone-to-Zone Trading Strategy"
+ 
 # Enable/disable specific strategy components
-USE_CANDLESTICK_PATTERNS = True
-USE_TIME_FILTERS = True
-USE_MOMENTUM_RULES = True
-USE_VOLUME_FILTERS = True
-
-
+USE_ZONE_DETECTION = True        # Core: identify supply/demand zones
+USE_CONFIRMATION_PATTERNS = True # Look for engulfing, pin bars, rejection wicks
+USE_TIME_FILTERS = True          # Avoid low-activity hours
+USE_ZONE_FRESHNESS = True        # Prefer zones that haven't been touched before
+USE_MIDLINE_TP = True            # Use 50% midpoint between zones as take-profit
+ 
+# Zone detection thresholds
+STRONG_MOVE_THRESHOLD = 0.003    # Minimum % move to qualify as strong departure (0.3%)
+ZONE_BODY_RATIO_MIN = 0.6        # Minimum body/candle ratio for a strong zone candle
+ZONE_TOUCH_TOLERANCE = 0.001     # How close price needs to be to zone boundary (0.1%)
+MAX_ZONE_AGE = 50                # Discard zones older than this many candles
+MIN_ZONE_CANDLES = 2             # Minimum consecutive strong candles to form a zone
+ 
+ 
 # =============================================================================
-# MAIN STRATEGY FUNCTION - MODIFY THIS!
+# ZONE DETECTION HELPERS
 # =============================================================================
-
+ 
+def detect_demand_zone(lookback_data: pd.DataFrame) -> dict | None:
+    """
+    Detect the most recent valid demand zone from lookback data.
+ 
+    A demand zone is identified by:
+    - Strong bullish candles (long bodies, sharp move up)
+    - Break of structure upward after the zone
+    - Sometimes a V-shape reversal
+ 
+    Returns a dict with zone 'high' and 'low' price levels, or None.
+    """
+    if lookback_data is None or len(lookback_data) < MIN_ZONE_CANDLES + 1:
+        return None
+ 
+    for i in range(len(lookback_data) - 2, MIN_ZONE_CANDLES - 2, -1):
+        candle = lookback_data.iloc[i]
+        candle_range = candle['high'] - candle['low']
+        if candle_range == 0:
+            continue
+ 
+        body = abs(candle['close'] - candle['open'])
+        body_ratio = body / candle_range
+ 
+        is_bullish = candle['close'] > candle['open']
+        is_strong = body_ratio >= ZONE_BODY_RATIO_MIN
+ 
+        if not (is_bullish and is_strong):
+            continue
+ 
+        # Check for strong upward departure AFTER this candle
+        future_candles = lookback_data.iloc[i + 1:]
+        if len(future_candles) < 1:
+            continue
+ 
+        departure_move = (future_candles['close'].max() - candle['high']) / candle['high']
+        if departure_move < STRONG_MOVE_THRESHOLD:
+            continue
+ 
+        return {
+            'high': candle['high'],
+            'low':  candle['low'],
+            'age':  len(lookback_data) - 1 - i,
+            'type': 'demand'
+        }
+ 
+    return None
+ 
+ 
+def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
+    """
+    Detect the most recent valid supply zone from lookback data.
+ 
+    A supply zone is identified by:
+    - Strong bearish candles (long bodies, sharp move down)
+    - Break of structure downward after the zone
+    - Clear rejection wick or engulfing pattern
+ 
+    Returns a dict with zone 'high' and 'low' price levels, or None.
+    """
+    if lookback_data is None or len(lookback_data) < MIN_ZONE_CANDLES + 1:
+        return None
+ 
+    for i in range(len(lookback_data) - 2, MIN_ZONE_CANDLES - 2, -1):
+        candle = lookback_data.iloc[i]
+        candle_range = candle['high'] - candle['low']
+        if candle_range == 0:
+            continue
+ 
+        body = abs(candle['close'] - candle['open'])
+        body_ratio = body / candle_range
+ 
+        is_bearish = candle['close'] < candle['open']
+        is_strong = body_ratio >= ZONE_BODY_RATIO_MIN
+ 
+        if not (is_bearish and is_strong):
+            continue
+ 
+        # Check for strong downward departure AFTER this candle
+        future_candles = lookback_data.iloc[i + 1:]
+        if len(future_candles) < 1:
+            continue
+ 
+        departure_move = (candle['low'] - future_candles['close'].min()) / candle['low']
+        if departure_move < STRONG_MOVE_THRESHOLD:
+            continue
+ 
+        return {
+            'high': candle['high'],
+            'low':  candle['low'],
+            'age':  len(lookback_data) - 1 - i,
+            'type': 'supply'
+        }
+ 
+    return None
+ 
+ 
+def price_in_zone(price: float, zone: dict, tolerance: float = ZONE_TOUCH_TOLERANCE) -> bool:
+    """Check if current price is within or touching a zone (with tolerance buffer)."""
+    zone_low  = zone['low']  * (1 - tolerance)
+    zone_high = zone['high'] * (1 + tolerance)
+    return zone_low <= price <= zone_high
+ 
+ 
+def zone_is_fresh(zone: dict) -> bool:
+    """
+    Zones that haven't been touched before are more reliable.
+    Uses zone age as a proxy — fresher zones score higher.
+    """
+    return zone['age'] <= MAX_ZONE_AGE
+ 
+ 
+# =============================================================================
+# CONFIRMATION PATTERN HELPERS
+# =============================================================================
+ 
+def is_bullish_engulfing(current_candle: pd.Series, prev_candle: pd.Series) -> bool:
+    """Previous bearish, current bullish and fully engulfs previous body."""
+    return (
+        prev_candle['close'] < prev_candle['open'] and
+        current_candle['close'] > current_candle['open'] and
+        current_candle['open'] < prev_candle['close'] and
+        current_candle['close'] > prev_candle['open']
+    )
+ 
+ 
+def is_bearish_engulfing(current_candle: pd.Series, prev_candle: pd.Series) -> bool:
+    """Previous bullish, current bearish and fully engulfs previous body."""
+    return (
+        prev_candle['close'] > prev_candle['open'] and
+        current_candle['close'] < current_candle['open'] and
+        current_candle['open'] > prev_candle['close'] and
+        current_candle['close'] < prev_candle['open']
+    )
+ 
+ 
+def is_pin_bar_bullish(candle: pd.Series) -> bool:
+    """
+    Bullish pin bar / hammer: long lower wick, small body, small upper wick.
+    Signals rejection of lower prices — buy confirmation in demand zone.
+    """
+    candle_size = candle.get('candle_size', candle['high'] - candle['low'])
+    body_size   = candle.get('body_size', abs(candle['close'] - candle['open']))
+    wick_lower  = candle.get('wick_lower', 0)
+    wick_upper  = candle.get('wick_upper', 0)
+ 
+    if candle_size == 0 or body_size == 0:
+        return False
+ 
+    return (
+        wick_lower > body_size * 2 and
+        wick_upper < body_size * 0.5 and
+        body_size / candle_size < 0.4
+    )
+ 
+ 
+def is_pin_bar_bearish(candle: pd.Series) -> bool:
+    """
+    Bearish pin bar / shooting star: long upper wick, small body, small lower wick.
+    Signals rejection of higher prices — sell confirmation in supply zone.
+    """
+    candle_size = candle.get('candle_size', candle['high'] - candle['low'])
+    body_size   = candle.get('body_size', abs(candle['close'] - candle['open']))
+    wick_lower  = candle.get('wick_lower', 0)
+    wick_upper  = candle.get('wick_upper', 0)
+ 
+    if candle_size == 0 or body_size == 0:
+        return False
+ 
+    return (
+        wick_upper > body_size * 2 and
+        wick_lower < body_size * 0.5 and
+        body_size / candle_size < 0.4
+    )
+ 
+ 
+def is_higher_low(lookback_data: pd.DataFrame, periods: int = 3) -> bool:
+    """Recent lows forming a higher low — bullish market structure."""
+    if lookback_data is None or len(lookback_data) < periods:
+        return False
+    lows = lookback_data.tail(periods)['low'].values
+    return all(lows[i] > lows[i - 1] for i in range(1, len(lows)))
+ 
+ 
+def is_lower_high(lookback_data: pd.DataFrame, periods: int = 3) -> bool:
+    """Recent highs forming a lower high — bearish market structure."""
+    if lookback_data is None or len(lookback_data) < periods:
+        return False
+    highs = lookback_data.tail(periods)['high'].values
+    return all(highs[i] < highs[i - 1] for i in range(1, len(highs)))
+ 
+ 
+# =============================================================================
+# MAIN STRATEGY FUNCTION — ZONE-TO-ZONE
+# =============================================================================
+ 
 def apply_strategy(
     current_candle: pd.Series,
     lookback_data: pd.DataFrame = None
 ) -> str:
     """
-    Apply your personal trading strategy to determine buy/sell signal.
-
-    THIS IS THE MAIN FUNCTION TO MODIFY WITH YOUR TRADING RULES!
-
+    Apply the Zone-to-Zone Trading Strategy to determine buy/sell signal.
+ 
+    Core logic (5 steps from the strategy document):
+      1. Identify strong supply and demand zones from historical candles.
+      2. Wait for price to RETURN to a zone — do not chase mid-range moves.
+      3. Look for confirmation inside the zone (engulfing, pin bar, rejection wick,
+         higher low / lower high structure).
+      4. Enter in the direction of the zone; target the NEXT opposite zone.
+      5. Never trade in no-man's land (between zones).
+ 
     Args:
-        current_candle: pandas Series containing current candle data
-        lookback_data: DataFrame containing previous N candles (oldest to newest)
-
+        current_candle: pandas Series with current candle OHLCV data.
+        lookback_data:  DataFrame of previous N candles (oldest → newest).
+ 
     Returns:
-        'buy' - Strategy signals a buy
-        'sell' - Strategy signals a sell
-        'neutral' - No clear signal
+        'buy'     — Price is in a demand zone with bullish confirmation.
+        'sell'    — Price is in a supply zone with bearish confirmation.
+        'neutral' — Price is between zones, no confirmation, or time-filtered.
     """
-
-    # Initialize signal
+ 
     signal = 'neutral'
-
-    # ==========================================================================
-    # EXAMPLE STRATEGY RULES - REPLACE WITH YOUR OWN!
-    # ==========================================================================
-
-    # Extract current candle data
-    open_price = current_candle['open']
-    high_price = current_candle['high']
-    low_price = current_candle['low']
+ 
+    if lookback_data is None or len(lookback_data) < LOOKBACK_PERIODS:
+        return signal
+ 
     close_price = current_candle['close']
-    volume = current_candle.get('volume', 0)
-    candle_size = current_candle.get('candle_size', high_price - low_price)
-    body_size = current_candle.get('body_size', abs(close_price - open_price))
-    wick_upper = current_candle.get('wick_upper', 0)
-    wick_lower = current_candle.get('wick_lower', 0)
-    hour = current_candle.get('hour', 0)
-    day_of_week = current_candle.get('day_of_week', 0)
-
+    open_price  = current_candle['open']
+    hour        = current_candle.get('hour', 12)
+    day_of_week = current_candle.get('day_of_week', 1)
+ 
     # --------------------------------------------------------------------------
-    # RULE 1: Candlestick Pattern Recognition
+    # TIME FILTER — avoid low-activity sessions
     # --------------------------------------------------------------------------
-    if USE_CANDLESTICK_PATTERNS and candle_size > 0:
-        body_ratio = body_size / candle_size if candle_size > 0 else 0
-
-        # Bullish Engulfing Pattern Check
-        if lookback_data is not None and len(lookback_data) >= 1:
-            prev_candle = lookback_data.iloc[-1]
-            prev_close = prev_candle['close']
-            prev_open = prev_candle['open']
-
-            # Bullish engulfing: previous was bearish, current is bullish and engulfs
-            if (prev_close < prev_open and  # Previous was bearish
-                close_price > open_price and  # Current is bullish
-                open_price < prev_close and  # Opens below previous close
-                close_price > prev_open):  # Closes above previous open
+    if USE_TIME_FILTERS:
+        low_activity_hours = [0, 1, 2, 3, 4, 5, 22, 23]
+        if hour in low_activity_hours or day_of_week in [5, 6]:
+            return 'neutral'
+ 
+    # --------------------------------------------------------------------------
+    # STEP 1 — Identify supply and demand zones
+    # --------------------------------------------------------------------------
+    if not USE_ZONE_DETECTION:
+        return signal
+ 
+    demand_zone = detect_demand_zone(lookback_data)
+    supply_zone = detect_supply_zone(lookback_data)
+ 
+    # --------------------------------------------------------------------------
+    # STEP 2 — Check if price has RETURNED to a zone (never trade mid-range)
+    # --------------------------------------------------------------------------
+    in_demand_zone = demand_zone is not None and price_in_zone(close_price, demand_zone)
+    in_supply_zone = supply_zone is not None and price_in_zone(close_price, supply_zone)
+ 
+    if not in_demand_zone and not in_supply_zone:
+        return 'neutral'  # Price is between zones — no trade
+ 
+    # --------------------------------------------------------------------------
+    # ZONE FRESHNESS — fresher zones are more reliable
+    # --------------------------------------------------------------------------
+    if USE_ZONE_FRESHNESS:
+        if in_demand_zone and not zone_is_fresh(demand_zone):
+            in_demand_zone = False
+        if in_supply_zone and not zone_is_fresh(supply_zone):
+            in_supply_zone = False
+ 
+    if not in_demand_zone and not in_supply_zone:
+        return 'neutral'
+ 
+    # --------------------------------------------------------------------------
+    # STEP 3 — Look for confirmation inside the zone
+    # --------------------------------------------------------------------------
+    prev_candle = lookback_data.iloc[-1] if len(lookback_data) >= 1 else None
+ 
+    if USE_CONFIRMATION_PATTERNS and prev_candle is not None:
+ 
+        # BUY confirmation inside demand zone
+        if in_demand_zone:
+            bullish_engulf  = is_bullish_engulfing(current_candle, prev_candle)
+            bullish_pin     = is_pin_bar_bullish(current_candle)
+            higher_low      = is_higher_low(lookback_data, periods=3)
+            current_bullish = close_price > open_price
+ 
+            # Signal fires on any valid confirmation
+            if bullish_engulf or bullish_pin or (higher_low and current_bullish):
                 signal = 'buy'
-
-            # Bearish engulfing: previous was bullish, current is bearish and engulfs
-            elif (prev_close > prev_open and  # Previous was bullish
-                  close_price < open_price and  # Current is bearish
-                  open_price > prev_close and  # Opens above previous close
-                  close_price < prev_open):  # Closes below previous open
+ 
+        # SELL confirmation inside supply zone
+        if in_supply_zone and signal == 'neutral':
+            bearish_engulf  = is_bearish_engulfing(current_candle, prev_candle)
+            bearish_pin     = is_pin_bar_bearish(current_candle)
+            lower_high      = is_lower_high(lookback_data, periods=3)
+            current_bearish = close_price < open_price
+ 
+            if bearish_engulf or bearish_pin or (lower_high and current_bearish):
                 signal = 'sell'
-
-        # Hammer Pattern (bullish reversal)
-        if signal == 'neutral':
-            if (wick_lower > body_size * 2 and  # Long lower wick
-                wick_upper < body_size * 0.5 and  # Small upper wick
-                body_ratio < 0.4):  # Small body
-                signal = 'buy'
-
-        # Shooting Star Pattern (bearish reversal)
-        if signal == 'neutral':
-            if (wick_upper > body_size * 2 and  # Long upper wick
-                wick_lower < body_size * 0.5 and  # Small lower wick
-                body_ratio < 0.4):  # Small body
-                signal = 'sell'
-
+ 
+    else:
+        # Aggressive entry: enter at zone boundary without waiting for confirmation
+        if in_demand_zone:
+            signal = 'buy'
+        elif in_supply_zone:
+            signal = 'sell'
+ 
     # --------------------------------------------------------------------------
-    # RULE 2: Time-Based Filters
+    # STEP 4 & 5 — Signal is set; SL/TP are calculated externally via helpers
     # --------------------------------------------------------------------------
-    if USE_TIME_FILTERS and signal != 'neutral':
-        # Avoid trading during low-activity hours (adjust to your preference)
-        low_activity_hours = [0, 1, 2, 3, 4, 5, 22, 23]  # Late night/early morning
-        if hour in low_activity_hours:
-            signal = 'neutral'  # Override signal during low activity
-
-        # Weekend filter (if your data includes weekends)
-        if day_of_week in [5, 6]:  # Saturday, Sunday
-            signal = 'neutral'
-
-    # --------------------------------------------------------------------------
-    # RULE 3: Momentum Rules
-    # --------------------------------------------------------------------------
-    if USE_MOMENTUM_RULES and lookback_data is not None and len(lookback_data) >= 3:
-        # Check for momentum (3 consecutive candles in same direction)
-        recent_candles = lookback_data.tail(3)
-
-        if signal == 'neutral':
-            # Bullish momentum: 3 consecutive bullish candles
-            bullish_count = sum(1 for _, c in recent_candles.iterrows()
-                              if c['close'] > c['open'])
-            if bullish_count == 3 and close_price > open_price:
-                signal = 'buy'
-
-            # Bearish momentum: 3 consecutive bearish candles
-            bearish_count = sum(1 for _, c in recent_candles.iterrows()
-                              if c['close'] < c['open'])
-            if bearish_count == 3 and close_price < open_price:
-                signal = 'sell'
-
-    # --------------------------------------------------------------------------
-    # RULE 4: Volume Confirmation
-    # --------------------------------------------------------------------------
-    if USE_VOLUME_FILTERS and lookback_data is not None and len(lookback_data) >= 5:
-        avg_volume = lookback_data['volume'].mean()
-
-        # Require above-average volume for signal confirmation
-        if signal != 'neutral' and volume < avg_volume * 0.5:
-            # Low volume - reduce confidence in signal
-            pass  # Keep signal but you could set to 'neutral' here
-
     return signal
-
-
+ 
+ 
+# =============================================================================
+# TAKE PROFIT & STOP LOSS CALCULATORS
+# =============================================================================
+ 
+def calculate_take_profit(
+    entry_price: float,
+    direction: str,
+    lookback_data: pd.DataFrame,
+    use_midline: bool = USE_MIDLINE_TP
+) -> float | None:
+    """
+    Calculate take-profit price using Zone-to-Zone logic.
+ 
+    - Buy  → TP at the next supply zone (or midline = 50% of the distance).
+    - Sell → TP at the next demand zone (or midline = 50% of the distance).
+ 
+    The midline TP (50% level) provides a safer target since price often
+    stalls or pulls back halfway before reaching the next zone.
+    """
+    if lookback_data is None:
+        return None
+ 
+    if direction == 'buy':
+        supply_zone = detect_supply_zone(lookback_data)
+        if supply_zone is None:
+            return None
+        target = supply_zone['low']
+        if use_midline:
+            return entry_price + (target - entry_price) * 0.5
+        return target
+ 
+    elif direction == 'sell':
+        demand_zone = detect_demand_zone(lookback_data)
+        if demand_zone is None:
+            return None
+        target = demand_zone['high']
+        if use_midline:
+            return entry_price - (entry_price - target) * 0.5
+        return target
+ 
+    return None
+ 
+ 
+def calculate_stop_loss(
+    entry_price: float,
+    direction: str,
+    lookback_data: pd.DataFrame
+) -> float | None:
+    """
+    Calculate stop-loss price using Zone-to-Zone logic.
+ 
+    - Buy  → SL below the demand zone (never inside the zone).
+    - Sell → SL above the supply zone (never inside the zone).
+ 
+    A small buffer is added so the stop sits just outside the zone boundary.
+    """
+    if lookback_data is None:
+        return None
+ 
+    buffer = entry_price * 0.001  # 0.1% buffer beyond zone edge
+ 
+    if direction == 'buy':
+        demand_zone = detect_demand_zone(lookback_data)
+        if demand_zone is None:
+            return None
+        return demand_zone['low'] - buffer
+ 
+    elif direction == 'sell':
+        supply_zone = detect_supply_zone(lookback_data)
+        if supply_zone is None:
+            return None
+        return supply_zone['high'] + buffer
+ 
+    return None
+ 
+ 
 # =============================================================================
 # ADDITIONAL STRATEGY HELPER FUNCTIONS
 # =============================================================================
-
+ 
 def calculate_sma(data: pd.DataFrame, column: str, period: int) -> pd.Series:
     """Calculate Simple Moving Average."""
     return data[column].rolling(window=period).mean()
-
-
+ 
+ 
 def calculate_ema(data: pd.DataFrame, column: str, period: int) -> pd.Series:
     """Calculate Exponential Moving Average."""
     return data[column].ewm(span=period, adjust=False).mean()
-
-
+ 
+ 
 def calculate_rsi(data: pd.DataFrame, column: str = 'close', period: int = 14) -> pd.Series:
     """Calculate Relative Strength Index."""
     delta = data[column].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def detect_doji(candle: pd.Series, threshold: float = 0.1) -> bool:
-    """Detect if candle is a Doji (small body relative to range)."""
-    if candle['candle_size'] == 0:
-        return False
-    body_ratio = candle['body_size'] / candle['candle_size']
-    return body_ratio < threshold
-
-
-def detect_marubozu(candle: pd.Series, threshold: float = 0.95) -> str:
-    """Detect Marubozu candle (full body, no wicks)."""
-    if candle['candle_size'] == 0:
-        return 'none'
-    body_ratio = candle['body_size'] / candle['candle_size']
-    if body_ratio >= threshold:
-        return 'bullish' if candle['close'] > candle['open'] else 'bearish'
-    return 'none'
-
-
+    gain  = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss  = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs    = gain / loss
+    return 100 - (100 / (1 + rs))
+ 
+ 
 def is_trend_up(lookback_data: pd.DataFrame, periods: int = 5) -> bool:
-    """Check if recent trend is upward."""
+    """Check if recent trend is upward based on closing prices."""
     if lookback_data is None or len(lookback_data) < periods:
         return False
     recent = lookback_data.tail(periods)
     return recent['close'].iloc[-1] > recent['close'].iloc[0]
-
-
+ 
+ 
 def is_trend_down(lookback_data: pd.DataFrame, periods: int = 5) -> bool:
-    """Check if recent trend is downward."""
+    """Check if recent trend is downward based on closing prices."""
     if lookback_data is None or len(lookback_data) < periods:
         return False
     recent = lookback_data.tail(periods)
     return recent['close'].iloc[-1] < recent['close'].iloc[0]
-
-
+ 
+ 
 # =============================================================================
 # STRATEGY VALIDATION
 # =============================================================================
-
+ 
 def validate_strategy() -> bool:
     """
     Validate that the strategy is properly configured.
-    Run this before training to ensure strategy is working.
+    Run this before training to ensure the strategy is working correctly.
     """
-    print(f"Strategy Name: {STRATEGY_NAME}")
-    print(f"Lookback Periods: {LOOKBACK_PERIODS}")
-    print(f"Candlestick Patterns: {'Enabled' if USE_CANDLESTICK_PATTERNS else 'Disabled'}")
-    print(f"Time Filters: {'Enabled' if USE_TIME_FILTERS else 'Disabled'}")
-    print(f"Momentum Rules: {'Enabled' if USE_MOMENTUM_RULES else 'Disabled'}")
-    print(f"Volume Filters: {'Enabled' if USE_VOLUME_FILTERS else 'Disabled'}")
-
-    # Test with dummy data
-    test_candle = pd.Series({
-        'open': 100.0,
-        'high': 105.0,
-        'low': 99.0,
-        'close': 104.0,
-        'volume': 1000,
-        'candle_size': 6.0,
-        'body_size': 4.0,
-        'wick_upper': 1.0,
-        'wick_lower': 1.0,
-        'hour': 10,
-        'day_of_week': 2,
-        'month': 6
+    print(f"Strategy Name:          {STRATEGY_NAME}")
+    print(f"Lookback Periods:       {LOOKBACK_PERIODS}")
+    print(f"Zone Detection:         {'Enabled' if USE_ZONE_DETECTION else 'Disabled'}")
+    print(f"Confirmation Patterns:  {'Enabled' if USE_CONFIRMATION_PATTERNS else 'Disabled'}")
+    print(f"Time Filters:           {'Enabled' if USE_TIME_FILTERS else 'Disabled'}")
+    print(f"Zone Freshness Check:   {'Enabled' if USE_ZONE_FRESHNESS else 'Disabled'}")
+    print(f"Midline Take Profit:    {'Enabled' if USE_MIDLINE_TP else 'Disabled'}")
+    print()
+ 
+    # Build synthetic lookback with a clear demand zone
+    n = 25
+    prices = [100.0 + i * 0.1 for i in range(n)]
+ 
+    lookback = pd.DataFrame({
+        'open':   [p - 0.5 for p in prices],
+        'high':   [p + 1.0 for p in prices],
+        'low':    [p - 1.0 for p in prices],
+        'close':  prices,
+        'volume': [1000] * n,
     })
-
+ 
+    # Insert a strong bullish zone candle near the start
+    lookback.iloc[5, lookback.columns.get_loc('open')]  = 98.0
+    lookback.iloc[5, lookback.columns.get_loc('close')] = 101.5
+    lookback.iloc[5, lookback.columns.get_loc('high')]  = 102.0
+    lookback.iloc[5, lookback.columns.get_loc('low')]   = 97.5
+ 
+    lookback['candle_size'] = lookback['high'] - lookback['low']
+    lookback['body_size']   = (lookback['close'] - lookback['open']).abs()
+    lookback['wick_upper']  = lookback['high'] - lookback[['close', 'open']].max(axis=1)
+    lookback['wick_lower']  = lookback[['close', 'open']].min(axis=1) - lookback['low']
+ 
+    # Current candle with bullish engulfing inside demand zone
+    prev = lookback.iloc[-1]
+    test_candle = pd.Series({
+        'open':        prev['close'] - 0.3,
+        'high':        prev['open'] + 0.5,
+        'low':         prev['close'] - 0.5,
+        'close':       prev['open'] + 0.3,
+        'volume':      1500,
+        'candle_size': 1.0,
+        'body_size':   0.6,
+        'wick_upper':  0.2,
+        'wick_lower':  0.2,
+        'hour':        10,
+        'day_of_week': 2,
+        'month':       6,
+    })
+ 
     try:
-        result = apply_strategy(test_candle, None)
+        result = apply_strategy(test_candle, lookback)
         if result in ['buy', 'sell', 'neutral']:
             print(f"✓ Strategy validation passed (test signal: {result})")
             return True
@@ -288,7 +561,7 @@ def validate_strategy() -> bool:
     except Exception as e:
         print(f"✗ Strategy validation failed: {e}")
         return False
-
-
+ 
+ 
 if __name__ == "__main__":
     validate_strategy()
