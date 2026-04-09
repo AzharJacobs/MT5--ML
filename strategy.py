@@ -71,96 +71,164 @@ MIN_ZONE_CANDLES = 2             # Minimum consecutive strong candles to form a 
 def detect_demand_zone(lookback_data: pd.DataFrame) -> dict | None:
     """
     Detect the most recent valid demand zone from lookback data.
- 
+
     A demand zone is identified by:
     - Strong bullish candles (long bodies, sharp move up)
     - Break of structure upward after the zone
     - Sometimes a V-shape reversal
- 
+
     Returns a dict with zone 'high' and 'low' price levels, or None.
     """
     if lookback_data is None or len(lookback_data) < MIN_ZONE_CANDLES + 1:
         return None
- 
-    for i in range(len(lookback_data) - 2, MIN_ZONE_CANDLES - 2, -1):
-        candle = lookback_data.iloc[i]
-        candle_range = candle['high'] - candle['low']
-        if candle_range == 0:
+    
+    demand_zones = []
+    
+    # Scan from oldest to newest, looking for strong bullish moves
+    for i in range(len(lookback_data) - 1):
+        current = lookback_data.iloc[i]
+        
+        # Check if this is a strong bullish candle
+        if current['close'] <= current['open']:  # Not bullish
             continue
- 
-        body = abs(candle['close'] - candle['open'])
-        body_ratio = body / candle_range
- 
-        is_bullish = candle['close'] > candle['open']
-        is_strong = body_ratio >= ZONE_BODY_RATIO_MIN
- 
-        if not (is_bullish and is_strong):
+        
+        body_size = current['close'] - current['open']
+        candle_size = current['high'] - current['low']
+        
+        # Check if body is substantial relative to candle
+        if candle_size == 0 or (body_size / candle_size) < ZONE_BODY_RATIO_MIN:
             continue
- 
-        # Check for strong upward departure AFTER this candle
-        future_candles = lookback_data.iloc[i + 1:]
-        if len(future_candles) < 1:
+        
+        # Check if this is a strong move (at least STRONG_MOVE_THRESHOLD% up)
+        if body_size / current['open'] < STRONG_MOVE_THRESHOLD:
             continue
- 
-        departure_move = (future_candles['close'].max() - candle['high']) / candle['high']
-        if departure_move < STRONG_MOVE_THRESHOLD:
-            continue
- 
+        
+        # Look ahead to confirm break of structure upward
+        consecutive_strength = 1
+        zone_low = current['low']
+        zone_high = current['high']
+        
+        # Check next candles for continuation or higher lows (demand zone characteristics)
+        for j in range(i + 1, min(i + MIN_ZONE_CANDLES + 1, len(lookback_data))):
+            next_candle = lookback_data.iloc[j]
+            
+            # Expand zone bounds
+            zone_low = min(zone_low, next_candle['low'])
+            zone_high = max(zone_high, next_candle['high'])
+            
+            # Count consecutive bullish or consolidating candles
+            if next_candle['close'] >= next_candle['open']:
+                consecutive_strength += 1
+            elif (next_candle['high'] - next_candle['low']) < (current['candle_size'] * 0.5):
+                # Small consolidation candle is acceptable
+                consecutive_strength += 0.5
+        
+        # Valid demand zone if we have enough consecutive strength
+        if consecutive_strength >= MIN_ZONE_CANDLES:
+            age = len(lookback_data) - i - 1
+            
+            if age <= MAX_ZONE_AGE:
+                demand_zones.append({
+                    'low': zone_low,
+                    'high': zone_high,
+                    'age': age,
+                    'strength': consecutive_strength,
+                    'index': i
+                })
+    
+    # Return the freshest (most recent) demand zone
+    if demand_zones:
+        # Sort by age (freshest first) and then by strength
+        demand_zones.sort(key=lambda x: (x['age'], -x['strength']))
         return {
-            'high': candle['high'],
-            'low':  candle['low'],
-            'age':  len(lookback_data) - 1 - i,
-            'type': 'demand'
+            'low': demand_zones[0]['low'],
+            'high': demand_zones[0]['high'],
+            'age': demand_zones[0]['age'],
+            'strength': demand_zones[0]['strength']
         }
- 
+    
     return None
  
  
 def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
     """
     Detect the most recent valid supply zone from lookback data.
- 
+
     A supply zone is identified by:
     - Strong bearish candles (long bodies, sharp move down)
     - Break of structure downward after the zone
     - Clear rejection wick or engulfing pattern
- 
+
     Returns a dict with zone 'high' and 'low' price levels, or None.
     """
     if lookback_data is None or len(lookback_data) < MIN_ZONE_CANDLES + 1:
         return None
- 
-    for i in range(len(lookback_data) - 2, MIN_ZONE_CANDLES - 2, -1):
-        candle = lookback_data.iloc[i]
-        candle_range = candle['high'] - candle['low']
-        if candle_range == 0:
+    
+    supply_zones = []
+    
+    # Scan from oldest to newest, looking for strong bearish moves
+    for i in range(len(lookback_data) - 1):
+        current = lookback_data.iloc[i]
+        
+        # Check if this is a strong bearish candle
+        if current['close'] >= current['open']:  # Not bearish
             continue
- 
-        body = abs(candle['close'] - candle['open'])
-        body_ratio = body / candle_range
- 
-        is_bearish = candle['close'] < candle['open']
-        is_strong = body_ratio >= ZONE_BODY_RATIO_MIN
- 
-        if not (is_bearish and is_strong):
+        
+        body_size = current['open'] - current['close']
+        candle_size = current['high'] - current['low']
+        
+        # Check if body is substantial relative to candle
+        if candle_size == 0 or (body_size / candle_size) < ZONE_BODY_RATIO_MIN:
             continue
- 
-        # Check for strong downward departure AFTER this candle
-        future_candles = lookback_data.iloc[i + 1:]
-        if len(future_candles) < 1:
+        
+        # Check if this is a strong move (at least STRONG_MOVE_THRESHOLD% down)
+        if body_size / current['open'] < STRONG_MOVE_THRESHOLD:
             continue
- 
-        departure_move = (candle['low'] - future_candles['close'].min()) / candle['low']
-        if departure_move < STRONG_MOVE_THRESHOLD:
-            continue
- 
+        
+        # Look ahead to confirm break of structure downward
+        consecutive_strength = 1
+        zone_low = current['low']
+        zone_high = current['high']
+        
+        # Check next candles for continuation or lower highs (supply zone characteristics)
+        for j in range(i + 1, min(i + MIN_ZONE_CANDLES + 1, len(lookback_data))):
+            next_candle = lookback_data.iloc[j]
+            
+            # Expand zone bounds
+            zone_low = min(zone_low, next_candle['low'])
+            zone_high = max(zone_high, next_candle['high'])
+            
+            # Count consecutive bearish or consolidating candles
+            if next_candle['close'] <= next_candle['open']:
+                consecutive_strength += 1
+            elif (next_candle['high'] - next_candle['low']) < (current['candle_size'] * 0.5):
+                # Small consolidation candle is acceptable
+                consecutive_strength += 0.5
+        
+        # Valid supply zone if we have enough consecutive strength
+        if consecutive_strength >= MIN_ZONE_CANDLES:
+            age = len(lookback_data) - i - 1
+            
+            if age <= MAX_ZONE_AGE:
+                supply_zones.append({
+                    'low': zone_low,
+                    'high': zone_high,
+                    'age': age,
+                    'strength': consecutive_strength,
+                    'index': i
+                })
+    
+    # Return the freshest (most recent) supply zone
+    if supply_zones:
+        # Sort by age (freshest first) and then by strength
+        supply_zones.sort(key=lambda x: (x['age'], -x['strength']))
         return {
-            'high': candle['high'],
-            'low':  candle['low'],
-            'age':  len(lookback_data) - 1 - i,
-            'type': 'supply'
+            'low': supply_zones[0]['low'],
+            'high': supply_zones[0]['high'],
+            'age': supply_zones[0]['age'],
+            'strength': supply_zones[0]['strength']
         }
- 
+    
     return None
  
  
