@@ -14,7 +14,14 @@ import numpy as np
 from typing import Tuple, Dict, List, Optional
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from db_connect import get_connection, DatabaseConnection
-from strategy import apply_strategy, LOOKBACK_PERIODS
+from strategy import (
+    apply_strategy,
+    LOOKBACK_PERIODS,
+    detect_demand_zone,
+    detect_supply_zone,
+    price_in_zone,
+    ZONE_TOUCH_TOLERANCE,
+)
 
 
 class DataPreparator:
@@ -212,6 +219,96 @@ class DataPreparator:
         print(f"✓ Engineered {len(df.columns)} features")
         return df
 
+    def create_zone_outcome_labels(
+        self,
+        df: pd.DataFrame,
+        zone_lookback: int = 30,
+        horizon: int = 20,
+        zone_touch_tolerance: float = ZONE_TOUCH_TOLERANCE,
+    ) -> pd.DataFrame:
+        """
+        Create forward-looking zone-to-zone outcome labels with zero lookahead in zone detection.
+
+        Label semantics:
+          -  1 (buy): price returns into a past-identified demand zone, then reaches the next supply zone within N candles.
+          - -1 (sell): price returns into a past-identified supply zone, then reaches the next demand zone within N candles.
+          -  0 (neutral): outcome not achieved within horizon, or missing required zones.
+
+        Important:
+          - Zones are detected using ONLY past candles (lookback window ending at t-1).
+          - Outcome is evaluated using ONLY future candles (t+1 ... t+horizon).
+        """
+        print(
+            "Creating forward-looking zone outcome labels "
+            f"(lookback={zone_lookback}, horizon={horizon})..."
+        )
+
+        df = df.sort_values(['timeframe', 'timestamp']).reset_index(drop=True).copy()
+        df['zone_label'] = 0
+
+        labeled_dfs: List[pd.DataFrame] = []
+
+        for timeframe in df['timeframe'].unique():
+            tf = df[df['timeframe'] == timeframe].copy().reset_index(drop=True)
+
+            if len(tf) < (zone_lookback + horizon + 2):
+                labeled_dfs.append(tf)
+                continue
+
+            labels = np.zeros(len(tf), dtype=int)
+
+            for i in range(zone_lookback, len(tf) - horizon - 1):
+                lookback_data = tf.iloc[i - zone_lookback:i]
+                current = tf.iloc[i]
+                close_price = float(current['close'])
+
+                demand_zone = detect_demand_zone(lookback_data)
+                supply_zone = detect_supply_zone(lookback_data)
+
+                in_demand = demand_zone is not None and price_in_zone(
+                    close_price, demand_zone, tolerance=zone_touch_tolerance
+                )
+                in_supply = supply_zone is not None and price_in_zone(
+                    close_price, supply_zone, tolerance=zone_touch_tolerance
+                )
+
+                if not in_demand and not in_supply:
+                    continue
+
+                future = tf.iloc[i + 1:i + 1 + horizon]
+                if future.empty:
+                    continue
+
+                # BUY setup: return to demand -> reach next supply
+                if in_demand and supply_zone is not None:
+                    target_price = float(supply_zone['low']) * (1 - zone_touch_tolerance)
+                    if float(future['high'].max()) >= target_price:
+                        labels[i] = 1
+                    else:
+                        labels[i] = 0
+                    continue
+
+                # SELL setup: return to supply -> reach next demand
+                if in_supply and demand_zone is not None:
+                    target_price = float(demand_zone['high']) * (1 + zone_touch_tolerance)
+                    if float(future['low'].min()) <= target_price:
+                        labels[i] = -1
+                    else:
+                        labels[i] = 0
+
+            tf['zone_label'] = labels
+            labeled_dfs.append(tf)
+
+        df = pd.concat(labeled_dfs, ignore_index=True)
+
+        vc = df['zone_label'].value_counts().to_dict()
+        print(
+            "✓ Zone labels created: "
+            f"buy={vc.get(1, 0)}, sell={vc.get(-1, 0)}, neutral={vc.get(0, 0)}"
+        )
+
+        return df
+
     def create_lagged_features(
         self,
         df: pd.DataFrame,
@@ -231,8 +328,15 @@ class DataPreparator:
 
         df = df.copy()
         lag_columns = [
+            # Core candle features
+            'candle_size', 'body_size', 'wick_upper', 'wick_lower',
+            # Engineered price/shape features
             'price_change_pct', 'body_to_range_ratio',
-            'volume_normalized', 'is_bullish', 'strategy_signal_encoded'
+            'upper_wick_ratio', 'lower_wick_ratio', 'volume_normalized',
+            # Time cyclical features
+            'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos',
+            # Strategy features (derived from past candles via apply_strategy)
+            'strategy_signal_encoded',
         ]
 
         # Process each timeframe separately
@@ -275,23 +379,12 @@ class DataPreparator:
         print("Preparing features and target...")
 
         # Define feature columns
-        self.feature_columns = [
-            # Core OHLCV features
-            'candle_size', 'body_size', 'wick_upper', 'wick_lower',
-            # Engineered features
-            'price_change_pct', 'body_to_range_ratio',
-            'upper_wick_ratio', 'lower_wick_ratio', 'volume_normalized',
-            # Time features
-            'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
-            'month_sin', 'month_cos',
-            # Timeframe encoding
-            'timeframe_encoded',
-            # Strategy signal
-            'strategy_signal_encoded'
-        ]
+        # IMPORTANT: To avoid leakage, we only use lagged features (t-1, t-2, ...).
+        # No current-candle features are included in X.
+        self.feature_columns = ['timeframe_encoded']
 
         # Add lagged feature columns if they exist
-        lag_columns = [col for col in df.columns if '_lag' in col]
+        lag_columns = [col for col in df.columns if "_lag" in col]
         self.feature_columns.extend(lag_columns)
 
         # Filter to only existing columns
@@ -300,8 +393,11 @@ class DataPreparator:
         # Create feature matrix
         X = df[self.feature_columns].copy()
 
-        # Target: predict next candle direction (0 = sell, 1 = buy)
-        y = df['is_bullish'].copy()
+        # Target: zone-to-zone outcome (binary for classifier): 1=buy success, 0=sell success
+        # Neutral (0) is excluded before this function is called.
+        if 'zone_label' not in df.columns:
+            raise ValueError("Missing 'zone_label'. Run create_zone_outcome_labels() first.")
+        y = (df['zone_label'] == 1).astype(int).copy()
 
         # Scale features
         X_scaled = pd.DataFrame(
@@ -311,7 +407,7 @@ class DataPreparator:
         )
 
         print(f"✓ Prepared {len(self.feature_columns)} features for {len(X)} samples")
-        print(f"  Target distribution: buy={y.sum()}, sell={len(y) - y.sum()}")
+        print(f"  Target distribution: buy={int(y.sum())}, sell={int(len(y) - y.sum())}")
 
         return X_scaled, y
 
@@ -360,7 +456,9 @@ class DataPreparator:
         timeframes: List[str] = None,
         start_date: str = None,
         end_date: str = None,
-        lag_periods: int = 5
+        lag_periods: int = 5,
+        zone_lookback: int = 30,
+        zone_horizon: int = 20,
     ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
         """
         Full data preparation pipeline.
@@ -386,13 +484,25 @@ class DataPreparator:
         # Step 3: Engineer features
         data = self.engineer_features(data)
 
-        # Step 4: Create lagged features
+        # Step 4: Create forward-looking outcome labels (uses past zones + future reach)
+        data = self.create_zone_outcome_labels(
+            data,
+            zone_lookback=zone_lookback,
+            horizon=zone_horizon,
+        )
+
+        # Step 5: Create lagged features (ALL ML features are lagged; no current candle leakage)
         data = self.create_lagged_features(data, lag_periods)
+
+        # Step 6: Keep only actionable samples (exclude neutral / unknown outcomes)
+        initial_count = len(data)
+        data = data[data['zone_label'] != 0].copy()
+        print(f"✓ Filtered neutral labels: {initial_count - len(data)} rows removed")
 
         # Save prepared timeframe data to parquet files
         self.save_timeframe_parquets(data)
 
-        # Step 5: Prepare features and target
+        # Step 7: Prepare features and target
         X, y = self.prepare_features_and_target(data)
 
         return X, y, data
@@ -414,7 +524,9 @@ def prepare_data(
     timeframes: List[str] = None,
     start_date: str = None,
     end_date: str = None,
-    lag_periods: int = 5
+    lag_periods: int = 5,
+    zone_lookback: int = 30,
+    zone_horizon: int = 20,
 ) -> Tuple[pd.DataFrame, pd.Series, DataPreparator]:
     """
     Convenience function for data preparation.
@@ -423,7 +535,9 @@ def prepare_data(
         Tuple of (X features, y target, DataPreparator instance)
     """
     preparator = DataPreparator()
-    X, y, _ = preparator.prepare_data(timeframes, start_date, end_date, lag_periods)
+    X, y, _ = preparator.prepare_data(
+        timeframes, start_date, end_date, lag_periods, zone_lookback, zone_horizon
+    )
     return X, y, preparator
 
 
@@ -432,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--timeframes",
         nargs="+",
-        default=["10min"],
+        default=["5min"],
         help="Timeframes to prepare (e.g. 5min 10min 1h). Default: 10min"
     )
     parser.add_argument("--start-date", type=str, default=None, help="Start date filter (YYYY-MM-DD)")

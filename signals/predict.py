@@ -170,28 +170,20 @@ class Predictor:
         Returns:
             Feature DataFrame ready for prediction
         """
-        # Calculate basic features
-        candle_size = current_candle.get('candle_size',
-                                         current_candle['high'] - current_candle['low'])
-        body_size = current_candle.get('body_size',
-                                       abs(current_candle['close'] - current_candle['open']))
+        # IMPORTANT (no lookahead):
+        # The model is trained on lag-only features. For a prediction at time t, we use
+        # candle features from t-1 (the most recent completed candle in lookback_data).
+        if lookback_data is None or len(lookback_data) < 1:
+            raise ValueError("Not enough lookback data to build lagged features (need >= 1 candle).")
+
+        prev_candle = lookback_data.iloc[-1]
+
+        candle_size = prev_candle.get('candle_size', prev_candle['high'] - prev_candle['low'])
+        body_size = prev_candle.get('body_size', abs(prev_candle['close'] - prev_candle['open']))
 
         features = {
-            'candle_size': candle_size,
-            'body_size': body_size,
-            'wick_upper': current_candle.get('wick_upper', 0),
-            'wick_lower': current_candle.get('wick_lower', 0),
-            'price_change_pct': (current_candle['close'] - current_candle['open']) / current_candle['open'] * 100,
-            'body_to_range_ratio': body_size / candle_size if candle_size > 0 else 0,
-            'upper_wick_ratio': current_candle.get('wick_upper', 0) / candle_size if candle_size > 0 else 0,
-            'lower_wick_ratio': current_candle.get('wick_lower', 0) / candle_size if candle_size > 0 else 0,
-            'volume_normalized': 0,  # Will be calculated if lookback available
-            'hour_sin': np.sin(2 * np.pi * current_candle.get('hour', 0) / 24),
-            'hour_cos': np.cos(2 * np.pi * current_candle.get('hour', 0) / 24),
-            'day_sin': np.sin(2 * np.pi * current_candle.get('day_of_week', 0) / 7),
-            'day_cos': np.cos(2 * np.pi * current_candle.get('day_of_week', 0) / 7),
-            'month_sin': np.sin(2 * np.pi * current_candle.get('month', 1) / 12),
-            'month_cos': np.cos(2 * np.pi * current_candle.get('month', 1) / 12),
+            # Non-lag features used in training
+            'timeframe_encoded': 0,  # set below
         }
 
         # Timeframe encoding
@@ -200,32 +192,63 @@ class Predictor:
         except:
             features['timeframe_encoded'] = 0
 
-        # Strategy signal
-        strategy_signal = apply_strategy(current_candle, lookback_data)
+        # Strategy signal (computed at t using current candle + past lookback), but we store it as lagged inputs
+        # by sourcing it from the previous candle's perspective.
         signal_map = {'buy': 1, 'sell': -1, 'neutral': 0}
-        features['strategy_signal_encoded'] = signal_map.get(strategy_signal, 0)
 
-        # Volume normalization
-        if lookback_data is not None and len(lookback_data) > 0:
-            vol_mean = lookback_data['volume'].mean()
-            vol_std = lookback_data['volume'].std()
-            if vol_std > 0:
-                features['volume_normalized'] = (current_candle.get('volume', 0) - vol_mean) / vol_std
+        # Build lagged features exactly like training: *_lag{lag}
+        max_lag_needed = 0
+        for col in self.feature_columns:
+            if "_lag" in col:
+                try:
+                    lag_n = int(col.split("_lag")[-1])
+                    max_lag_needed = max(max_lag_needed, lag_n)
+                except Exception:
+                    continue
 
-        # Add lagged features
-        if lookback_data is not None and len(lookback_data) >= LOOKBACK_PERIODS:
-            for lag in range(1, LOOKBACK_PERIODS + 1):
-                idx = -(lag)
-                if abs(idx) <= len(lookback_data):
-                    prev = lookback_data.iloc[idx]
-                    prev_candle_size = prev.get('candle_size', prev['high'] - prev['low'])
-                    prev_body_size = prev.get('body_size', abs(prev['close'] - prev['open']))
+        max_lag = max(1, min(max_lag_needed or LOOKBACK_PERIODS, len(lookback_data)))
 
-                    features[f'price_change_pct_lag{lag}'] = (prev['close'] - prev['open']) / prev['open'] * 100 if prev['open'] != 0 else 0
-                    features[f'body_to_range_ratio_lag{lag}'] = prev_body_size / prev_candle_size if prev_candle_size > 0 else 0
-                    features[f'volume_normalized_lag{lag}'] = 0
-                    features[f'is_bullish_lag{lag}'] = 1 if prev['close'] > prev['open'] else 0
-                    features[f'strategy_signal_encoded_lag{lag}'] = 0
+        for lag in range(1, max_lag + 1):
+            prev = lookback_data.iloc[-lag]
+            prev_candle_size = prev.get('candle_size', prev['high'] - prev['low'])
+            prev_body_size = prev.get('body_size', abs(prev['close'] - prev['open']))
+            prev_open = float(prev['open']) if float(prev['open']) != 0 else 1.0
+
+            # Candle/shape
+            features[f'candle_size_lag{lag}'] = float(prev_candle_size)
+            features[f'body_size_lag{lag}'] = float(prev_body_size)
+            features[f'wick_upper_lag{lag}'] = float(prev.get('wick_upper', 0))
+            features[f'wick_lower_lag{lag}'] = float(prev.get('wick_lower', 0))
+
+            # Price/ratios
+            features[f'price_change_pct_lag{lag}'] = float((prev['close'] - prev['open']) / prev_open * 100)
+            features[f'body_to_range_ratio_lag{lag}'] = float(prev_body_size / prev_candle_size) if prev_candle_size > 0 else 0.0
+            features[f'upper_wick_ratio_lag{lag}'] = float(prev.get('wick_upper', 0) / prev_candle_size) if prev_candle_size > 0 else 0.0
+            features[f'lower_wick_ratio_lag{lag}'] = float(prev.get('wick_lower', 0) / prev_candle_size) if prev_candle_size > 0 else 0.0
+
+            # Volume normalization using history strictly before that candle
+            hist = lookback_data.iloc[:len(lookback_data) - lag]
+            vol_norm = 0.0
+            if hist is not None and len(hist) > 10:
+                vol_mean = float(hist['volume'].mean())
+                vol_std = float(hist['volume'].std())
+                if vol_std > 0:
+                    vol_norm = float((prev.get('volume', 0) - vol_mean) / vol_std)
+            features[f'volume_normalized_lag{lag}'] = vol_norm
+
+            # Time cyclical (based on candle timestamp fields, lagged)
+            features[f'hour_sin_lag{lag}'] = float(np.sin(2 * np.pi * prev.get('hour', 0) / 24))
+            features[f'hour_cos_lag{lag}'] = float(np.cos(2 * np.pi * prev.get('hour', 0) / 24))
+            features[f'day_sin_lag{lag}'] = float(np.sin(2 * np.pi * prev.get('day_of_week', 0) / 7))
+            features[f'day_cos_lag{lag}'] = float(np.cos(2 * np.pi * prev.get('day_of_week', 0) / 7))
+            features[f'month_sin_lag{lag}'] = float(np.sin(2 * np.pi * prev.get('month', 1) / 12))
+            features[f'month_cos_lag{lag}'] = float(np.cos(2 * np.pi * prev.get('month', 1) / 12))
+
+            # Strategy signal encoded, lagged (compute using the candle at that lag as "current")
+            # and candles before it as lookback.
+            prev_lb = lookback_data.iloc[:len(lookback_data) - lag]
+            sig = apply_strategy(prev, prev_lb if len(prev_lb) > 0 else None)
+            features[f'strategy_signal_encoded_lag{lag}'] = signal_map.get(sig, 0)
 
         # Create DataFrame with correct column order
         feature_df = pd.DataFrame([features])

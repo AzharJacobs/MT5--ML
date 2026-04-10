@@ -11,8 +11,9 @@ import joblib
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import argparse
 from typing import Dict, Any, List, Optional, Tuple
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
@@ -142,14 +143,23 @@ class ModelTrainer:
             lag_periods=lag_periods
         )
 
-        # Step 2: Split data into training and testing sets
-        print(f"\nSplitting data (test_size={test_size})...")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y,
-            test_size=test_size,
-            random_state=42,
-            stratify=y
-        )
+        # Step 2: Chronological train/test split (no shuffling)
+        print(f"\nSplitting data chronologically (test_size={test_size})...")
+        if raw_data is None or 'timestamp' not in raw_data.columns:
+            raise ValueError("Expected raw_data with a 'timestamp' column for chronological splitting.")
+
+        sort_cols = ['timestamp'] + (['timeframe'] if 'timeframe' in raw_data.columns else [])
+        order = raw_data.sort_values(sort_cols).index
+        X = X.loc[order].reset_index(drop=True)
+        y = y.loc[order].reset_index(drop=True)
+        raw_data = raw_data.loc[order].reset_index(drop=True)
+
+        split_idx = int(len(X) * (1 - test_size))
+        if split_idx <= 0 or split_idx >= len(X):
+            raise ValueError(f"Invalid split derived from test_size={test_size} for n={len(X)}")
+
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
         print(f"  Training samples: {len(X_train)}")
         print(f"  Testing samples: {len(X_test)}")
@@ -157,6 +167,16 @@ class ModelTrainer:
         # Step 3: Train model
         print(f"\nTraining {self.model_type} model...")
         start_time = datetime.now()
+
+        # Add class weights (helps imbalance)
+        if self.model_type == "catboost":
+            y_arr = np.asarray(y_train)
+            n0 = int(np.sum(y_arr == 0))
+            n1 = int(np.sum(y_arr == 1))
+            if n0 == 0 or n1 == 0:
+                raise ValueError(f"Cannot compute class weights (n0={n0}, n1={n1}).")
+            class_weights = {0: len(y_arr) / n0, 1: len(y_arr) / n1}
+            self.model.set_params(class_weights=class_weights)
 
         self.model.fit(X_train, y_train)
 
@@ -169,7 +189,8 @@ class ModelTrainer:
 
         # Step 5: Cross-validation
         print("\nPerforming cross-validation...")
-        cv_scores = cross_val_score(self.model, X, y, cv=5, scoring='accuracy')
+        tscv = TimeSeriesSplit(n_splits=5)
+        cv_scores = cross_val_score(self.model, X, y, cv=tscv, scoring='accuracy')
         results['cv_scores'] = cv_scores.tolist()
         results['cv_mean'] = cv_scores.mean()
         results['cv_std'] = cv_scores.std()
@@ -483,21 +504,47 @@ def train_model(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train the ML model on selected timeframes.")
+    parser.add_argument(
+        "--timeframes",
+        nargs="+",
+        default=None,
+        help="Timeframes to train on (e.g. --timeframes 5min 10min 1H). Default: all",
+    )
+    parser.add_argument("--start-date", type=str, default=None, help="Start date filter (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default=None, help="End date filter (YYYY-MM-DD)")
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="catboost",
+        choices=["catboost", "xgboost", "logistic"],
+        help="Model type to train (default: catboost)",
+    )
+    parser.add_argument("--no-save", action="store_true", help="Do not save model artifacts")
+    parser.add_argument("--lag-periods", type=int, default=5, help="Number of lag periods for features")
+    parser.add_argument("--test-size", type=float, default=0.2, help="Test split size (default: 0.2)")
+
+    args = parser.parse_args()
+
     print("=" * 60)
     print("MODEL TRAINING")
     print("=" * 60)
 
-    # Train model with all available data
-    results = train_model(
-        timeframes=None,  # Use all timeframes
-        start_date=None,  # Use all available data
-        end_date=None,
-        model_type="catboost",
-        save=True
+    trainer = ModelTrainer(model_type=args.model_type)
+    results = trainer.train(
+        timeframes=args.timeframes,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        test_size=args.test_size,
+        lag_periods=args.lag_periods,
     )
+
+    if not args.no_save:
+        trainer.save_model()
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
     print("=" * 60)
     print(f"\nFinal Test Accuracy: {results['test_accuracy']:.4f}")
-    print(f"Model saved to: {MODEL_DIR}/{MODEL_FILE}")
+    if not args.no_save:
+        print(f"Model saved to: {MODEL_DIR}/{MODEL_FILE}")

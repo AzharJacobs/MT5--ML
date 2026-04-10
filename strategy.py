@@ -161,7 +161,12 @@ def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
 
     Returns a dict with zone 'high' and 'low' price levels, or None.
     """
-    if lookback_data is None or len(lookback_data) < MIN_ZONE_CANDLES + 1:
+    # Relaxed thresholds specifically for SUPPLY detection to generate more sell labels.
+    # Target a buy/sell ratio closer to ~2:1 (not ~4:1).
+    supply_strong_move_threshold = 0.002  # was STRONG_MOVE_THRESHOLD (0.003)
+    supply_min_zone_candles = 1           # was MIN_ZONE_CANDLES (2)
+
+    if lookback_data is None or len(lookback_data) < supply_min_zone_candles + 1:
         return None
     
     supply_zones = []
@@ -181,8 +186,8 @@ def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
         if candle_size == 0 or (body_size / candle_size) < ZONE_BODY_RATIO_MIN:
             continue
         
-        # Check if this is a strong move (at least STRONG_MOVE_THRESHOLD% down)
-        if body_size / current['open'] < STRONG_MOVE_THRESHOLD:
+        # Check if this is a strong move (at least supply_strong_move_threshold% down)
+        if body_size / current['open'] < supply_strong_move_threshold:
             continue
         
         # Look ahead to confirm break of structure downward
@@ -191,7 +196,7 @@ def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
         zone_high = current['high']
         
         # Check next candles for continuation or lower highs (supply zone characteristics)
-        for j in range(i + 1, min(i + MIN_ZONE_CANDLES + 1, len(lookback_data))):
+        for j in range(i + 1, min(i + supply_min_zone_candles + 1, len(lookback_data))):
             next_candle = lookback_data.iloc[j]
             
             # Expand zone bounds
@@ -206,7 +211,7 @@ def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
                 consecutive_strength += 0.5
         
         # Valid supply zone if we have enough consecutive strength
-        if consecutive_strength >= MIN_ZONE_CANDLES:
+        if consecutive_strength >= supply_min_zone_candles:
             age = len(lookback_data) - i - 1
             
             if age <= MAX_ZONE_AGE:
@@ -412,32 +417,68 @@ def apply_strategy(
     if USE_CONFIRMATION_PATTERNS and prev_candle is not None:
  
         # BUY confirmation inside demand zone
+        buy_score = 0
+        sell_score = 0
+        buy_confirmed = False
+        sell_confirmed = False
+
         if in_demand_zone:
-            bullish_engulf  = is_bullish_engulfing(current_candle, prev_candle)
-            bullish_pin     = is_pin_bar_bullish(current_candle)
-            higher_low      = is_higher_low(lookback_data, periods=3)
+            bullish_engulf = is_bullish_engulfing(current_candle, prev_candle)
+            bullish_pin = is_pin_bar_bullish(current_candle)
+            higher_low = is_higher_low(lookback_data, periods=3)
             current_bullish = close_price > open_price
- 
-            # Signal fires on any valid confirmation
-            if bullish_engulf or bullish_pin or (higher_low and current_bullish):
-                signal = 'buy'
- 
-        # SELL confirmation inside supply zone
-        if in_supply_zone and signal == 'neutral':
-            bearish_engulf  = is_bearish_engulfing(current_candle, prev_candle)
-            bearish_pin     = is_pin_bar_bearish(current_candle)
-            lower_high      = is_lower_high(lookback_data, periods=3)
+
+            buy_confirmed = bool(bullish_engulf or bullish_pin or (higher_low and current_bullish))
+            buy_score = int(bullish_engulf) + int(bullish_pin) + int(higher_low and current_bullish)
+
+        if in_supply_zone:
+            bearish_engulf = is_bearish_engulfing(current_candle, prev_candle)
+            bearish_pin = is_pin_bar_bearish(current_candle)
+            lower_high = is_lower_high(lookback_data, periods=3)
             current_bearish = close_price < open_price
- 
-            if bearish_engulf or bearish_pin or (lower_high and current_bearish):
+
+            sell_confirmed = bool(bearish_engulf or bearish_pin or (lower_high and current_bearish))
+            sell_score = int(bearish_engulf) + int(bearish_pin) + int(lower_high and current_bearish)
+
+        if buy_confirmed and not sell_confirmed:
+            signal = 'buy'
+        elif sell_confirmed and not buy_confirmed:
+            signal = 'sell'
+        elif buy_confirmed and sell_confirmed:
+            if buy_score > sell_score:
+                signal = 'buy'
+            elif sell_score > buy_score:
                 signal = 'sell'
+            else:
+                # Tie-breaker: pick the zone price is deeper inside
+                eps = 1e-12
+                demand_depth = -1.0
+                supply_depth = -1.0
+                if in_demand_zone and demand_zone is not None:
+                    dz_span = max(float(demand_zone['high'] - demand_zone['low']), eps)
+                    demand_depth = float(demand_zone['high'] - close_price) / dz_span  # 0 at top, 1 at bottom
+                if in_supply_zone and supply_zone is not None:
+                    sz_span = max(float(supply_zone['high'] - supply_zone['low']), eps)
+                    supply_depth = float(close_price - supply_zone['low']) / sz_span  # 0 at bottom, 1 at top
+                signal = 'sell' if supply_depth >= demand_depth else 'buy'
  
     else:
         # Aggressive entry: enter at zone boundary without waiting for confirmation
-        if in_demand_zone:
+        if in_demand_zone and not in_supply_zone:
             signal = 'buy'
-        elif in_supply_zone:
+        elif in_supply_zone and not in_demand_zone:
             signal = 'sell'
+        elif in_demand_zone and in_supply_zone:
+            eps = 1e-12
+            demand_depth = -1.0
+            supply_depth = -1.0
+            if demand_zone is not None:
+                dz_span = max(float(demand_zone['high'] - demand_zone['low']), eps)
+                demand_depth = float(demand_zone['high'] - close_price) / dz_span
+            if supply_zone is not None:
+                sz_span = max(float(supply_zone['high'] - supply_zone['low']), eps)
+                supply_depth = float(close_price - supply_zone['low']) / sz_span
+            signal = 'sell' if supply_depth >= demand_depth else 'buy'
  
     # --------------------------------------------------------------------------
     # STEP 4 & 5 — Signal is set; SL/TP are calculated externally via helpers
