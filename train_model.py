@@ -80,6 +80,7 @@ class ModelTrainer:
                 eval_metric="AUC",
                 random_seed=42,
                 verbose=False
+                # class_weights are set later after data is loaded
             )
         elif self.model_type == "xgboost":
             if XGBClassifier is None:
@@ -168,15 +169,24 @@ class ModelTrainer:
         print(f"\nTraining {self.model_type} model...")
         start_time = datetime.now()
 
-        # Add class weights (helps imbalance)
+        # Add class weights (helps imbalance). For CatBoost, build the estimator
+        # with class_weights baked in so sklearn clone() works reliably in CV.
         if self.model_type == "catboost":
             y_arr = np.asarray(y_train)
             n0 = int(np.sum(y_arr == 0))
             n1 = int(np.sum(y_arr == 1))
             if n0 == 0 or n1 == 0:
                 raise ValueError(f"Cannot compute class weights (n0={n0}, n1={n1}).")
-            class_weights = {0: len(y_arr) / n0, 1: len(y_arr) / n1}
-            self.model.set_params(class_weights=class_weights)
+            self.model = CatBoostClassifier(
+                iterations=500,
+                depth=6,
+                learning_rate=0.05,
+                loss_function="Logloss",
+                eval_metric="AUC",
+                random_seed=42,
+                verbose=False,
+                class_weights={0: len(y_arr) / n0, 1: len(y_arr) / n1},
+            )
 
         self.model.fit(X_train, y_train)
 
@@ -190,7 +200,8 @@ class ModelTrainer:
         # Step 5: Cross-validation
         print("\nPerforming cross-validation...")
         tscv = TimeSeriesSplit(n_splits=5)
-        cv_scores = cross_val_score(self.model, X, y, cv=tscv, scoring='accuracy')
+        cv_estimator = self.model
+        cv_scores = cross_val_score(cv_estimator, X, y, cv=tscv, scoring='accuracy')
         results['cv_scores'] = cv_scores.tolist()
         results['cv_mean'] = cv_scores.mean()
         results['cv_std'] = cv_scores.std()
