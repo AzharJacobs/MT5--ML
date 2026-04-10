@@ -12,14 +12,29 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     classification_report, confusion_matrix
 )
 from prepare_data import DataPreparator
+
+# Optional model deps (installed via requirements.txt updates)
+try:
+    from catboost import CatBoostClassifier
+except Exception:  # pragma: no cover
+    CatBoostClassifier = None  # type: ignore
+
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover
+    XGBClassifier = None  # type: ignore
+
+try:
+    import optuna
+except Exception:  # pragma: no cover
+    optuna = None  # type: ignore
 
 
 # Model save directory
@@ -33,12 +48,12 @@ class ModelTrainer:
     Handles ML model training, evaluation, and saving.
     """
 
-    def __init__(self, model_type: str = "random_forest"):
+    def __init__(self, model_type: str = "catboost"):
         """
         Initialize model trainer.
 
         Args:
-            model_type: Type of model to use ('random_forest', 'gradient_boosting', 'logistic')
+            model_type: Type of model to use ('catboost', 'xgboost', 'logistic')
         """
         self.model_type = model_type
         self.model = None
@@ -50,21 +65,38 @@ class ModelTrainer:
 
     def _initialize_model(self) -> None:
         """Initialize the ML model based on model_type."""
-        if self.model_type == "random_forest":
-            self.model = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=15,
-                min_samples_split=10,
-                min_samples_leaf=5,
-                random_state=42,
-                n_jobs=-1
+        if self.model_type == "catboost":
+            if CatBoostClassifier is None:
+                raise ImportError(
+                    "catboost is not installed. Install it (e.g. `pip install catboost`) "
+                    "or use model_type='xgboost' / 'logistic'."
+                )
+            self.model = CatBoostClassifier(
+                iterations=500,
+                depth=6,
+                learning_rate=0.05,
+                loss_function="Logloss",
+                eval_metric="AUC",
+                random_seed=42,
+                verbose=False
             )
-        elif self.model_type == "gradient_boosting":
-            self.model = GradientBoostingClassifier(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42
+        elif self.model_type == "xgboost":
+            if XGBClassifier is None:
+                raise ImportError(
+                    "xgboost is not installed. Install it (e.g. `pip install xgboost`) "
+                    "or use model_type='catboost' / 'logistic'."
+                )
+            self.model = XGBClassifier(
+                n_estimators=600,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                reg_lambda=1.0,
+                random_state=42,
+                n_jobs=-1,
+                tree_method="hist",
+                eval_metric="logloss"
             )
         elif self.model_type == "logistic":
             self.model = LogisticRegression(
@@ -286,61 +318,134 @@ class ModelTrainer:
         self,
         X: pd.DataFrame,
         y: pd.Series,
-        param_grid: Dict[str, List] = None
+        n_trials: int = 50,
+        timeout_seconds: Optional[int] = None,
+        cv_splits: int = 5,
+        random_seed: int = 42
     ) -> Dict[str, Any]:
         """
-        Perform hyperparameter tuning using GridSearchCV.
+        Perform hyperparameter tuning using Optuna.
 
         Args:
             X: Feature matrix
             y: Target vector
-            param_grid: Dictionary of parameters to search
+            n_trials: Number of Optuna trials
+            timeout_seconds: Optional timeout for tuning
+            cv_splits: Stratified KFold splits
+            random_seed: Random seed
 
         Returns:
             Best parameters and score
         """
-        if param_grid is None:
-            if self.model_type == "random_forest":
-                param_grid = {
-                    'n_estimators': [50, 100, 200],
-                    'max_depth': [10, 15, 20],
-                    'min_samples_split': [5, 10, 15]
+        if optuna is None:
+            raise ImportError(
+                "optuna is not installed. Install it (e.g. `pip install optuna`) to tune hyperparameters."
+            )
+
+        print("\nPerforming hyperparameter tuning with Optuna...")
+        print(f"  Model type: {self.model_type}")
+        print(f"  Trials: {n_trials} | CV splits: {cv_splits} | Timeout: {timeout_seconds or 'none'}s")
+
+        skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=random_seed)
+
+        def objective(trial: "optuna.Trial") -> float:
+            if self.model_type == "catboost":
+                if CatBoostClassifier is None:
+                    raise ImportError("catboost not installed")
+                params = {
+                    "iterations": trial.suggest_int("iterations", 200, 1500),
+                    "depth": trial.suggest_int("depth", 4, 10),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                    "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
+                    "random_strength": trial.suggest_float("random_strength", 0.0, 2.0),
+                    "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 2.0),
+                    "loss_function": "Logloss",
+                    "eval_metric": "AUC",
+                    "random_seed": random_seed,
+                    "verbose": False,
                 }
-            elif self.model_type == "gradient_boosting":
-                param_grid = {
-                    'n_estimators': [50, 100, 150],
-                    'max_depth': [3, 5, 7],
-                    'learning_rate': [0.05, 0.1, 0.15]
+                model = CatBoostClassifier(**params)
+            elif self.model_type == "xgboost":
+                if XGBClassifier is None:
+                    raise ImportError("xgboost not installed")
+                params = {
+                    "n_estimators": trial.suggest_int("n_estimators", 200, 2000),
+                    "max_depth": trial.suggest_int("max_depth", 3, 10),
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                    "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+                    "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+                    "random_state": random_seed,
+                    "n_jobs": -1,
+                    "tree_method": "hist",
+                    "eval_metric": "logloss",
                 }
+                model = XGBClassifier(**params)
+            elif self.model_type == "logistic":
+                params = {
+                    "C": trial.suggest_float("C", 1e-3, 50.0, log=True),
+                    "solver": trial.suggest_categorical("solver", ["lbfgs", "saga"]),
+                    "max_iter": 2000,
+                    "random_state": random_seed,
+                    "n_jobs": -1,
+                }
+                model = LogisticRegression(**params)
             else:
-                param_grid = {
-                    'C': [0.1, 1, 10],
-                    'solver': ['lbfgs', 'saga']
-                }
+                raise ValueError(f"Optuna tuning not configured for model type: {self.model_type}")
 
-        print(f"\nPerforming hyperparameter tuning...")
-        print(f"Parameter grid: {param_grid}")
+            scores = []
+            for train_idx, valid_idx in skf.split(X, y):
+                X_train_cv = X.iloc[train_idx]
+                y_train_cv = y.iloc[train_idx]
+                X_valid_cv = X.iloc[valid_idx]
+                y_valid_cv = y.iloc[valid_idx]
 
-        grid_search = GridSearchCV(
-            self.model,
-            param_grid,
-            cv=5,
-            scoring='accuracy',
-            n_jobs=-1,
-            verbose=1
-        )
+                model.fit(X_train_cv, y_train_cv)
+                scores.append(float(model.score(X_valid_cv, y_valid_cv)))
 
-        grid_search.fit(X, y)
+            return float(np.mean(scores))
 
-        print(f"\nBest parameters: {grid_search.best_params_}")
-        print(f"Best CV score: {grid_search.best_score_:.4f}")
+        sampler = optuna.samplers.TPESampler(seed=random_seed)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study.optimize(objective, n_trials=n_trials, timeout=timeout_seconds)
 
-        # Update model with best parameters
-        self.model = grid_search.best_estimator_
+        best_params = dict(study.best_params)
+        best_score = float(study.best_value)
+
+        print(f"\nBest parameters: {best_params}")
+        print(f"Best CV score: {best_score:.4f}")
+
+        # Rebuild model with best params
+        if self.model_type == "catboost":
+            self.model = CatBoostClassifier(
+                **best_params,
+                loss_function="Logloss",
+                eval_metric="AUC",
+                random_seed=random_seed,
+                verbose=False
+            )
+        elif self.model_type == "xgboost":
+            self.model = XGBClassifier(
+                **best_params,
+                random_state=random_seed,
+                n_jobs=-1,
+                tree_method="hist",
+                eval_metric="logloss"
+            )
+        elif self.model_type == "logistic":
+            self.model = LogisticRegression(
+                **best_params,
+                max_iter=2000,
+                random_state=random_seed,
+                n_jobs=-1
+            )
 
         return {
-            'best_params': grid_search.best_params_,
-            'best_score': grid_search.best_score_
+            "best_params": best_params,
+            "best_score": best_score,
+            "n_trials": len(study.trials)
         }
 
 
@@ -348,7 +453,7 @@ def train_model(
     timeframes: List[str] = None,
     start_date: str = None,
     end_date: str = None,
-    model_type: str = "random_forest",
+    model_type: str = "catboost",
     save: bool = True
 ) -> Dict[str, Any]:
     """
@@ -387,7 +492,7 @@ if __name__ == "__main__":
         timeframes=None,  # Use all timeframes
         start_date=None,  # Use all available data
         end_date=None,
-        model_type="random_forest",
+        model_type="catboost",
         save=True
     )
 

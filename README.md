@@ -136,11 +136,11 @@ python main.py --retrain
 Train with Specific Timeframes
 python main.py --train --timeframes 1min 5min 1H
 Choose Model Type
-python main.py --train --model-type gradient_boosting
+python main.py --train --model-type xgboost
 Available models:
 
-random_forest (default, recommended)
-gradient_boosting
+catboost (default, recommended)
+xgboost
 logistic
 Running Predictions
 Predict Using Saved Model
@@ -227,7 +227,7 @@ python main.py --retrain --timeframes 1min 5min 1H
 
 # Retrain with different model type
 
-python main.py --retrain --model-type gradient_boosting
+python main.py --retrain --model-type xgboost
 Programmatic Retraining
 from train_model import train_model
 
@@ -238,7 +238,7 @@ results = train_model(
 
     timeframes=['1min', '5min', '1H'],
 
-    model_type='random_forest',
+    model_type='catboost',
 
     save=True
 
@@ -426,7 +426,7 @@ results = train_model(timeframes=['1min'], save=True)
 
 # Full trainer with hyperparameter tuning
 
-trainer = ModelTrainer(model_type='random_forest')
+trainer = ModelTrainer(model_type='catboost')
 
 results = trainer.train(timeframes=['1min'])
 

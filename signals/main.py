@@ -27,7 +27,12 @@ from typing import Optional
 from db_connect import get_connection
 from strategy import validate_strategy, STRATEGY_NAME
 from train_model import ModelTrainer, train_model, MODEL_DIR, MODEL_FILE
-from predict import Predictor, predict, query
+try:
+    # When running from repo root: `python signals/main.py`
+    from signals.predict import Predictor, predict, query
+except ModuleNotFoundError:
+    # Fallback for running with cwd=signals or alternative PYTHONPATH setups
+    from predict import Predictor, predict, query
 from prepare_data import DataPreparator
 
 
@@ -92,7 +97,7 @@ def run_training(
     timeframes: list = None,
     start_date: str = None,
     end_date: str = None,
-    model_type: str = "random_forest",
+    model_type: str = "catboost",
     force_retrain: bool = False
 ) -> bool:
     """
@@ -361,8 +366,8 @@ Examples:
     )
     parser.add_argument(
         '--model-type',
-        default='random_forest',
-        choices=['random_forest', 'gradient_boosting', 'logistic'],
+        default='catboost',
+        choices=['catboost', 'xgboost', 'logistic'],
         help='ML model type to use'
     )
 

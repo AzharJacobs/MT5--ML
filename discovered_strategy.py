@@ -1,9 +1,13 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 import json
 from db_connect import get_connection
+
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover
+    XGBClassifier = None  # type: ignore
 
 TIMEFRAMES = ['1min','2min','3min','4min','5min','10min','15min','30min','1H','4H','1D']
 
@@ -78,17 +82,25 @@ def discover_per_timeframe(df, feature_cols):
         X_train, X_test = X.iloc[:split], X.iloc[split:]
         y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-        model = RandomForestClassifier(
-            n_estimators=100,
+        if XGBClassifier is None:
+            raise ImportError("xgboost is not installed. Install it to run discovered_strategy.py.")
+
+        model = XGBClassifier(
+            n_estimators=500,
             max_depth=6,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
             random_state=42,
-            n_jobs=-1
+            n_jobs=-1,
+            tree_method="hist",
+            eval_metric="logloss"
         )
         model.fit(X_train, y_train)
 
         accuracy = model.score(X_test, y_test) * 100
 
-        importances = model.feature_importances_
+        importances = getattr(model, "feature_importances_", np.zeros(len(feature_cols)))
         feature_importance = dict(zip(feature_cols, importances))
         top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
 
