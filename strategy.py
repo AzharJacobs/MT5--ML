@@ -244,12 +244,14 @@ def price_in_zone(price: float, zone: dict, tolerance: float = ZONE_TOUCH_TOLERA
     return zone_low <= price <= zone_high
  
  
-def zone_is_fresh(zone: dict) -> bool:
+def zone_is_fresh(zone: dict, fresh_age: int = 20) -> bool:
     """
     Zones that haven't been touched before are more reliable.
     Uses zone age as a proxy — fresher zones score higher.
+    Age <= 20 candles = fresh. Zones up to 50 are detected but only
+    the freshest ones (<=20) are traded.
     """
-    return zone['age'] <= MAX_ZONE_AGE
+    return zone['age'] <= fresh_age
  
  
 # =============================================================================
