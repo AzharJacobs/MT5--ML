@@ -92,6 +92,12 @@ class MLSignalStrategy(bt.Strategy):
         self._entries_submitted = 0
         self._skipped_margin   = 0
         self._in_trade         = False
+        self._exit_pending     = False
+
+        # Manual SL/TP management (more reliable than bracket + Market parent)
+        self._sl: Optional[float] = None
+        self._tp: Optional[float] = None
+        self._side: Optional[str] = None  # "buy" | "sell"
 
         self.model          = getattr(self, "model", None)
         self.features_by_dt = getattr(self, "features_by_dt", None)
@@ -108,6 +114,10 @@ class MLSignalStrategy(bt.Strategy):
             return
         self._trade_count += 1
         self._in_trade = False
+        self._exit_pending = False
+        self._sl = None
+        self._tp = None
+        self._side = None
         if trade.pnlcomm > 0:
             self._wins += 1
         else:
@@ -117,12 +127,20 @@ class MLSignalStrategy(bt.Strategy):
         if order.status in (order.Canceled, order.Rejected, order.Margin):
             if self.position.size == 0:
                 self._in_trade = False
+                self._exit_pending = False
+                self._sl = None
+                self._tp = None
+                self._side = None
                 status_name = {
                     order.Canceled: "Canceled",
                     order.Rejected: "Rejected",
                     order.Margin:   "Margin/Insufficient funds",
                 }.get(order.status, str(order.status))
                 print(f"  [WARN] Order failed ({status_name}) — resetting trade flag")
+        elif order.status == order.Completed:
+            # If an exit order completed, clear pending flag; trade stats handled in notify_trade
+            if self.position.size == 0:
+                self._exit_pending = False
 
     # ------------------------------------------------------------------
     def _calc_size(self, price: float) -> float:
@@ -137,9 +155,27 @@ class MLSignalStrategy(bt.Strategy):
 
     # ------------------------------------------------------------------
     def next(self):
-        if self._in_trade:
-            return
+        # Manual exit management: close on next bar if SL/TP touched in-bar
         if self.position.size != 0:
+            if self._exit_pending:
+                return
+            side = self._side
+            sl   = self._sl
+            tp   = self._tp
+            if side and sl is not None and tp is not None:
+                bar_high = float(self.data.high[0])
+                bar_low  = float(self.data.low[0])
+                hit = False
+                if side == "buy":
+                    hit = (bar_low <= sl) or (bar_high >= tp)
+                elif side == "sell":
+                    hit = (bar_high >= sl) or (bar_low <= tp)
+                if hit:
+                    self._exit_pending = True
+                    self.close()
+            return
+
+        if self._in_trade:
             return
 
         dt  = self.data.datetime.datetime(0).replace(tzinfo=None, microsecond=0)
@@ -212,28 +248,20 @@ class MLSignalStrategy(bt.Strategy):
             if tp is None: tp = close_price * 1.006
             if sl >= close_price or tp <= close_price:
                 return
-            self.buy_bracket(
-                size=size,
-                price=close_price,
-                exectype=bt.Order.Market,
-                stopprice=float(sl),
-                limitprice=float(tp),
-            )
+            self.buy(size=size)
         else:
             if sl is None: sl = close_price * 1.003
             if tp is None: tp = close_price * 0.994
             if sl <= close_price or tp >= close_price:
                 return
-            self.sell_bracket(
-                size=size,
-                price=close_price,
-                exectype=bt.Order.Market,
-                stopprice=float(sl),
-                limitprice=float(tp),
-            )
+            self.sell(size=size)
 
         self._in_trade = True
         self._entries_submitted += 1
+        self._exit_pending = False
+        self._sl = float(sl)
+        self._tp = float(tp)
+        self._side = pred_label
 
     # ------------------------------------------------------------------
     @property
