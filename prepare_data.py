@@ -82,7 +82,7 @@ class DataPreparator:
 
         df = self.db.fetch_dataframe(query, tuple(params) if params else None)
 
-        print(f"✓ Fetched {len(df)} records from database")
+        print(f"[OK] Fetched {len(df)} records from database")
         return df
 
     def apply_strategy_signals(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -131,7 +131,8 @@ class DataPreparator:
 
         # Count signals
         signal_counts = df['strategy_signal'].value_counts()
-        print(f"✓ Strategy signals applied:")
+        # Use ASCII to avoid Windows cp1252 console encoding errors.
+        print("[OK] Strategy signals applied:")
         for signal, count in signal_counts.items():
             print(f"  - {signal}: {count}")
 
@@ -216,7 +217,7 @@ class DataPreparator:
         signal_map = {'buy': 1, 'sell': -1, 'neutral': 0}
         df['strategy_signal_encoded'] = df['strategy_signal'].map(signal_map).fillna(0)
 
-        print(f"✓ Engineered {len(df.columns)} features")
+        print(f"[OK] Engineered {len(df.columns)} features")
         return df
 
     def create_zone_outcome_labels(
@@ -360,7 +361,7 @@ class DataPreparator:
         df = df.dropna()
         dropped = initial_count - len(df)
 
-        print(f"✓ Created lagged features (dropped {dropped} rows with NaN)")
+        print(f"[OK] Created lagged features (dropped {dropped} rows with NaN)")
         return df
 
     def prepare_features_and_target(
@@ -406,7 +407,7 @@ class DataPreparator:
             index=X.index
         )
 
-        print(f"✓ Prepared {len(self.feature_columns)} features for {len(X)} samples")
+        print(f"[OK] Prepared {len(self.feature_columns)} features for {len(X)} samples")
         print(f"  Target distribution: buy={int(y.sum())}, sell={int(len(y) - y.sum())}")
 
         return X_scaled, y
@@ -497,7 +498,7 @@ class DataPreparator:
         # Step 6: Keep only actionable samples (exclude neutral / unknown outcomes)
         initial_count = len(data)
         data = data[data['zone_label'] != 0].copy()
-        print(f"✓ Filtered neutral labels: {initial_count - len(data)} rows removed")
+        print(f"[OK] Filtered neutral labels: {initial_count - len(data)} rows removed")
 
         # Save prepared timeframe data to parquet files
         self.save_timeframe_parquets(data)

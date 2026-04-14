@@ -56,7 +56,8 @@ class DatabaseConnection:
             db_url = f"postgresql+psycopg2://{self.user}:{encoded_password}@{self.host}:{self.port}/{self.database}"
             self.engine = create_engine(db_url)
             
-            print(f"✓ Connected to PostgreSQL database: {self.database}")
+            # Use ASCII to avoid Windows cp1252 console encoding errors.
+            print(f"[OK] Connected to PostgreSQL database: {self.database}")
             return True
         except psycopg2.Error as e:
             print(f"✗ Database connection failed: {e}")
@@ -68,7 +69,7 @@ class DatabaseConnection:
             self.cursor.close()
         if self.connection:
             self.connection.close()
-            print("✓ Database connection closed")
+            print("[OK] Database connection closed")
 
     def execute_query(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
         """

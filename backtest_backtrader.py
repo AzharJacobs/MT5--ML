@@ -130,31 +130,53 @@ class MLSignalStrategy(bt.Strategy):
         if self._pending_order is not None:
             return
 
-        dt = self.data.datetime.datetime(0)
+        # Backtrader datetimes and pandas datetimes can differ subtly (tzinfo, microseconds).
+        # Normalize to a tz-naive, second-resolution datetime for stable dict lookup.
+        dt = self.data.datetime.datetime(0).replace(tzinfo=None, microsecond=0)
         row = self.features_by_dt.get(dt)
         if row is None:
             return
 
         X_row = row["X"]
         proba = self.model.predict_proba(X_row)[0]
-        pred = int(np.argmax(proba))  # 0 sell, 1 buy
+        pred_idx = int(np.argmax(proba))
         conf = float(np.max(proba))
 
         if conf < float(self.p.confidence):
             return
 
+        # Use explicit class labels (supports 2-class or 3-class: buy/sell/neutral).
+        classes = getattr(self.model, "classes_", None)
+        if classes is None:
+            # Fallback to old convention if model doesn't expose classes_
+            pred_label = "buy" if pred_idx == 1 else "sell"
+        else:
+            raw_label = classes[pred_idx]
+            # Common training setups:
+            # - binary: {0,1} meaning {sell,buy}
+            # - ternary: {"sell","buy","neutral"} (or similar strings)
+            if isinstance(raw_label, (int, np.integer)):
+                pred_label = "buy" if int(raw_label) == 1 else "sell"
+            else:
+                pred_label = str(raw_label).lower()
+
+        if pred_label in {"neutral", "hold"}:
+            return
+
         # Simple regime:
-        # - pred==1: be long
-        # - pred==0: be short
-        if pred == 1:
+        # - "buy": be long
+        # - "sell": be short
+        if pred_label == "buy":
             if self.position.size <= 0:
                 if self.position.size < 0:
                     self._pending_order = self.close()
+                    return  # wait for close to complete
                 self._pending_order = self.buy()
         else:
             if self.position.size >= 0:
                 if self.position.size > 0:
                     self._pending_order = self.close()
+                    return  # wait for close to complete
                 self._pending_order = self.sell()
 
     @property
@@ -217,7 +239,7 @@ def run_backtest(
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]
     features_by_dt = {}
     for _, r in X_scaled.iterrows():
-        dt = r["timestamp"].to_pydatetime()
+        dt = r["timestamp"].to_pydatetime().replace(tzinfo=None, microsecond=0)
         X_row = pd.DataFrame([r[feature_cols].to_numpy()], columns=feature_cols)
         features_by_dt[dt] = {"X": X_row}
 
@@ -293,7 +315,8 @@ def main() -> None:
     print("BACKTEST RESULTS (Backtrader)")
     print("=" * 60)
     print(f"Timeframe:            {args.timeframe}")
-    print(f"Date range:           {args.start_date or 'ALL'} → {args.end_date or 'ALL'}")
+    # Use ASCII to avoid Windows cp1252 console encoding errors.
+    print(f"Date range:           {args.start_date or 'ALL'} -> {args.end_date or 'ALL'}")
     print(f"Final portfolio value:{res.final_value:,.2f}")
     print(f"PnL:                  {res.pnl:,.2f}")
     print(f"Max drawdown:         {res.max_drawdown_pct:.2f}%")

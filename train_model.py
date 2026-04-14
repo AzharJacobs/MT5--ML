@@ -337,12 +337,13 @@ class ModelTrainer:
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
         model = joblib.load(model_path)
-        print(f"✓ Model loaded from: {model_path}")
+        # Use ASCII to avoid Windows cp1252 console encoding errors.
+        print(f"[OK] Model loaded from: {model_path}")
 
         metadata = {}
         if os.path.exists(metadata_path):
             metadata = joblib.load(metadata_path)
-            print(f"✓ Metadata loaded from: {metadata_path}")
+            print(f"[OK] Metadata loaded from: {metadata_path}")
 
         return model, metadata
 
