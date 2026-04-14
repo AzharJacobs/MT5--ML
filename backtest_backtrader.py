@@ -39,6 +39,7 @@ class BacktestResult:
     max_drawdown_pct: float
     winrate_pct: float
     total_trades: int
+    entries_submitted: int
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -100,10 +101,12 @@ class MLSignalStrategy(bt.Strategy):
     )
 
     def __init__(self):
-        self._pending_order = None
+        # Track any submitted/accepted orders (including bracket legs).
+        self._pending_orders = []
         self._wins = 0
         self._losses = 0
         self._trade_count = 0
+        self._entries_submitted = 0
 
         # Injected externally
         self.model = getattr(self, "model", None)
@@ -116,7 +119,10 @@ class MLSignalStrategy(bt.Strategy):
         if order.status in [order.Submitted, order.Accepted]:
             return
         if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
-            self._pending_order = None
+            try:
+                self._pending_orders.remove(order)
+            except ValueError:
+                pass
 
     def notify_trade(self, trade):
         if not trade.isclosed:
@@ -128,7 +134,7 @@ class MLSignalStrategy(bt.Strategy):
             self._losses += 1
 
     def next(self):
-        if self._pending_order is not None:
+        if self._pending_orders:
             return
 
         # Backtrader datetimes and pandas datetimes can differ subtly (tzinfo, microseconds).
@@ -188,33 +194,51 @@ class MLSignalStrategy(bt.Strategy):
         if pred_label == "buy":
             if self.position.size <= 0:
                 if self.position.size < 0:
-                    self._pending_order = self.close()
+                    o = self.close()
+                    if o is not None:
+                        self._pending_orders.append(o)
                     return  # wait for close to complete
                 sl = calculate_stop_loss(close_price, "buy", lookback_df)
                 tp = calculate_take_profit(close_price, "buy", lookback_df)
-                if sl is None or tp is None:
-                    return
-                self._pending_order = self.buy_bracket(
+                # Fallback: if zone-based SL/TP can't be computed from the 20-bar lookback,
+                # use a simple fixed-percent bracket so the backtest can still trade.
+                if sl is None:
+                    sl = close_price * (1.0 - 0.003)
+                if tp is None:
+                    tp = close_price * (1.0 + 0.006)
+                orders = self.buy_bracket(
                     price=close_price,
                     exectype=bt.Order.Market,
                     stopprice=float(sl),
                     limitprice=float(tp),
                 )
+                for o in orders:
+                    if o is not None:
+                        self._pending_orders.append(o)
+                self._entries_submitted += 1
         else:
             if self.position.size >= 0:
                 if self.position.size > 0:
-                    self._pending_order = self.close()
+                    o = self.close()
+                    if o is not None:
+                        self._pending_orders.append(o)
                     return  # wait for close to complete
                 sl = calculate_stop_loss(close_price, "sell", lookback_df)
                 tp = calculate_take_profit(close_price, "sell", lookback_df)
-                if sl is None or tp is None:
-                    return
-                self._pending_order = self.sell_bracket(
+                if sl is None:
+                    sl = close_price * (1.0 + 0.003)
+                if tp is None:
+                    tp = close_price * (1.0 - 0.006)
+                orders = self.sell_bracket(
                     price=close_price,
                     exectype=bt.Order.Market,
                     stopprice=float(sl),
                     limitprice=float(tp),
                 )
+                for o in orders:
+                    if o is not None:
+                        self._pending_orders.append(o)
+                self._entries_submitted += 1
 
     @property
     def wins(self) -> int:
@@ -227,6 +251,10 @@ class MLSignalStrategy(bt.Strategy):
     @property
     def trades(self) -> int:
         return self._trade_count
+
+    @property
+    def entries_submitted(self) -> int:
+        return self._entries_submitted
 
 
 def run_backtest(
@@ -313,6 +341,7 @@ def run_backtest(
     wins = int(getattr(strat_inst, "wins", 0))
     losses = int(getattr(strat_inst, "losses", 0))
     trades = int(getattr(strat_inst, "trades", 0))
+    entries = int(getattr(strat_inst, "entries_submitted", 0))
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
     return BacktestResult(
@@ -320,7 +349,8 @@ def run_backtest(
         pnl=float(end_value - start_value),
         max_drawdown_pct=max_dd,
         winrate_pct=float(winrate),
-        total_trades=trades
+        total_trades=trades,
+        entries_submitted=entries,
     )
 
 
@@ -358,6 +388,7 @@ def main() -> None:
     print(f"PnL:                  {res.pnl:,.2f}")
     print(f"Max drawdown:         {res.max_drawdown_pct:.2f}%")
     print(f"Trades:               {res.total_trades}")
+    print(f"Entries submitted:    {res.entries_submitted}")
     print(f"Winrate:              {res.winrate_pct:.2f}%")
 
 

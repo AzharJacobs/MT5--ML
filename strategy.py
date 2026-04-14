@@ -57,10 +57,10 @@ USE_ZONE_FRESHNESS = True        # Prefer zones that haven't been touched before
 USE_MIDLINE_TP = True            # Use 50% midpoint between zones as take-profit
  
 # Zone detection thresholds
-STRONG_MOVE_THRESHOLD = 0.003    # Minimum % move to qualify as strong departure (0.3%)
-ZONE_BODY_RATIO_MIN = 0.6        # Minimum body/candle ratio for a strong zone candle
+STRONG_MOVE_THRESHOLD = 0.0010    # Minimum % move to qualify as strong departure (0.3%)
+ZONE_BODY_RATIO_MIN = 0.50       # Minimum body/candle ratio for a strong zone candle
 ZONE_TOUCH_TOLERANCE = 0.001     # How close price needs to be to zone boundary (0.1%)
-MAX_ZONE_AGE = 50                # Discard zones older than this many candles
+MAX_ZONE_AGE = 60                # Discard zones older than this many candles
 MIN_ZONE_CANDLES = 2             # Minimum consecutive strong candles to form a zone
  
  
