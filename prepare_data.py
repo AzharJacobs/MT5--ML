@@ -220,28 +220,28 @@ class DataPreparator:
         print(f"[OK] Engineered {len(df.columns)} features")
         return df
 
-    def create_zone_outcome_labels(
+    def create_forward_movement_labels(
         self,
         df: pd.DataFrame,
-        zone_lookback: int = 30,
-        horizon: int = 20,
-        zone_touch_tolerance: float = ZONE_TOUCH_TOLERANCE,
+        forward_bars: int = 3,
+        move_threshold: float = 0.003,
     ) -> pd.DataFrame:
         """
-        Create forward-looking zone-to-zone outcome labels with zero lookahead in zone detection.
+        Create forward-looking movement outcome labels.
+
+        This labels *actual future price movement* after a strategy signal rather than
+        labeling based on zone detection at the current bar.
 
         Label semantics:
-          -  1 (buy): price returns into a past-identified demand zone, then reaches the next supply zone within N candles.
-          - -1 (sell): price returns into a past-identified supply zone, then reaches the next demand zone within N candles.
-          -  0 (neutral): outcome not achieved within horizon, or missing required zones.
-
-        Important:
-          - Zones are detected using ONLY past candles (lookback window ending at t-1).
-          - Outcome is evaluated using ONLY future candles (t+1 ... t+horizon).
+          -  1 (buy): a buy signal occurred at t, and within the next N bars price moved up
+                     by at least `move_threshold` from the entry close (uses future highs).
+          - -1 (sell): a sell signal occurred at t, and within the next N bars price moved down
+                      by at least `move_threshold` from the entry close (uses future lows).
+          -  0 (neutral): no signal or threshold not reached within N bars.
         """
         print(
-            "Creating forward-looking zone outcome labels "
-            f"(lookback={zone_lookback}, horizon={horizon})..."
+            "Creating forward-looking movement labels "
+            f"(forward_bars={forward_bars}, move_threshold={move_threshold})..."
         )
 
         df = df.sort_values(['timeframe', 'timestamp']).reset_index(drop=True).copy()
@@ -252,50 +252,32 @@ class DataPreparator:
         for timeframe in df['timeframe'].unique():
             tf = df[df['timeframe'] == timeframe].copy().reset_index(drop=True)
 
-            if len(tf) < (zone_lookback + horizon + 2):
+            if len(tf) < (forward_bars + 2):
                 labeled_dfs.append(tf)
                 continue
 
             labels = np.zeros(len(tf), dtype=int)
 
-            for i in range(zone_lookback, len(tf) - horizon - 1):
-                lookback_data = tf.iloc[i - zone_lookback:i]
+            for i in range(0, len(tf) - forward_bars - 1):
                 current = tf.iloc[i]
                 close_price = float(current['close'])
+                sig = str(current.get('strategy_signal', 'neutral')).lower()
 
-                demand_zone = detect_demand_zone(lookback_data)
-                supply_zone = detect_supply_zone(lookback_data)
-
-                in_demand = demand_zone is not None and price_in_zone(
-                    close_price, demand_zone, tolerance=zone_touch_tolerance
-                )
-                in_supply = supply_zone is not None and price_in_zone(
-                    close_price, supply_zone, tolerance=zone_touch_tolerance
-                )
-
-                if not in_demand and not in_supply:
+                if sig not in {"buy", "sell"}:
                     continue
 
-                future = tf.iloc[i + 1:i + 1 + horizon]
+                future = tf.iloc[i + 1:i + 1 + forward_bars]
                 if future.empty:
                     continue
 
-                # BUY setup: return to demand -> reach next supply
-                if in_demand and supply_zone is not None:
-                    target_price = float(supply_zone['low']) * (1 - zone_touch_tolerance)
-                    if float(future['high'].max()) >= target_price:
+                if sig == "buy":
+                    up_target = close_price * (1.0 + float(move_threshold))
+                    if float(future["high"].max()) >= up_target:
                         labels[i] = 1
-                    else:
-                        labels[i] = 0
-                    continue
-
-                # SELL setup: return to supply -> reach next demand
-                if in_supply and demand_zone is not None:
-                    target_price = float(demand_zone['high']) * (1 + zone_touch_tolerance)
-                    if float(future['low'].min()) <= target_price:
+                elif sig == "sell":
+                    down_target = close_price * (1.0 - float(move_threshold))
+                    if float(future["low"].min()) <= down_target:
                         labels[i] = -1
-                    else:
-                        labels[i] = 0
 
             tf['zone_label'] = labels
             labeled_dfs.append(tf)
@@ -304,7 +286,7 @@ class DataPreparator:
 
         vc = df['zone_label'].value_counts().to_dict()
         print(
-            "✓ Zone labels created: "
+            "✓ Labels created: "
             f"buy={vc.get(1, 0)}, sell={vc.get(-1, 0)}, neutral={vc.get(0, 0)}"
         )
 
@@ -397,7 +379,7 @@ class DataPreparator:
         # Target: zone-to-zone outcome (binary for classifier): 1=buy success, 0=sell success
         # Neutral (0) is excluded before this function is called.
         if 'zone_label' not in df.columns:
-            raise ValueError("Missing 'zone_label'. Run create_zone_outcome_labels() first.")
+            raise ValueError("Missing 'zone_label'. Run create_forward_movement_labels() first.")
         y = (df['zone_label'] == 1).astype(int).copy()
 
         # Scale features
@@ -458,8 +440,8 @@ class DataPreparator:
         start_date: str = None,
         end_date: str = None,
         lag_periods: int = 5,
-        zone_lookback: int = 30,
-        zone_horizon: int = 20,
+        forward_bars: int = 3,
+        move_threshold: float = 0.003,
     ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
         """
         Full data preparation pipeline.
@@ -485,11 +467,11 @@ class DataPreparator:
         # Step 3: Engineer features
         data = self.engineer_features(data)
 
-        # Step 4: Create forward-looking outcome labels (uses past zones + future reach)
-        data = self.create_zone_outcome_labels(
+        # Step 4: Create forward-looking outcome labels (future movement after signal)
+        data = self.create_forward_movement_labels(
             data,
-            zone_lookback=zone_lookback,
-            horizon=zone_horizon,
+            forward_bars=forward_bars,
+            move_threshold=move_threshold,
         )
 
         # Step 5: Create lagged features (ALL ML features are lagged; no current candle leakage)
@@ -526,8 +508,8 @@ def prepare_data(
     start_date: str = None,
     end_date: str = None,
     lag_periods: int = 5,
-    zone_lookback: int = 30,
-    zone_horizon: int = 20,
+    forward_bars: int = 3,
+    move_threshold: float = 0.003,
 ) -> Tuple[pd.DataFrame, pd.Series, DataPreparator]:
     """
     Convenience function for data preparation.
@@ -537,7 +519,7 @@ def prepare_data(
     """
     preparator = DataPreparator()
     X, y, _ = preparator.prepare_data(
-        timeframes, start_date, end_date, lag_periods, zone_lookback, zone_horizon
+        timeframes, start_date, end_date, lag_periods, forward_bars, move_threshold
     )
     return X, y, preparator
 

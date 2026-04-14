@@ -161,10 +161,9 @@ def detect_supply_zone(lookback_data: pd.DataFrame) -> dict | None:
 
     Returns a dict with zone 'high' and 'low' price levels, or None.
     """
-    # Relaxed thresholds specifically for SUPPLY detection to generate more sell labels.
-    # Target a buy/sell ratio closer to ~2:1 (not ~4:1).
-    supply_strong_move_threshold = 0.002  # was STRONG_MOVE_THRESHOLD (0.003)
-    supply_min_zone_candles = 1           # was MIN_ZONE_CANDLES (2)
+    # Use the same thresholds as demand zone detection.
+    supply_strong_move_threshold = STRONG_MOVE_THRESHOLD
+    supply_min_zone_candles = MIN_ZONE_CANDLES
 
     if lookback_data is None or len(lookback_data) < supply_min_zone_candles + 1:
         return None

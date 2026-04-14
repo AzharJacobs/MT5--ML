@@ -79,8 +79,8 @@ class ModelTrainer:
                 loss_function="Logloss",
                 eval_metric="AUC",
                 random_seed=42,
-                verbose=False
-                # class_weights are set later after data is loaded
+                verbose=False,
+                auto_class_weights="Balanced",
             )
         elif self.model_type == "xgboost":
             if XGBClassifier is None:
@@ -104,7 +104,8 @@ class ModelTrainer:
             self.model = LogisticRegression(
                 max_iter=1000,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                class_weight="balanced",
             )
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
@@ -169,24 +170,15 @@ class ModelTrainer:
         print(f"\nTraining {self.model_type} model...")
         start_time = datetime.now()
 
-        # Add class weights (helps imbalance). For CatBoost, build the estimator
-        # with class_weights baked in so sklearn clone() works reliably in CV.
-        if self.model_type == "catboost":
+        # Handle class imbalance via built-in balancing rather than relaxing strategy thresholds.
+        if self.model_type == "xgboost":
             y_arr = np.asarray(y_train)
             n0 = int(np.sum(y_arr == 0))
             n1 = int(np.sum(y_arr == 1))
             if n0 == 0 or n1 == 0:
-                raise ValueError(f"Cannot compute class weights (n0={n0}, n1={n1}).")
-            self.model = CatBoostClassifier(
-                iterations=500,
-                depth=6,
-                learning_rate=0.05,
-                loss_function="Logloss",
-                eval_metric="AUC",
-                random_seed=42,
-                verbose=False,
-                class_weights={0: len(y_arr) / n0, 1: len(y_arr) / n1},
-            )
+                raise ValueError(f"Cannot compute scale_pos_weight (n0={n0}, n1={n1}).")
+            # roughly equivalent to class_weight="balanced" for binary problems
+            self.model.set_params(scale_pos_weight=float(n0) / float(n1))
 
         self.model.fit(X_train, y_train)
 

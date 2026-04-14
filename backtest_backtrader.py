@@ -29,6 +29,7 @@ import backtrader as bt
 from db_connect import get_connection
 from prepare_data import DataPreparator
 from train_model import ModelTrainer, MODEL_DIR
+from strategy import calculate_stop_loss, calculate_take_profit
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,24 @@ class MLSignalStrategy(bt.Strategy):
         if pred_label in {"neutral", "hold"}:
             return
 
+        close_price = float(self.data.close[0])
+
+        # Build OHLCV lookback (oldest -> newest) for SL/TP calculators.
+        lookback_n = 20
+        if len(self.data) < lookback_n:
+            return
+        lookback_df = pd.DataFrame({
+            "open":   [float(self.data.open[-i]) for i in range(lookback_n - 1, -1, -1)],
+            "high":   [float(self.data.high[-i]) for i in range(lookback_n - 1, -1, -1)],
+            "low":    [float(self.data.low[-i]) for i in range(lookback_n - 1, -1, -1)],
+            "close":  [float(self.data.close[-i]) for i in range(lookback_n - 1, -1, -1)],
+            "volume": [float(self.data.volume[-i]) for i in range(lookback_n - 1, -1, -1)],
+        })
+        lookback_df["candle_size"] = lookback_df["high"] - lookback_df["low"]
+        lookback_df["body_size"] = (lookback_df["close"] - lookback_df["open"]).abs()
+        lookback_df["wick_upper"] = lookback_df["high"] - lookback_df[["close", "open"]].max(axis=1)
+        lookback_df["wick_lower"] = lookback_df[["close", "open"]].min(axis=1) - lookback_df["low"]
+
         # Simple regime:
         # - "buy": be long
         # - "sell": be short
@@ -171,13 +190,31 @@ class MLSignalStrategy(bt.Strategy):
                 if self.position.size < 0:
                     self._pending_order = self.close()
                     return  # wait for close to complete
-                self._pending_order = self.buy()
+                sl = calculate_stop_loss(close_price, "buy", lookback_df)
+                tp = calculate_take_profit(close_price, "buy", lookback_df)
+                if sl is None or tp is None:
+                    return
+                self._pending_order = self.buy_bracket(
+                    price=close_price,
+                    exectype=bt.Order.Market,
+                    stopprice=float(sl),
+                    limitprice=float(tp),
+                )
         else:
             if self.position.size >= 0:
                 if self.position.size > 0:
                     self._pending_order = self.close()
                     return  # wait for close to complete
-                self._pending_order = self.sell()
+                sl = calculate_stop_loss(close_price, "sell", lookback_df)
+                tp = calculate_take_profit(close_price, "sell", lookback_df)
+                if sl is None or tp is None:
+                    return
+                self._pending_order = self.sell_bracket(
+                    price=close_price,
+                    exectype=bt.Order.Market,
+                    stopprice=float(sl),
+                    limitprice=float(tp),
+                )
 
     @property
     def wins(self) -> int:
