@@ -144,10 +144,15 @@ class ModelTrainer:
             best_params = self._tune(X_train, y_train, n_trials=tune_trials)
             self._init_model(best_params)
 
-        # Handle class imbalance for XGBoost
-        # XGBoost doesn't support multi-class scale_pos_weight directly,
-        # so we use sample_weight instead
-        sample_weight = self._compute_sample_weights(y_train)
+        # XGBoost requires classes to be 0-indexed integers.
+        # Remap: -1->0, 0->1, 1->2 (stored in metadata for reverse mapping at prediction)
+        self.label_map         = {-1: 0, 0: 1, 1: 2}
+        self.label_map_reverse = {0: -1, 1: 0, 2: 1}
+        y_train_mapped = y_train.map(self.label_map)
+        y_test_mapped  = y_test.map(self.label_map)
+
+        # Handle class imbalance via sample weights
+        sample_weight = self._compute_sample_weights(y_train_mapped)
 
         # Train
         print(f"\n  Training {self.model_type}...")
@@ -155,13 +160,17 @@ class ModelTrainer:
 
         if self.model_type == "xgboost":
             self.model.fit(
-                X_train, y_train,
+                X_train, y_train_mapped,
                 sample_weight=sample_weight,
-                eval_set=[(X_test, y_test)],
+                eval_set=[(X_test, y_test_mapped)],
                 verbose=False,
             )
         else:
-            self.model.fit(X_train, y_train, sample_weight=sample_weight)
+            self.model.fit(X_train, y_train_mapped, sample_weight=sample_weight)
+
+        # Use mapped labels for evaluation
+        y_train = y_train_mapped
+        y_test  = y_test_mapped
 
         elapsed = (datetime.now() - t0).total_seconds()
         print(f"  Training complete in {elapsed:.1f}s")
@@ -187,6 +196,8 @@ class ModelTrainer:
             "feature_columns": self.preparator.get_feature_columns(),
             "scaler":          self.preparator.get_scaler(),
             "results":         results,
+            "label_map":        self.label_map,
+            "label_map_reverse": self.label_map_reverse,
             "train_rows":      len(X_train),
             "test_rows":       len(X_test),
         }

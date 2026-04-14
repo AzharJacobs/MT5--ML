@@ -158,6 +158,7 @@ class DataPreparator:
                 feat_df,
                 max_bars=params["max_bars"],
                 min_rr=params["min_rr"],
+                timeframe=tf,
             )
 
             labeled["timeframe"] = tf
