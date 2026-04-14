@@ -1,568 +1,255 @@
 """
-prepare_data.py - Data Preparation Module
-==========================================
-
-Pulls OHLCV data directly from PostgreSQL and prepares it for ML training.
-Applies trading strategy signals as additional features.
+prepare_data.py — Data Preparation (New Pipeline)
+==================================================
+Replaces the old prepare_data.py entirely.
+Pulls OHLCV data from PostgreSQL, runs the Zone-to-Zone
+feature + label pipeline, and returns train/test splits
+ready for train_model.py.
 """
 
-import argparse
-from pathlib import Path
-
+import os
+import logging
 import pandas as pd
 import numpy as np
-from typing import Tuple, Dict, List, Optional
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from db_connect import get_connection, DatabaseConnection
-from strategy import (
-    apply_strategy,
-    LOOKBACK_PERIODS,
-    detect_demand_zone,
-    detect_supply_zone,
-    price_in_zone,
-    ZONE_TOUCH_TOLERANCE,
+from typing import List, Tuple, Optional
+from sklearn.preprocessing import StandardScaler
+
+from db_connect import get_connection
+from features import build_features, FEATURE_COLUMNS
+from labels import generate_labels, get_class_weights
+
+logger = logging.getLogger("mt5_collector.prepare_data")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s"
 )
+
+# Timeframes that get 1H + 4H HTF context injected
+LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
+
+# Per-timeframe tuning — controls zone sensitivity and label simulation window
+TF_PARAMS = {
+    "1min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.0},
+    "2min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.0},
+    "3min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.0},
+    "4min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.0},
+    "5min":  {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.0},
+    "10min": {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.0},
+    "15min": {"impulse_atr": 0.5, "max_bars": 80,  "min_rr": 1.0},
+    "30min": {"impulse_atr": 0.6, "max_bars": 80,  "min_rr": 1.0},
+    "1H":    {"impulse_atr": 0.6, "max_bars": 120, "min_rr": 1.0},
+    "4H":    {"impulse_atr": 0.7, "max_bars": 60,  "min_rr": 1.0},
+    "1D":    {"impulse_atr": 0.8, "max_bars": 30,  "min_rr": 1.0},
+}
+
+# Categorical columns that need encoding before model training
+CATEGORICAL_COLS = ["direction", "session", "day_of_week"]
 
 
 class DataPreparator:
     """
-    Handles all data preparation for the ML model.
-    Pulls data from PostgreSQL and applies strategy signals.
+    Full data preparation pipeline for Zone-to-Zone ML model.
+    Replaces the old DataPreparator — same interface, new internals.
     """
 
     def __init__(self):
-        """Initialize data preparator with database connection."""
-        self.db: DatabaseConnection = get_connection()
-        self.label_encoder = LabelEncoder()
-        self.scaler = StandardScaler()
+        self.scaler           = StandardScaler()
         self.feature_columns: List[str] = []
-        self.timeframe_encoder = LabelEncoder()
+        self._db              = get_connection()
 
-    def fetch_training_data(
-        self,
-        timeframes: List[str] = None,
-        start_date: str = None,
-        end_date: str = None
-    ) -> pd.DataFrame:
+    # ------------------------------------------------------------------
+    def _load_ohlcv(self, timeframe: str, symbol: str) -> pd.DataFrame:
+        """Load raw OHLCV from PostgreSQL via SQLAlchemy engine."""
+        if not self._db.connect():
+            raise ConnectionError("Cannot connect to database")
+
+        query = """
+            SELECT timestamp, open, high, low, close, volume,
+                   hour, day_of_week, month, year, session,
+                   direction, candle_size, body_size, wick_upper, wick_lower
+            FROM ustech_ohlcv
+            WHERE symbol = %s AND timeframe = %s
+            ORDER BY timestamp ASC
         """
-        Fetch training data from PostgreSQL database.
-
-        Args:
-            timeframes: List of timeframes to include (None = all)
-            start_date: Start date filter (YYYY-MM-DD)
-            end_date: End date filter (YYYY-MM-DD)
-
-        Returns:
-            Raw DataFrame from database
-        """
-        print("Fetching training data from PostgreSQL...")
-
-        if not self.db.connect():
-            raise ConnectionError("Failed to connect to database")
-
-        # Build query for multiple timeframes
-        query_parts = ["SELECT * FROM ustech_ohlcv WHERE 1=1"]
-        params = []
-
-        if timeframes:
-            placeholders = ', '.join(['%s'] * len(timeframes))
-            query_parts.append(f"AND timeframe IN ({placeholders})")
-            params.extend(timeframes)
-
-        if start_date:
-            query_parts.append("AND date >= %s")
-            params.append(start_date)
-
-        if end_date:
-            query_parts.append("AND date <= %s")
-            params.append(end_date)
-
-        query_parts.append("ORDER BY timeframe, timestamp ASC")
-        query = " ".join(query_parts)
-
-        df = self.db.fetch_dataframe(query, tuple(params) if params else None)
-
-        print(f"[OK] Fetched {len(df)} records from database")
+        df = self._db.fetch_dataframe(query, (symbol, timeframe))
+        logger.info(f"Loaded {len(df):,} rows for {timeframe}")
         return df
 
-    def apply_strategy_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Apply trading strategy to each candle and add signal column.
-
-        Args:
-            df: DataFrame with OHLCV data
-
-        Returns:
-            DataFrame with added 'strategy_signal' column
-        """
-        print("Applying trading strategy signals...")
-
-        # Sort by timeframe and timestamp to ensure correct order
-        df = df.sort_values(['timeframe', 'timestamp']).reset_index(drop=True)
-
-        strategy_signals = []
-
-        # Process each timeframe separately
-        for timeframe in df['timeframe'].unique():
-            tf_data = df[df['timeframe'] == timeframe].copy()
-
-            for i in range(len(tf_data)):
-                current_candle = tf_data.iloc[i]
-
-                # Get lookback data (previous N candles)
-                if i >= LOOKBACK_PERIODS:
-                    lookback_start = i - LOOKBACK_PERIODS
-                    lookback_data = tf_data.iloc[lookback_start:i]
-                elif i > 0:
-                    lookback_data = tf_data.iloc[0:i]
-                else:
-                    lookback_data = None
-
-                # Apply strategy
-                signal = apply_strategy(current_candle, lookback_data)
-                strategy_signals.append({
-                    'index': tf_data.index[i],
-                    'signal': signal
-                })
-
-        # Create signal mapping
-        signal_map = {item['index']: item['signal'] for item in strategy_signals}
-        df['strategy_signal'] = df.index.map(signal_map)
-
-        # Count signals
-        signal_counts = df['strategy_signal'].value_counts()
-        # Use ASCII to avoid Windows cp1252 console encoding errors.
-        print("[OK] Strategy signals applied:")
-        for signal, count in signal_counts.items():
-            print(f"  - {signal}: {count}")
-
-        return df
-
-    def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Create additional features for ML model.
-
-        Args:
-            df: DataFrame with OHLCV data
-
-        Returns:
-            DataFrame with engineered features
-        """
-        print("Engineering features...")
-
+    # ------------------------------------------------------------------
+    def _encode_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Label-encode categorical columns so XGBoost can consume them."""
         df = df.copy()
+        day_map = {
+            "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+            "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6,
+        }
+        dir_map     = {"buy": 1, "sell": -1, "neutral": 0}
+        session_map = {
+            "asian": 0, "london": 1, "london_ny_overlap": 2,
+            "new_york": 3, "off_hours": 4, "daily": 5, "unknown": -1,
+        }
 
-        # Price-based features
-        df['price_range'] = df['high'] - df['low']
-        df['price_change'] = df['close'] - df['open']
-        df['price_change_pct'] = (df['close'] - df['open']) / df['open'] * 100
-
-        # Body and wick ratios
-        df['body_to_range_ratio'] = np.where(
-            df['candle_size'] > 0,
-            df['body_size'] / df['candle_size'],
-            0
-        )
-        df['upper_wick_ratio'] = np.where(
-            df['candle_size'] > 0,
-            df['wick_upper'] / df['candle_size'],
-            0
-        )
-        df['lower_wick_ratio'] = np.where(
-            df['candle_size'] > 0,
-            df['wick_lower'] / df['candle_size'],
-            0
-        )
-
-        # Volume features (if volume > 0)
-        df['volume_normalized'] = df.groupby('timeframe')['volume'].transform(
-            lambda x: (x - x.mean()) / x.std() if x.std() > 0 else 0
-        )
-
-        # Time-based cyclical features (for better pattern recognition)
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-
-        if not pd.api.types.is_numeric_dtype(df['day_of_week']):
-            day_map = {
-                'monday': 0,
-                'tuesday': 1,
-                'wednesday': 2,
-                'thursday': 3,
-                'friday': 4,
-                'saturday': 5,
-                'sunday': 6
-            }
-            df['day_of_week'] = (
-                df['day_of_week']
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .map(day_map)
-            )
-            df['day_of_week'] = pd.to_numeric(df['day_of_week'], errors='coerce').fillna(0).astype(int)
-
-        df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-        df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
-        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-
-        # Encode timeframe
-        df['timeframe_encoded'] = self.timeframe_encoder.fit_transform(df['timeframe'])
-
-        # Binary direction encoding
-        df['is_bullish'] = (df['direction'] == 'buy').astype(int)
-
-        # Strategy signal encoding
-        signal_map = {'buy': 1, 'sell': -1, 'neutral': 0}
-        df['strategy_signal_encoded'] = df['strategy_signal'].map(signal_map).fillna(0)
-
-        print(f"[OK] Engineered {len(df.columns)} features")
-        return df
-
-    def create_forward_movement_labels(
-        self,
-        df: pd.DataFrame,
-        forward_bars: int = 3,
-        move_threshold: float = 0.003,
-    ) -> pd.DataFrame:
-        """
-        Create forward-looking movement outcome labels.
-
-        This labels *actual future price movement* after a strategy signal rather than
-        labeling based on zone detection at the current bar.
-
-        Label semantics:
-          -  1 (buy): a buy signal occurred at t, and within the next N bars price moved up
-                     by at least `move_threshold` from the entry close (uses future highs).
-          - -1 (sell): a sell signal occurred at t, and within the next N bars price moved down
-                      by at least `move_threshold` from the entry close (uses future lows).
-          -  0 (neutral): no signal or threshold not reached within N bars.
-        """
-        print(
-            "Creating forward-looking movement labels "
-            f"(forward_bars={forward_bars}, move_threshold={move_threshold})..."
-        )
-
-        df = df.sort_values(['timeframe', 'timestamp']).reset_index(drop=True).copy()
-        df['zone_label'] = 0
-
-        labeled_dfs: List[pd.DataFrame] = []
-
-        for timeframe in df['timeframe'].unique():
-            tf = df[df['timeframe'] == timeframe].copy().reset_index(drop=True)
-
-            if len(tf) < (forward_bars + 2):
-                labeled_dfs.append(tf)
-                continue
-
-            labels = np.zeros(len(tf), dtype=int)
-
-            for i in range(0, len(tf) - forward_bars - 1):
-                current = tf.iloc[i]
-                close_price = float(current['close'])
-                sig = str(current.get('strategy_signal', 'neutral')).lower()
-
-                if sig not in {"buy", "sell"}:
-                    continue
-
-                future = tf.iloc[i + 1:i + 1 + forward_bars]
-                if future.empty:
-                    continue
-
-                if sig == "buy":
-                    up_target = close_price * (1.0 + float(move_threshold))
-                    if float(future["high"].max()) >= up_target:
-                        labels[i] = 1
-                elif sig == "sell":
-                    down_target = close_price * (1.0 - float(move_threshold))
-                    if float(future["low"].min()) <= down_target:
-                        labels[i] = -1
-
-            tf['zone_label'] = labels
-            labeled_dfs.append(tf)
-
-        df = pd.concat(labeled_dfs, ignore_index=True)
-
-        vc = df['zone_label'].value_counts().to_dict()
-        print(
-            "✓ Labels created: "
-            f"buy={vc.get(1, 0)}, sell={vc.get(-1, 0)}, neutral={vc.get(0, 0)}"
-        )
+        if "day_of_week" in df.columns:
+            df["day_of_week"] = df["day_of_week"].map(day_map).fillna(0).astype(float)
+        if "direction" in df.columns:
+            df["direction"]   = df["direction"].map(dir_map).fillna(0).astype(float)
+        if "session" in df.columns:
+            df["session"]     = df["session"].map(session_map).fillna(-1).astype(float)
 
         return df
 
-    def create_lagged_features(
-        self,
-        df: pd.DataFrame,
-        lag_periods: int = 5
-    ) -> pd.DataFrame:
-        """
-        Create lagged features for time series prediction.
-
-        Args:
-            df: DataFrame with features
-            lag_periods: Number of lag periods to create
-
-        Returns:
-            DataFrame with lagged features
-        """
-        print(f"Creating lagged features (periods={lag_periods})...")
-
-        df = df.copy()
-        lag_columns = [
-            # Core candle features
-            'candle_size', 'body_size', 'wick_upper', 'wick_lower',
-            # Engineered price/shape features
-            'price_change_pct', 'body_to_range_ratio',
-            'upper_wick_ratio', 'lower_wick_ratio', 'volume_normalized',
-            # Time cyclical features
-            'hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos',
-            # Strategy features (derived from past candles via apply_strategy)
-            'strategy_signal_encoded',
-        ]
-
-        # Process each timeframe separately
-        lagged_dfs = []
-
-        for timeframe in df['timeframe'].unique():
-            tf_data = df[df['timeframe'] == timeframe].copy()
-            tf_data = tf_data.sort_values('timestamp')
-
-            for col in lag_columns:
-                if col in tf_data.columns:
-                    for lag in range(1, lag_periods + 1):
-                        tf_data[f'{col}_lag{lag}'] = tf_data[col].shift(lag)
-
-            lagged_dfs.append(tf_data)
-
-        df = pd.concat(lagged_dfs, ignore_index=True)
-
-        # Drop rows with NaN from lagging
-        initial_count = len(df)
-        df = df.dropna()
-        dropped = initial_count - len(df)
-
-        print(f"[OK] Created lagged features (dropped {dropped} rows with NaN)")
-        return df
-
-    def prepare_features_and_target(
-        self,
-        df: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Prepare final feature matrix (X) and target vector (y).
-
-        Args:
-            df: Prepared DataFrame
-
-        Returns:
-            Tuple of (X features DataFrame, y target Series)
-        """
-        print("Preparing features and target...")
-
-        # Define feature columns
-        # IMPORTANT: To avoid leakage, we only use lagged features (t-1, t-2, ...).
-        # No current-candle features are included in X.
-        self.feature_columns = ['timeframe_encoded']
-
-        # Add lagged feature columns if they exist
-        lag_columns = [col for col in df.columns if "_lag" in col]
-        self.feature_columns.extend(lag_columns)
-
-        # Filter to only existing columns
-        self.feature_columns = [col for col in self.feature_columns if col in df.columns]
-
-        # Create feature matrix
-        X = df[self.feature_columns].copy()
-
-        # Target: zone-to-zone outcome (binary for classifier): 1=buy success, 0=sell success
-        # Neutral (0) is excluded before this function is called.
-        if 'zone_label' not in df.columns:
-            raise ValueError("Missing 'zone_label'. Run create_forward_movement_labels() first.")
-        y = (df['zone_label'] == 1).astype(int).copy()
-
-        # Scale features
-        X_scaled = pd.DataFrame(
-            self.scaler.fit_transform(X),
-            columns=self.feature_columns,
-            index=X.index
-        )
-
-        print(f"[OK] Prepared {len(self.feature_columns)} features for {len(X)} samples")
-        print(f"  Target distribution: buy={int(y.sum())}, sell={int(len(y) - y.sum())}")
-
-        return X_scaled, y
-
-    def _save_dataframe_with_fallback(self, df: pd.DataFrame, file_path: Path) -> Path:
-        """Save a DataFrame to parquet if available, otherwise fall back to CSV."""
-        try:
-            df.to_parquet(file_path, index=False)
-            return file_path
-        except (ImportError, ValueError) as exc:
-            csv_path = file_path.with_suffix('.csv')
-            print(f"  - Parquet save failed ({exc}). Falling back to CSV: {csv_path.name}")
-            df.to_csv(csv_path, index=False)
-            return csv_path
-
-    def save_timeframe_parquets(
-        self,
-        df: pd.DataFrame,
-        output_dir: str = 'data'
-    ) -> None:
-        """
-        Save each timeframe's prepared data into parquet files, with a CSV fallback.
-
-        Args:
-            df: Prepared DataFrame with a 'timeframe' column.
-            output_dir: Relative output folder name.
-        """
-        project_root = Path(__file__).resolve().parent
-        output_path = project_root / output_dir
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        print(f"Saving prepared data to: {output_path}")
-
-        for timeframe in sorted(df['timeframe'].dropna().unique()):
-            timeframe_safe = str(timeframe).replace('/', '_').replace(' ', '_')
-            file_path = output_path / f"{timeframe_safe}.parquet"
-            tf_data = df[df['timeframe'] == timeframe].copy()
-            saved_path = self._save_dataframe_with_fallback(tf_data, file_path)
-            print(f"  - Saved {len(tf_data)} rows for timeframe '{timeframe}' to {saved_path.name}")
-
-        combined_file = output_path / "all_timeframes.parquet"
-        saved_combined = self._save_dataframe_with_fallback(df, combined_file)
-        print(f"  - Saved combined dataset to {saved_combined.name}")
-
+    # ------------------------------------------------------------------
     def prepare_data(
         self,
         timeframes: List[str] = None,
         start_date: str = None,
-        end_date: str = None,
-        lag_periods: int = 5,
-        forward_bars: int = 3,
-        move_threshold: float = 0.003,
-    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+        end_date:   str = None,
+        symbol:     str = "USTECm",
+        test_size:  float = 0.2,
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
         """
-        Full data preparation pipeline.
-
-        Args:
-            timeframes: List of timeframes to include
-            start_date: Start date filter
-            end_date: End date filter
-            lag_periods: Number of lag periods for features
+        Full pipeline: load → features → labels → encode → scale → split.
 
         Returns:
-            Tuple of (X features, y target, raw data for reference)
+            X_train, y_train, raw_train,
+            X_test,  y_test,  raw_test
         """
-        # Step 1: Fetch data from PostgreSQL
-        raw_data = self.fetch_training_data(timeframes, start_date, end_date)
+        if timeframes is None:
+            timeframes = ["5min", "15min", "1H"]
 
-        if raw_data.empty:
-            raise ValueError("No data fetched from database")
+        all_frames: List[pd.DataFrame] = []
 
-        # Step 2: Apply strategy signals
-        data = self.apply_strategy_signals(raw_data)
+        for tf in timeframes:
+            params = TF_PARAMS.get(tf, {"impulse_atr": 0.5, "max_bars": 50, "min_rr": 1.0})
+            logger.info(f"\n{'='*50}\nProcessing {tf} | params={params}\n{'='*50}")
 
-        # Step 3: Engineer features
-        data = self.engineer_features(data)
+            raw = self._load_ohlcv(tf, symbol)
+            if raw.empty:
+                logger.warning(f"No data for {tf} — skipping")
+                continue
 
-        # Step 4: Create forward-looking outcome labels (future movement after signal)
-        data = self.create_forward_movement_labels(
-            data,
-            forward_bars=forward_bars,
-            move_threshold=move_threshold,
+            # Date filters
+            raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+            if start_date:
+                raw = raw[raw["timestamp"] >= pd.to_datetime(start_date)]
+            if end_date:
+                raw = raw[raw["timestamp"] <= pd.to_datetime(end_date)]
+            if raw.empty:
+                continue
+
+            # HTF context
+            h1_df = h4_df = None
+            if tf in LTF_TIMEFRAMES:
+                h1_df = self._load_ohlcv("1H", symbol)
+                h4_df = self._load_ohlcv("4H", symbol)
+                if h1_df.empty: h1_df = None
+                if h4_df.empty: h4_df = None
+
+            # Features
+            feat_df = build_features(
+                raw,
+                h1_df=h1_df,
+                h4_df=h4_df,
+                impulse_atr_multiplier=params["impulse_atr"],
+            )
+
+            # Labels
+            labeled = generate_labels(
+                feat_df,
+                max_bars=params["max_bars"],
+                min_rr=params["min_rr"],
+            )
+
+            labeled["timeframe"] = tf
+            all_frames.append(labeled)
+
+            signals = (labeled["signal"] != 0).sum()
+            winners = (labeled["label"] != 0).sum()
+            logger.info(f"{tf} — rows={len(labeled):,} signals={signals:,} winners={winners:,}")
+
+        if not all_frames:
+            raise ValueError("No data prepared — check DB connection and timeframes")
+
+        full = pd.concat(all_frames, ignore_index=True)
+        full = full.sort_values("timestamp").reset_index(drop=True)
+
+        # Encode categoricals
+        full = self._encode_categoricals(full)
+
+        # Build feature column list (only columns that exist)
+        self.feature_columns = [c for c in FEATURE_COLUMNS if c in full.columns]
+
+        # Timeframe one-hot (gives model context on which TF it's looking at)
+        tf_dummies = pd.get_dummies(full["timeframe"], prefix="tf").astype(float)
+        full = pd.concat([full, tf_dummies], axis=1)
+        self.feature_columns += [c for c in tf_dummies.columns if c not in self.feature_columns]
+
+        # Chronological train/test split
+        split_idx = int(len(full) * (1 - test_size))
+        train_df  = full.iloc[:split_idx].copy()
+        test_df   = full.iloc[split_idx:].copy()
+
+        logger.info(
+            f"\nSplit | train={len(train_df):,} "
+            f"({train_df['timestamp'].min().date()} → {train_df['timestamp'].max().date()}) | "
+            f"test={len(test_df):,} "
+            f"({test_df['timestamp'].min().date()} → {test_df['timestamp'].max().date()})"
         )
 
-        # Step 5: Create lagged features (ALL ML features are lagged; no current candle leakage)
-        data = self.create_lagged_features(data, lag_periods)
+        # Feature matrices
+        X_train = train_df[self.feature_columns].fillna(0)
+        X_test  = test_df[self.feature_columns].fillna(0)
+        y_train = train_df["label"]
+        y_test  = test_df["label"]
 
-        # Step 6: Keep only actionable samples (exclude neutral / unknown outcomes)
-        initial_count = len(data)
-        data = data[data['zone_label'] != 0].copy()
-        print(f"[OK] Filtered neutral labels: {initial_count - len(data)} rows removed")
+        # Scale
+        X_train_scaled = pd.DataFrame(
+            self.scaler.fit_transform(X_train),
+            columns=self.feature_columns, index=X_train.index
+        )
+        X_test_scaled = pd.DataFrame(
+            self.scaler.transform(X_test),
+            columns=self.feature_columns, index=X_test.index
+        )
 
-        # Save prepared timeframe data to parquet files
-        self.save_timeframe_parquets(data)
+        self._log_label_dist(y_train, "Train")
+        self._log_label_dist(y_test,  "Test")
 
-        # Step 7: Prepare features and target
-        X, y = self.prepare_features_and_target(data)
+        return X_train_scaled, y_train, train_df, X_test_scaled, y_test, test_df
 
-        return X, y, data
+    # ------------------------------------------------------------------
+    def _log_label_dist(self, y: pd.Series, name: str) -> None:
+        counts = y.value_counts().to_dict()
+        total  = len(y)
+        parts  = [f"{k}={v} ({v/total*100:.1f}%)" for k, v in sorted(counts.items())]
+        logger.info(f"{name} labels: {' | '.join(parts)}")
 
-    def get_feature_columns(self) -> List[str]:
-        """Return list of feature column names."""
-        return self.feature_columns
-
+    # ------------------------------------------------------------------
     def get_scaler(self) -> StandardScaler:
-        """Return fitted scaler for prediction use."""
         return self.scaler
 
-    def get_timeframe_encoder(self) -> LabelEncoder:
-        """Return fitted timeframe encoder."""
-        return self.timeframe_encoder
+    def get_feature_columns(self) -> List[str]:
+        return self.feature_columns
+
+    def apply_strategy_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compatibility shim for backtest_backtrader.py."""
+        return df
+
+    def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compatibility shim for backtest_backtrader.py."""
+        return build_features(df)
+
+    def create_lagged_features(self, df: pd.DataFrame, lag_periods: int = 5) -> pd.DataFrame:
+        """Compatibility shim — lagging not used in new pipeline."""
+        return df
 
 
+# Convenience function (keeps old call signature working)
 def prepare_data(
     timeframes: List[str] = None,
     start_date: str = None,
-    end_date: str = None,
-    lag_periods: int = 5,
-    forward_bars: int = 3,
-    move_threshold: float = 0.003,
-) -> Tuple[pd.DataFrame, pd.Series, DataPreparator]:
-    """
-    Convenience function for data preparation.
-
-    Returns:
-        Tuple of (X features, y target, DataPreparator instance)
-    """
-    preparator = DataPreparator()
-    X, y, _ = preparator.prepare_data(
-        timeframes, start_date, end_date, lag_periods, forward_bars, move_threshold
-    )
-    return X, y, preparator
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare OHLCV data and save parquet files for specified timeframes.")
-    parser.add_argument(
-        "--timeframes",
-        nargs="+",
-        default=["5min"],
-        help="Timeframes to prepare (e.g. 5min 10min 1h). Default: 10min"
-    )
-    parser.add_argument("--start-date", type=str, default=None, help="Start date filter (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, default=None, help="End date filter (YYYY-MM-DD)")
-    parser.add_argument("--lag-periods", type=int, default=5, help="Number of lag periods for features")
-
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("DATA PREPARATION TEST")
-    print("=" * 60)
-
-    try:
-        preparator = DataPreparator()
-
-        X, y, raw_data = preparator.prepare_data(
-            timeframes=args.timeframes,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            lag_periods=args.lag_periods
-        )
-
-        print("\n" + "=" * 60)
-        print("DATA PREPARATION SUMMARY")
-        print("=" * 60)
-        print(f"Total samples: {len(X)}")
-        print(f"Features: {len(preparator.get_feature_columns())}")
-        print(f"Feature columns: {preparator.get_feature_columns()[:10]}...")
-        print(f"\nSample features (first 5 rows):")
-        print(X.head())
-        print(f"\nTarget distribution:")
-        print(y.value_counts())
-
-    except Exception as e:
-        print(f"Error during data preparation: {e}")
-        raise
+    end_date:   str = None,
+    symbol:     str = "USTECm",
+):
+    prep = DataPreparator()
+    return prep.prepare_data(timeframes, start_date, end_date, symbol)
