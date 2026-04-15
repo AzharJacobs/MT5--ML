@@ -1,25 +1,20 @@
 """
 labels.py — Zone-to-Zone Label Generation
 ==========================================
-Strategy rule implemented here:
-  - LTF (5min / 15min) zone = ENTRY trigger
-  - HTF (1H / 4H) zone = TP and SL targets
+Entry:  LTF zone encounter (5min / 15min candle enters demand or supply zone)
+TP/SL:  Real HTF (1H) zone price levels stored by features.py
 
-Why:
-  LTF zones are small and get broken easily — using them for TP/SL
-  gives terrible RR and almost every trade hits SL.
-  HTF zones are created by institutional moves and hold much better.
-  Using HTF boundaries for TP/SL gives the trade real room to breathe
-  and produces meaningful RR ratios.
-
-For 1H itself there is no higher timeframe injected in the current
-pipeline so it falls back to its own zone boundaries — which already
-work well (78% win rate observed).
+Why this works:
+  LTF zones are small and close together — using them for TP/SL produces
+  tiny reward and wide risk, killing RR on almost every signal.
+  HTF zones are institutional-level moves that are far apart and hold.
+  Using real 1H zone prices gives the trade genuine room to breathe
+  and produces valid RR ratios.
 
 Label values:
    1  = buy signal that hit TP
   -1  = sell signal that hit TP
-   0  = no signal, or signal that hit SL / expired
+   0  = no signal, SL hit, or expired
 """
 
 import pandas as pd
@@ -28,37 +23,30 @@ import logging
 
 logger = logging.getLogger("mt5_collector.labels")
 
-# Timeframes that should use HTF zone boundaries for TP/SL
-LTF_TIMEFRAMES = {"1min", "2min", "3min", "4min", "5min", "10min", "15min", "30min"}
+LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
 
 
 def generate_labels(
     df: pd.DataFrame,
     max_bars: int = 50,
     min_rr: float = 1.0,
-    sl_atr_multiplier: float = 1.5,
+    sl_buffer_atr: float = 0.5,
     use_midline_tp: bool = True,
     timeframe: str = None,
 ) -> pd.DataFrame:
     """
-    Generate trade labels using LTF entry + HTF targets.
+    Generate trade labels.
 
-    Entry logic  (LTF):  price is inside a LTF demand/supply zone
-    TP/SL logic  (HTF):  boundaries come from injected 1H zone columns
-                         Falls back to LTF zone boundaries if HTF not available
-                         Falls back to ATR-based levels if neither available
+    For LTF timeframes: entry from LTF zone, TP/SL from real 1H zone prices.
+    For HTF timeframes: entry and TP/SL from own zone prices.
 
     Args:
-        df:                Feature-enriched DataFrame from features.py
-        max_bars:          Forward bars to check for TP/SL hit
-        min_rr:            Minimum risk/reward ratio to accept as a signal
-        sl_atr_multiplier: Extra buffer beyond zone boundary for SL (in ATR units)
-        use_midline_tp:    TP = 50% of distance to next HTF zone (per strategy doc)
-        timeframe:         Timeframe name — used to decide HTF vs LTF logic
-
-    Returns:
-        df with added columns: signal, signal_reason, trade_outcome,
-                               label, tp_price, sl_price, rr_ratio
+        df:             Feature-enriched DataFrame from features.py
+        max_bars:       Forward bars to simulate TP/SL outcome
+        min_rr:         Minimum risk/reward ratio to accept signal
+        sl_buffer_atr:  Small ATR buffer added beyond zone boundary for SL
+        use_midline_tp: TP at 50% distance to next zone (per strategy doc)
+        timeframe:      Timeframe name — determines LTF vs HTF logic
     """
     df = df.copy().reset_index(drop=True)
 
@@ -70,9 +58,7 @@ def generate_labels(
     df["sl_price"]      = np.nan
     df["rr_ratio"]      = np.nan
 
-    # Decide whether to use HTF columns for TP/SL
-    use_htf = (timeframe in LTF_TIMEFRAMES) if timeframe else True
-
+    use_htf = (timeframe in LTF_TIMEFRAMES) if timeframe else False
     n = len(df)
 
     for i in range(n - max_bars):
@@ -93,98 +79,80 @@ def generate_labels(
         reason = ""
 
         # ----------------------------------------------------------------
-        # BUY — LTF price enters demand zone
+        # BUY — price enters demand zone
         # ----------------------------------------------------------------
         if float(row.get("in_demand_zone", 0) or 0) == 1.0:
 
-            # --- SL: below HTF demand zone bottom (or LTF fallback) ---
             if use_htf:
-                # HTF demand zone bottom — the 1H zone that created this area
-                htf_demand_bottom = _get_htf_demand_bottom(row, atr)
-                sl = htf_demand_bottom - sl_atr_multiplier * atr
-            else:
-                ltf_demand_bottom = _safe_float(row.get("demand_zone_bottom"))
-                if np.isnan(ltf_demand_bottom):
-                    continue
-                sl = ltf_demand_bottom - sl_atr_multiplier * atr
+                # SL: below real 1H demand zone bottom
+                htf_d_bottom = _f(row.get("htf_demand_zone_bottom"))
+                sl = (htf_d_bottom - sl_buffer_atr * atr) if not np.isnan(htf_d_bottom) \
+                     else (close - 4.0 * atr)
 
-            # --- TP: at or toward HTF supply zone (or LTF fallback) ---
-            if use_htf:
-                htf_supply_bottom = _get_htf_supply_bottom(row, close, atr)
-                if use_midline_tp and not np.isnan(htf_supply_bottom):
-                    tp = close + (htf_supply_bottom - close) * 0.5
-                elif not np.isnan(htf_supply_bottom):
-                    tp = htf_supply_bottom
+                # TP: toward real 1H supply zone bottom
+                htf_s_bottom = _f(row.get("htf_supply_zone_bottom"))
+                if not np.isnan(htf_s_bottom) and htf_s_bottom > close:
+                    tp = close + (htf_s_bottom - close) * (0.5 if use_midline_tp else 1.0)
                 else:
-                    tp = close + 3.0 * atr  # ATR fallback — wider than before
+                    tp = close + 4.0 * atr
             else:
-                ltf_supply_bottom = _safe_float(row.get("supply_zone_bottom"))
-                if not np.isnan(ltf_supply_bottom) and use_midline_tp:
-                    tp = close + (ltf_supply_bottom - close) * 0.5
-                elif not np.isnan(ltf_supply_bottom):
-                    tp = ltf_supply_bottom
-                else:
-                    tp = close + 3.0 * atr
+                # HTF timeframe — use own zone levels
+                d_bottom = _f(row.get("demand_zone_bottom"))
+                s_bottom = _f(row.get("supply_zone_bottom"))
+                if np.isnan(d_bottom):
+                    continue
+                sl = d_bottom - sl_buffer_atr * atr
+                tp = (close + (s_bottom - close) * (0.5 if use_midline_tp else 1.0)) \
+                     if not np.isnan(s_bottom) and s_bottom > close else close + 3.0 * atr
 
             risk   = close - sl
             reward = tp - close
-
             if risk <= 0 or reward <= 0:
                 continue
-
             rr = reward / risk
             if rr < min_rr:
                 continue
 
             signal = 1
-            reason = f"demand({'htf' if use_htf else 'ltf'}) rr={rr:.2f}"
+            reason = f"demand_{'htf' if use_htf else 'ltf'} rr={rr:.2f}"
             df.at[i, "rr_ratio"] = float(rr)
 
         # ----------------------------------------------------------------
-        # SELL — LTF price enters supply zone
+        # SELL — price enters supply zone
         # ----------------------------------------------------------------
         elif float(row.get("in_supply_zone", 0) or 0) == 1.0:
 
-            # --- SL: above HTF supply zone top (or LTF fallback) ---
             if use_htf:
-                htf_supply_top = _get_htf_supply_top(row, atr)
-                sl = htf_supply_top + sl_atr_multiplier * atr
-            else:
-                ltf_supply_top = _safe_float(row.get("supply_zone_top"))
-                if np.isnan(ltf_supply_top):
-                    continue
-                sl = ltf_supply_top + sl_atr_multiplier * atr
+                # SL: above real 1H supply zone top
+                htf_s_top = _f(row.get("htf_supply_zone_top"))
+                sl = (htf_s_top + sl_buffer_atr * atr) if not np.isnan(htf_s_top) \
+                     else (close + 4.0 * atr)
 
-            # --- TP: at or toward HTF demand zone (or LTF fallback) ---
-            if use_htf:
-                htf_demand_top = _get_htf_demand_top(row, close, atr)
-                if use_midline_tp and not np.isnan(htf_demand_top):
-                    tp = close - (close - htf_demand_top) * 0.5
-                elif not np.isnan(htf_demand_top):
-                    tp = htf_demand_top
+                # TP: toward real 1H demand zone top
+                htf_d_top = _f(row.get("htf_demand_zone_top"))
+                if not np.isnan(htf_d_top) and htf_d_top < close:
+                    tp = close - (close - htf_d_top) * (0.5 if use_midline_tp else 1.0)
                 else:
-                    tp = close - 3.0 * atr
+                    tp = close - 4.0 * atr
             else:
-                ltf_demand_top = _safe_float(row.get("demand_zone_top"))
-                if not np.isnan(ltf_demand_top) and use_midline_tp:
-                    tp = close - (close - ltf_demand_top) * 0.5
-                elif not np.isnan(ltf_demand_top):
-                    tp = ltf_demand_top
-                else:
-                    tp = close - 3.0 * atr
+                s_top   = _f(row.get("supply_zone_top"))
+                d_top   = _f(row.get("demand_zone_top"))
+                if np.isnan(s_top):
+                    continue
+                sl = s_top + sl_buffer_atr * atr
+                tp = (close - (close - d_top) * (0.5 if use_midline_tp else 1.0)) \
+                     if not np.isnan(d_top) and d_top < close else close - 3.0 * atr
 
             risk   = sl - close
             reward = close - tp
-
             if risk <= 0 or reward <= 0:
                 continue
-
             rr = reward / risk
             if rr < min_rr:
                 continue
 
             signal = -1
-            reason = f"supply({'htf' if use_htf else 'ltf'}) rr={rr:.2f}"
+            reason = f"supply_{'htf' if use_htf else 'ltf'} rr={rr:.2f}"
             df.at[i, "rr_ratio"] = float(rr)
 
         if signal == 0:
@@ -196,7 +164,7 @@ def generate_labels(
         df.at[i, "sl_price"]      = float(sl)
 
         # ----------------------------------------------------------------
-        # Simulate forward price action to determine outcome
+        # Simulate forward price action
         # ----------------------------------------------------------------
         outcome = 0
         future  = df.iloc[i + 1: i + 1 + max_bars]
@@ -218,82 +186,14 @@ def generate_labels(
     return df
 
 
-# ---------------------------------------------------------------------------
-# HTF zone boundary helpers
-# ---------------------------------------------------------------------------
-# These pull from the HTF context columns that features.py injected via
-# add_htf_context(). The 1H bias tells us the direction of the last
-# institutional move — we use that to estimate zone boundaries.
-#
-# Since the HTF context currently only injects a bias direction (+1/-1/0)
-# and not explicit price levels, we reconstruct approximate HTF zone
-# boundaries from the LTF zone columns combined with ATR scaling.
-# This is a practical approximation — a full HTF zone price level would
-# require a separate merge of 1H zone data, which is future work.
-# ---------------------------------------------------------------------------
-
-def _safe_float(val) -> float:
+def _f(val) -> float:
+    """Safe float conversion."""
     try:
         v = float(val)
         return v if not np.isnan(v) else np.nan
     except (TypeError, ValueError):
         return np.nan
 
-
-def _get_htf_demand_bottom(row, atr: float) -> float:
-    """
-    Estimate HTF demand zone bottom for SL placement.
-    Uses LTF demand_zone_bottom as anchor, then widens by HTF ATR factor
-    to approximate where the 1H zone would sit.
-    """
-    ltf_bottom = _safe_float(row.get("demand_zone_bottom"))
-    if not np.isnan(ltf_bottom):
-        # Widen by 2x ATR to approximate HTF zone depth
-        return ltf_bottom - 2.0 * atr
-    return float(row["close"]) - 4.0 * atr
-
-
-def _get_htf_supply_top(row, atr: float) -> float:
-    """Estimate HTF supply zone top for SL placement."""
-    ltf_top = _safe_float(row.get("supply_zone_top"))
-    if not np.isnan(ltf_top):
-        return ltf_top + 2.0 * atr
-    return float(row["close"]) + 4.0 * atr
-
-
-def _get_htf_supply_bottom(row, close: float, atr: float) -> float:
-    """
-    Estimate HTF supply zone bottom for TP placement on buy trades.
-    Uses nearest_supply_dist_atr to reconstruct approximate supply level.
-    """
-    dist_atr = _safe_float(row.get("nearest_supply_dist_atr"))
-    ltf_supply_bottom = _safe_float(row.get("supply_zone_bottom"))
-
-    if not np.isnan(ltf_supply_bottom):
-        # Scale up the distance to approximate HTF supply
-        return ltf_supply_bottom + 2.0 * atr
-    elif not np.isnan(dist_atr):
-        return close + dist_atr * atr + 2.0 * atr
-    return np.nan
-
-
-def _get_htf_demand_top(row, close: float, atr: float) -> float:
-    """
-    Estimate HTF demand zone top for TP placement on sell trades.
-    """
-    dist_atr = _safe_float(row.get("nearest_demand_dist_atr"))
-    ltf_demand_top = _safe_float(row.get("demand_zone_top"))
-
-    if not np.isnan(ltf_demand_top):
-        return ltf_demand_top - 2.0 * atr
-    elif not np.isnan(dist_atr):
-        return close - abs(dist_atr) * atr - 2.0 * atr
-    return np.nan
-
-
-# ---------------------------------------------------------------------------
-# Logging + class weights
-# ---------------------------------------------------------------------------
 
 def _log_summary(df: pd.DataFrame, timeframe: str = None) -> None:
     signals  = (df["signal"] != 0).sum()
@@ -303,7 +203,6 @@ def _log_summary(df: pd.DataFrame, timeframe: str = None) -> None:
     sl_hits  = (df["trade_outcome"] == -1).sum()
     win_rate = tp_hits / max(signals, 1) * 100
     tf_tag   = f"{timeframe} " if timeframe else ""
-
     logger.info(
         f"{tf_tag}Labels | signals={signals} "
         f"buy_wins={buys} sell_wins={sells} "

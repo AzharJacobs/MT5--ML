@@ -287,11 +287,13 @@ class ModelTrainer:
                 )
                 m = CatBoostClassifier(**params)
 
-            sw = self._compute_sample_weights(y)
+            # Remap labels to 0-indexed for XGBoost
+            y_mapped = y.map({-1: 0, 0: 1, 1: 2})
+            sw = self._compute_sample_weights(y_mapped)
             scores = []
-            for tr_idx, val_idx in skf.split(X, y):
-                m.fit(X.iloc[tr_idx], y.iloc[tr_idx], sample_weight=sw[tr_idx])
-                scores.append(accuracy_score(y.iloc[val_idx], m.predict(X.iloc[val_idx])))
+            for tr_idx, val_idx in skf.split(X, y_mapped):
+                m.fit(X.iloc[tr_idx], y_mapped.iloc[tr_idx], sample_weight=sw[tr_idx])
+                scores.append(accuracy_score(y_mapped.iloc[val_idx], m.predict(X.iloc[val_idx])))
             return float(np.mean(scores))
 
         study = optuna.create_study(direction="maximize")

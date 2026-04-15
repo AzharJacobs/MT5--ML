@@ -263,42 +263,108 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # HTF Context
 # ---------------------------------------------------------------------------
 
+def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5) -> pd.DataFrame:
+    """
+    Run zone detection on a HTF DataFrame and return a
+    time-indexed table of active zone price levels.
+    Each row represents the active demand/supply zone at that HTF bar.
+    """
+    htf_df = htf_df.copy().reset_index(drop=True)
+    htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"])
+    atr = _atr(htf_df, 14)
+
+    records = []
+    active_demand = None
+    active_supply = None
+
+    for i in range(len(htf_df)):
+        cur  = htf_df.iloc[i]
+        catr = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
+        body = float(abs(cur["close"] - cur["open"]))
+
+        if cur["close"] > cur["open"] and body > impulse_atr_multiplier * catr:
+            active_demand = {
+                "top":    float(max(cur["open"], cur["close"])),
+                "bottom": float(cur["low"]),
+            }
+
+        if cur["close"] < cur["open"] and body > impulse_atr_multiplier * catr:
+            active_supply = {
+                "top":    float(cur["high"]),
+                "bottom": float(min(cur["open"], cur["close"])),
+            }
+
+        records.append({
+            "timestamp":            cur["timestamp"],
+            "htf_demand_zone_top":  active_demand["top"]    if active_demand else np.nan,
+            "htf_demand_zone_bottom": active_demand["bottom"] if active_demand else np.nan,
+            "htf_supply_zone_top":  active_supply["top"]    if active_supply else np.nan,
+            "htf_supply_zone_bottom": active_supply["bottom"] if active_supply else np.nan,
+            "htf_1h_bias": (
+                1.0 if active_demand and not active_supply else
+                -1.0 if active_supply and not active_demand else
+                0.0
+            ),
+        })
+
+    return pd.DataFrame(records)
+
+
 def add_htf_context(
     ltf_df: pd.DataFrame,
     h1_df:  pd.DataFrame,
     h4_df:  pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    Merge real HTF zone price levels onto every LTF row.
+
+    Stores on each LTF row:
+      htf_demand_zone_top/bottom  — actual 1H demand zone prices
+      htf_supply_zone_top/bottom  — actual 1H supply zone prices
+      htf_1h_bias                 — direction of last 1H zone (+1/-1/0)
+      htf_4h_bias                 — direction of last 4H zone (+1/-1/0)
+      htf_aligned                 — 1 if 1H and 4H agree on direction
+    """
     ltf_df = ltf_df.copy()
     ltf_df["timestamp"] = pd.to_datetime(ltf_df["timestamp"])
 
-    def _bias(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        atr  = _atr(df, 14)
-        body = (df["close"] - df["open"]).abs()
-        impulse = body > 0.5 * atr
-        bias = np.where(impulse & (df["close"] > df["open"]),  1,
-               np.where(impulse & (df["close"] < df["open"]), -1, 0))
-        df["htf_bias"] = pd.Series(bias, index=df.index)
-        df["htf_bias"] = df["htf_bias"].replace(0, np.nan).ffill().fillna(0).astype(float)
-        return df[["timestamp", "htf_bias"]]
-
+    # --- 1H zones: extract real price levels and merge ---
     if h1_df is not None and len(h1_df) > 0:
-        h1b = _bias(h1_df).rename(columns={"htf_bias": "htf_1h_bias"})
+        h1_zones = _extract_htf_zones(h1_df, impulse_atr_multiplier=0.5)
+        h1_zones["timestamp"] = pd.to_datetime(h1_zones["timestamp"])
+        # Drop any existing HTF columns from ltf_df before merge to avoid suffix conflicts
+        drop_cols = [c for c in ["htf_demand_zone_top", "htf_demand_zone_bottom",
+                                  "htf_supply_zone_top", "htf_supply_zone_bottom",
+                                  "htf_1h_bias"] if c in ltf_df.columns]
+        ltf_df = ltf_df.drop(columns=drop_cols)
         ltf_df = pd.merge_asof(
             ltf_df.sort_values("timestamp"),
-            h1b.sort_values("timestamp"),
-            on="timestamp", direction="backward"
+            h1_zones.sort_values("timestamp"),
+            on="timestamp",
+            direction="backward"
         )
     else:
-        ltf_df["htf_1h_bias"] = 0.0
+        ltf_df["htf_demand_zone_top"]    = np.nan
+        ltf_df["htf_demand_zone_bottom"] = np.nan
+        ltf_df["htf_supply_zone_top"]    = np.nan
+        ltf_df["htf_supply_zone_bottom"] = np.nan
+        ltf_df["htf_1h_bias"]            = 0.0
 
+    # --- 4H zones: bias direction only ---
     if h4_df is not None and len(h4_df) > 0:
-        h4b = _bias(h4_df).rename(columns={"htf_bias": "htf_4h_bias"})
+        h4_df = h4_df.copy()
+        h4_df["timestamp"] = pd.to_datetime(h4_df["timestamp"])
+        h4_atr  = _atr(h4_df, 14)
+        h4_body = (h4_df["close"] - h4_df["open"]).abs()
+        h4_imp  = h4_body > 0.5 * h4_atr
+        h4_bias = np.where(h4_imp & (h4_df["close"] > h4_df["open"]),  1.0,
+                  np.where(h4_imp & (h4_df["close"] < h4_df["open"]), -1.0, np.nan))
+        h4_df["htf_4h_bias"] = pd.Series(h4_bias).ffill().fillna(0.0).values
         ltf_df = pd.merge_asof(
             ltf_df.sort_values("timestamp"),
-            h4b.sort_values("timestamp"),
-            on="timestamp", direction="backward"
+            h4_df[["timestamp", "htf_4h_bias"]].sort_values("timestamp"),
+            on="timestamp",
+            direction="backward"
         )
     else:
         ltf_df["htf_4h_bias"] = 0.0
@@ -366,6 +432,8 @@ FEATURE_COLUMNS = [
     "volume_ratio", "body_atr_ratio",
     "momentum_5", "momentum_10",
     # HTF
+    "htf_demand_zone_top", "htf_demand_zone_bottom",
+    "htf_supply_zone_top", "htf_supply_zone_bottom",
     "htf_1h_bias", "htf_4h_bias", "htf_aligned",
     # Candle context
     "hour", "month",

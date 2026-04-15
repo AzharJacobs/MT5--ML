@@ -45,7 +45,10 @@ def _build_feature_matrix_for_timeframe(
     timeframe: str,
     metadata_bundle: Dict[str, Any]
 ) -> pd.DataFrame:
-    saved_scaler   = metadata_bundle.get("scaler")
+    import numpy as np
+    from features import build_features
+
+    saved_scaler    = metadata_bundle.get("scaler")
     feature_columns = metadata_bundle.get("feature_columns") or []
 
     if saved_scaler is None:
@@ -53,17 +56,41 @@ def _build_feature_matrix_for_timeframe(
     if not feature_columns:
         raise ValueError("Saved feature_columns not found in model metadata. Retrain first.")
 
-    prep = DataPreparator()
+    # Build features using the new pipeline
     data = df.copy()
-    data = prep.apply_strategy_signals(data)
-    data = prep.engineer_features(data)
-    data = prep.create_lagged_features(data, lag_periods=5)
+    data = build_features(data)
 
+    # Encode categoricals — must match prepare_data.py exactly
+    day_map = {
+        "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+        "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6,
+    }
+    dir_map = {"buy": 1, "sell": -1, "neutral": 0}
+    session_map = {
+        "asian": 0, "london": 1, "london_ny_overlap": 2,
+        "new_york": 3, "off_hours": 4, "daily": 5, "unknown": -1,
+    }
+
+    if "day_of_week" in data.columns:
+        data["day_of_week"] = data["day_of_week"].map(day_map).fillna(0).astype(float)
+    if "direction" in data.columns:
+        data["direction"]   = data["direction"].map(dir_map).fillna(0).astype(float)
+    if "session" in data.columns:
+        data["session"]     = data["session"].map(session_map).fillna(-1).astype(float)
+
+    # Timeframe one-hot — match columns from training
+    tf_dummies = pd.get_dummies(
+        pd.Series([timeframe] * len(data)), prefix="tf"
+    ).astype(float)
+    tf_dummies.index = data.index
+    data = pd.concat([data, tf_dummies], axis=1)
+
+    # Align to training feature columns exactly
     X = data.copy()
     for col in feature_columns:
         if col not in X.columns:
-            X[col] = 0
-    X = X[feature_columns]
+            X[col] = 0.0
+    X = X[feature_columns].fillna(0)
 
     X_scaled = pd.DataFrame(
         saved_scaler.transform(X),
