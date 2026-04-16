@@ -63,9 +63,9 @@ def detect_zones(
     # Initialize all zone columns as float from the start (avoids dtype errors)
     zone_cols = [
         "demand_zone_top", "demand_zone_bottom", "demand_zone_strength",
-        "demand_zone_fresh", "demand_zone_touches",
+        "demand_zone_fresh", "demand_zone_touches", "demand_zone_consolidation",
         "supply_zone_top", "supply_zone_bottom", "supply_zone_strength",
-        "supply_zone_fresh", "supply_zone_touches",
+        "supply_zone_fresh", "supply_zone_touches", "supply_zone_consolidation",
         "nearest_demand_dist_atr", "nearest_supply_dist_atr",
         "in_demand_zone", "in_supply_zone", "between_zones",
     ]
@@ -80,26 +80,42 @@ def detect_zones(
         cur_atr = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
         body    = float(abs(cur["close"] - cur["open"]))
 
+        # --- Consolidation check ---
+        # Look back 3 candles before the impulse and check if they were
+        # small and tight — this is the "base" that precedes a strong zone.
+        # Tight base = institutional accumulation/distribution = higher quality zone.
+        base_candles = df.iloc[max(0, i-3):i]
+        if len(base_candles) > 0:
+            base_bodies = (base_candles["close"] - base_candles["open"]).abs()
+            avg_base_body = float(base_bodies.mean()) if len(base_bodies) > 0 else cur_atr
+            # Consolidation score: how much smaller the base candles are vs current ATR
+            # 1.0 = very tight base (good), 0.0 = volatile base (weak zone)
+            consolidation_score = float(max(0.0, 1.0 - (avg_base_body / max(cur_atr, 1e-10))))
+        else:
+            consolidation_score = 0.0
+
         # --- Demand zone: bullish impulse ---
         if cur["close"] > cur["open"] and body > impulse_atr_multiplier * cur_atr:
             strength = float(min(body / cur_atr, 5.0))
             active_demand = {
-                "top":     float(max(cur["open"], cur["close"])),
-                "bottom":  float(cur["low"]),
-                "strength": strength,
-                "touches": 0,
-                "fresh":   True,
+                "top":            float(max(cur["open"], cur["close"])),
+                "bottom":         float(cur["low"]),
+                "strength":       strength,
+                "touches":        0,
+                "fresh":          True,
+                "consolidation":  consolidation_score,
             }
 
         # --- Supply zone: bearish impulse ---
         if cur["close"] < cur["open"] and body > impulse_atr_multiplier * cur_atr:
             strength = float(min(body / cur_atr, 5.0))
             active_supply = {
-                "top":     float(cur["high"]),
-                "bottom":  float(min(cur["open"], cur["close"])),
-                "strength": strength,
-                "touches": 0,
-                "fresh":   True,
+                "top":            float(cur["high"]),
+                "bottom":         float(min(cur["open"], cur["close"])),
+                "strength":       strength,
+                "touches":        0,
+                "fresh":          True,
+                "consolidation":  consolidation_score,
             }
 
         # --- Write demand zone to row ---
@@ -108,7 +124,8 @@ def detect_zones(
             df.at[i, "demand_zone_bottom"]   = active_demand["bottom"]
             df.at[i, "demand_zone_strength"] = active_demand["strength"]
             df.at[i, "demand_zone_fresh"]    = float(active_demand["fresh"])
-            df.at[i, "demand_zone_touches"]  = float(active_demand["touches"])
+            df.at[i, "demand_zone_touches"]       = float(active_demand["touches"])
+            df.at[i, "demand_zone_consolidation"] = float(active_demand.get("consolidation", 0.0))
 
             dist = (float(cur["close"]) - active_demand["top"]) / cur_atr
             df.at[i, "nearest_demand_dist_atr"] = float(dist)
@@ -125,7 +142,8 @@ def detect_zones(
             df.at[i, "supply_zone_bottom"]   = active_supply["bottom"]
             df.at[i, "supply_zone_strength"] = active_supply["strength"]
             df.at[i, "supply_zone_fresh"]    = float(active_supply["fresh"])
-            df.at[i, "supply_zone_touches"]  = float(active_supply["touches"])
+            df.at[i, "supply_zone_touches"]       = float(active_supply["touches"])
+            df.at[i, "supply_zone_consolidation"] = float(active_supply.get("consolidation", 0.0))
 
             dist = (active_supply["bottom"] - float(cur["close"])) / cur_atr
             df.at[i, "nearest_supply_dist_atr"] = float(dist)
@@ -142,6 +160,101 @@ def detect_zones(
                 active_demand["top"] < float(cur["close"]) < active_supply["bottom"]
             )
             df.at[i, "between_zones"] = float(between)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Zone Quality Scoring
+# ---------------------------------------------------------------------------
+
+def add_zone_quality(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Score each zone on quality based on Zone-to-Zone strategy rules:
+
+    A HIGH QUALITY zone has:
+      - Strong clean departure (high body/ATR ratio on the impulse candle)
+      - Fresh (not yet tested/touched)
+      - Few or zero previous touches
+      - Wide zone (enough room between top and bottom)
+      - Strong departure candle relative to surrounding candles
+
+    These scores give the model richer signal to discriminate
+    high-probability zones from weak ones — replacing the blunt
+    in_demand_zone / in_supply_zone binary flags as the primary signal.
+    """
+    df = df.copy()
+    safe_atr = df["atr_14"].replace(0, np.nan) if "atr_14" in df.columns else pd.Series(np.nan, index=df.index)
+
+    # --- Demand zone quality score (0-5) ---
+    demand_score = pd.Series(0.0, index=df.index)
+
+    # 1. Zone strength (body of impulse candle / ATR) — already computed
+    if "demand_zone_strength" in df.columns:
+        # strength is capped at 5.0 — normalize to 0-1
+        demand_score += (df["demand_zone_strength"].fillna(0) / 5.0).clip(0, 1)
+
+    # 2. Zone freshness — fresh zones are more reliable
+    if "demand_zone_fresh" in df.columns:
+        demand_score += df["demand_zone_fresh"].fillna(0)
+
+    # 3. Low touch count — untouched zones hold better
+    if "demand_zone_touches" in df.columns:
+        # 0 touches = 1.0, 1 touch = 0.5, 2+ touches = 0.0
+        touch_score = (1.0 - (df["demand_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
+        demand_score += touch_score
+
+    # 4. Zone width relative to ATR — wider zone = more institutional
+    if "demand_zone_top" in df.columns and "demand_zone_bottom" in df.columns:
+        zone_width = (df["demand_zone_top"] - df["demand_zone_bottom"]).fillna(0)
+        width_score = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0  # normalize to 0-1
+        demand_score += width_score
+
+    # 5. Consolidation before departure — tight base = institutional zone
+    if "demand_zone_consolidation" in df.columns:
+        demand_score += df["demand_zone_consolidation"].fillna(0).clip(0, 1)
+
+    # 6. HTF alignment — zone aligns with 1H bias
+    if "htf_1h_bias" in df.columns:
+        demand_score += (df["htf_1h_bias"].fillna(0) == 1.0).astype(float)
+
+    df["demand_zone_quality"] = demand_score.clip(0, 6)
+
+    # --- Supply zone quality score (0-5) ---
+    supply_score = pd.Series(0.0, index=df.index)
+
+    if "supply_zone_strength" in df.columns:
+        supply_score += (df["supply_zone_strength"].fillna(0) / 5.0).clip(0, 1)
+
+    if "supply_zone_fresh" in df.columns:
+        supply_score += df["supply_zone_fresh"].fillna(0)
+
+    if "supply_zone_touches" in df.columns:
+        touch_score = (1.0 - (df["supply_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
+        supply_score += touch_score
+
+    if "supply_zone_top" in df.columns and "supply_zone_bottom" in df.columns:
+        zone_width = (df["supply_zone_top"] - df["supply_zone_bottom"]).fillna(0)
+        width_score = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0
+        supply_score += width_score
+
+    if "supply_zone_consolidation" in df.columns:
+        supply_score += df["supply_zone_consolidation"].fillna(0).clip(0, 1)
+
+    if "htf_1h_bias" in df.columns:
+        supply_score += (df["htf_1h_bias"].fillna(0) == -1.0).astype(float)
+
+    df["supply_zone_quality"] = supply_score.clip(0, 6)
+
+    # --- Combined quality: which zone is currently relevant ---
+    # High quality demand + price in demand = strong buy setup
+    df["active_zone_quality"] = np.where(
+        df["in_demand_zone"].fillna(0) == 1.0, df["demand_zone_quality"],
+        np.where(
+            df["in_supply_zone"].fillna(0) == 1.0, df["supply_zone_quality"],
+            0.0
+        )
+    )
 
     return df
 
@@ -400,6 +513,8 @@ def build_features(
     if h1_df is not None or h4_df is not None:
         df = add_htf_context(df, h1_df, h4_df)
 
+    df = add_zone_quality(df)
+
     warmup = max(200, zone_lookback)
     df = df.iloc[warmup:].reset_index(drop=True)
 
@@ -413,8 +528,8 @@ def build_features(
 
 FEATURE_COLUMNS = [
     # Zone
-    "demand_zone_strength", "demand_zone_fresh", "demand_zone_touches",
-    "supply_zone_strength", "supply_zone_fresh", "supply_zone_touches",
+    "demand_zone_strength", "demand_zone_fresh", "demand_zone_touches", "demand_zone_consolidation",
+    "supply_zone_strength", "supply_zone_fresh", "supply_zone_touches", "supply_zone_consolidation",
     "nearest_demand_dist_atr", "nearest_supply_dist_atr",
     "in_demand_zone", "in_supply_zone", "between_zones",
     # Confirmations
@@ -431,12 +546,14 @@ FEATURE_COLUMNS = [
     "bb_position", "bb_width_atr",
     "volume_ratio", "body_atr_ratio",
     "momentum_5", "momentum_10",
+    # Zone quality
+    "demand_zone_quality", "supply_zone_quality", "active_zone_quality",
     # HTF
     "htf_demand_zone_top", "htf_demand_zone_bottom",
     "htf_supply_zone_top", "htf_supply_zone_bottom",
     "htf_1h_bias", "htf_4h_bias", "htf_aligned",
     # Candle context
     "hour", "month",
-    "direction", "candle_size", "body_size", "wick_upper", "wick_lower",
+    "candle_size", "body_size", "wick_upper", "wick_lower",
     "session",
 ]

@@ -61,9 +61,32 @@ def generate_labels(
     use_htf = (timeframe in LTF_TIMEFRAMES) if timeframe else False
     n = len(df)
 
+    # Trading session windows in BROKER time (Exness GMT+3)
+    # Asia/London overlap: 10:00-12:30 broker = 07:00-09:30 UTC = 09:00-11:30 SAST
+    # London/NY overlap:   16:00-19:00 broker = 13:00-16:00 UTC = 15:00-18:00 SAST
+    def _in_trading_session(row) -> bool:
+        hour = int(row.get("hour", -1) or -1)
+        # Get minutes from timestamp if available
+        ts = row.get("timestamp")
+        minute = 0
+        if ts is not None:
+            try:
+                minute = pd.to_datetime(ts).minute
+            except Exception:
+                minute = 0
+        # Asia/London: 10:00 - 12:30 broker time
+        asia_london = (hour == 10) or (hour == 11) or (hour == 12 and minute < 30)
+        # London/NY: 16:00 - 19:00 broker time
+        london_ny = (hour >= 16 and hour < 19)
+        return asia_london or london_ny
+
     for i in range(n - max_bars):
         row   = df.iloc[i]
         close = float(row["close"])
+
+        # Only trade during your session windows
+        if not _in_trading_session(row):
+            continue
 
         # Skip no-man's land
         if float(row.get("between_zones", 0) or 0) == 1.0:

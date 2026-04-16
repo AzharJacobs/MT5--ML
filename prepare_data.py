@@ -43,7 +43,7 @@ TF_PARAMS = {
 }
 
 # Categorical columns that need encoding before model training
-CATEGORICAL_COLS = ["direction", "session", "day_of_week"]
+CATEGORICAL_COLS = ["session", "day_of_week"]
 
 
 class DataPreparator:
@@ -66,7 +66,7 @@ class DataPreparator:
         query = """
             SELECT timestamp, open, high, low, close, volume,
                    hour, day_of_week, month, year, session,
-                   direction, candle_size, body_size, wick_upper, wick_lower
+                   candle_size, body_size, wick_upper, wick_lower
             FROM ustech_ohlcv
             WHERE symbol = %s AND timeframe = %s
             ORDER BY timestamp ASC
@@ -91,8 +91,7 @@ class DataPreparator:
 
         if "day_of_week" in df.columns:
             df["day_of_week"] = df["day_of_week"].map(day_map).fillna(0).astype(float)
-        if "direction" in df.columns:
-            df["direction"]   = df["direction"].map(dir_map).fillna(0).astype(float)
+        # direction excluded from model features
         if "session" in df.columns:
             df["session"]     = df["session"].map(session_map).fillna(-1).astype(float)
 

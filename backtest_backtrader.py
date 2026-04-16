@@ -60,12 +60,15 @@ def _build_feature_matrix_for_timeframe(
     data = df.copy()
     data = build_features(data)
 
+    # Remove direction — excluded from model features
+    if "direction" in data.columns:
+        data = data.drop(columns=["direction"])
+
     # Encode categoricals — must match prepare_data.py exactly
     day_map = {
         "Monday": 0, "Tuesday": 1, "Wednesday": 2,
         "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6,
     }
-    dir_map = {"buy": 1, "sell": -1, "neutral": 0}
     session_map = {
         "asian": 0, "london": 1, "london_ny_overlap": 2,
         "new_york": 3, "off_hours": 4, "daily": 5, "unknown": -1,
@@ -73,8 +76,6 @@ def _build_feature_matrix_for_timeframe(
 
     if "day_of_week" in data.columns:
         data["day_of_week"] = data["day_of_week"].map(day_map).fillna(0).astype(float)
-    if "direction" in data.columns:
-        data["direction"]   = data["direction"].map(dir_map).fillna(0).astype(float)
     if "session" in data.columns:
         data["session"]     = data["session"].map(session_map).fillna(-1).astype(float)
 
