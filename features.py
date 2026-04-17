@@ -6,6 +6,23 @@ Builds ML-ready features from raw OHLCV data.
 Zone detection is intentionally lenient here — the goal is to detect
 as many valid zones as possible and let the ML model learn which ones
 are high-probability. Filtering happens via feature scores, not hard gates.
+
+CHANGES (profit optimisation pass):
+  - Zone replacement guard added in detect_zones().
+    Previously a new impulse candle would overwrite the active zone
+    immediately, even if price had never left the old zone. This created
+    "phantom zone switches" — the model would see a fresh zone just as
+    price was still sitting inside the prior one, producing conflicting
+    in_demand_zone / in_supply_zone signals.
+
+    Fix: active_demand is only replaced when the current close price is
+    at least 1 ATR ABOVE the old zone top (price has clearly broken out
+    of the demand zone upward before a new one forms). Likewise,
+    active_supply is only replaced when close is at least 1 ATR BELOW
+    the old supply zone bottom.
+
+    This stabilises the zone reference mid-trade and removes a category
+    of false signals that were previously polluting the training labels.
 """
 
 import pandas as pd
@@ -56,11 +73,15 @@ def detect_zones(
     encounters and learns which are high-probability from the feature set.
     Freshness, touch count, and strength score give the model enough signal
     to discriminate good zones from weak ones.
+
+    Zone replacement rule (NEW):
+      A new demand zone only replaces the active one when close > old zone top + 1 ATR.
+      A new supply zone only replaces the active one when close < old zone bottom - 1 ATR.
+      This prevents phantom mid-trade zone switches.
     """
     df   = df.copy().reset_index(drop=True)
     atr  = _atr(df, atr_period)
 
-    # Initialize all zone columns as float from the start (avoids dtype errors)
     zone_cols = [
         "demand_zone_top", "demand_zone_bottom", "demand_zone_strength",
         "demand_zone_fresh", "demand_zone_touches", "demand_zone_consolidation",
@@ -79,17 +100,13 @@ def detect_zones(
         cur     = df.iloc[i]
         cur_atr = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
         body    = float(abs(cur["close"] - cur["open"]))
+        cur_close = float(cur["close"])
 
         # --- Consolidation check ---
-        # Look back 3 candles before the impulse and check if they were
-        # small and tight — this is the "base" that precedes a strong zone.
-        # Tight base = institutional accumulation/distribution = higher quality zone.
         base_candles = df.iloc[max(0, i-3):i]
         if len(base_candles) > 0:
             base_bodies = (base_candles["close"] - base_candles["open"]).abs()
             avg_base_body = float(base_bodies.mean()) if len(base_bodies) > 0 else cur_atr
-            # Consolidation score: how much smaller the base candles are vs current ATR
-            # 1.0 = very tight base (good), 0.0 = volatile base (weak zone)
             consolidation_score = float(max(0.0, 1.0 - (avg_base_body / max(cur_atr, 1e-10))))
         else:
             consolidation_score = 0.0
@@ -97,7 +114,7 @@ def detect_zones(
         # --- Demand zone: bullish impulse ---
         if cur["close"] > cur["open"] and body > impulse_atr_multiplier * cur_atr:
             strength = float(min(body / cur_atr, 5.0))
-            active_demand = {
+            new_demand = {
                 "top":            float(max(cur["open"], cur["close"])),
                 "bottom":         float(cur["low"]),
                 "strength":       strength,
@@ -105,11 +122,19 @@ def detect_zones(
                 "fresh":          True,
                 "consolidation":  consolidation_score,
             }
+            # NEW: only replace active demand zone if price has clearly left it.
+            # Condition: close must be more than 1 ATR above the old zone top,
+            # meaning price broke out of the zone before this new one formed.
+            if active_demand is None:
+                active_demand = new_demand
+            elif cur_close > active_demand["top"] + cur_atr:
+                active_demand = new_demand
+            # else: keep old zone — price is still inside or near it
 
         # --- Supply zone: bearish impulse ---
         if cur["close"] < cur["open"] and body > impulse_atr_multiplier * cur_atr:
             strength = float(min(body / cur_atr, 5.0))
-            active_supply = {
+            new_supply = {
                 "top":            float(cur["high"]),
                 "bottom":         float(min(cur["open"], cur["close"])),
                 "strength":       strength,
@@ -117,6 +142,13 @@ def detect_zones(
                 "fresh":          True,
                 "consolidation":  consolidation_score,
             }
+            # NEW: only replace active supply zone if price has clearly left it.
+            # Condition: close must be more than 1 ATR below the old zone bottom.
+            if active_supply is None:
+                active_supply = new_supply
+            elif cur_close < active_supply["bottom"] - cur_atr:
+                active_supply = new_supply
+            # else: keep old zone
 
         # --- Write demand zone to row ---
         if active_demand is not None:
@@ -127,7 +159,7 @@ def detect_zones(
             df.at[i, "demand_zone_touches"]       = float(active_demand["touches"])
             df.at[i, "demand_zone_consolidation"] = float(active_demand.get("consolidation", 0.0))
 
-            dist = (float(cur["close"]) - active_demand["top"]) / cur_atr
+            dist = (cur_close - active_demand["top"]) / cur_atr
             df.at[i, "nearest_demand_dist_atr"] = float(dist)
 
             in_d = active_demand["bottom"] <= float(cur["low"]) <= active_demand["top"]
@@ -145,7 +177,7 @@ def detect_zones(
             df.at[i, "supply_zone_touches"]       = float(active_supply["touches"])
             df.at[i, "supply_zone_consolidation"] = float(active_supply.get("consolidation", 0.0))
 
-            dist = (active_supply["bottom"] - float(cur["close"])) / cur_atr
+            dist = (active_supply["bottom"] - cur_close) / cur_atr
             df.at[i, "nearest_supply_dist_atr"] = float(dist)
 
             in_s = active_supply["bottom"] <= float(cur["high"]) <= active_supply["top"]
@@ -154,12 +186,18 @@ def detect_zones(
                 active_supply["touches"] += 1
                 active_supply["fresh"]    = False
 
-        # Between zones (no-man's land)
+        # Between zones (no-man's land).
+        # Only mark True when BOTH zones exist AND price is clearly between them.
+        # When only one zone exists, price is either inside it or approaching it
+        # — not in no-man's land, so we leave between_zones as 0.0.
         if active_demand is not None and active_supply is not None:
             between = (
-                active_demand["top"] < float(cur["close"]) < active_supply["bottom"]
+                active_demand["top"] < cur_close < active_supply["bottom"]
             )
             df.at[i, "between_zones"] = float(between)
+        else:
+            # One or both zones missing — default to 0.0 (not between zones)
+            df.at[i, "between_zones"] = 0.0
 
     return df
 
@@ -170,57 +208,36 @@ def detect_zones(
 
 def add_zone_quality(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Score each zone on quality based on Zone-to-Zone strategy rules:
-
-    A HIGH QUALITY zone has:
-      - Strong clean departure (high body/ATR ratio on the impulse candle)
-      - Fresh (not yet tested/touched)
-      - Few or zero previous touches
-      - Wide zone (enough room between top and bottom)
-      - Strong departure candle relative to surrounding candles
-
-    These scores give the model richer signal to discriminate
-    high-probability zones from weak ones — replacing the blunt
-    in_demand_zone / in_supply_zone binary flags as the primary signal.
+    Score each zone on quality based on Zone-to-Zone strategy rules.
     """
     df = df.copy()
     safe_atr = df["atr_14"].replace(0, np.nan) if "atr_14" in df.columns else pd.Series(np.nan, index=df.index)
 
-    # --- Demand zone quality score (0-5) ---
     demand_score = pd.Series(0.0, index=df.index)
 
-    # 1. Zone strength (body of impulse candle / ATR) — already computed
     if "demand_zone_strength" in df.columns:
-        # strength is capped at 5.0 — normalize to 0-1
         demand_score += (df["demand_zone_strength"].fillna(0) / 5.0).clip(0, 1)
 
-    # 2. Zone freshness — fresh zones are more reliable
     if "demand_zone_fresh" in df.columns:
         demand_score += df["demand_zone_fresh"].fillna(0)
 
-    # 3. Low touch count — untouched zones hold better
     if "demand_zone_touches" in df.columns:
-        # 0 touches = 1.0, 1 touch = 0.5, 2+ touches = 0.0
         touch_score = (1.0 - (df["demand_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
         demand_score += touch_score
 
-    # 4. Zone width relative to ATR — wider zone = more institutional
     if "demand_zone_top" in df.columns and "demand_zone_bottom" in df.columns:
         zone_width = (df["demand_zone_top"] - df["demand_zone_bottom"]).fillna(0)
-        width_score = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0  # normalize to 0-1
+        width_score = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0
         demand_score += width_score
 
-    # 5. Consolidation before departure — tight base = institutional zone
     if "demand_zone_consolidation" in df.columns:
         demand_score += df["demand_zone_consolidation"].fillna(0).clip(0, 1)
 
-    # 6. HTF alignment — zone aligns with 1H bias
     if "htf_1h_bias" in df.columns:
         demand_score += (df["htf_1h_bias"].fillna(0) == 1.0).astype(float)
 
     df["demand_zone_quality"] = demand_score.clip(0, 6)
 
-    # --- Supply zone quality score (0-5) ---
     supply_score = pd.Series(0.0, index=df.index)
 
     if "supply_zone_strength" in df.columns:
@@ -246,8 +263,6 @@ def add_zone_quality(df: pd.DataFrame) -> pd.DataFrame:
 
     df["supply_zone_quality"] = supply_score.clip(0, 6)
 
-    # --- Combined quality: which zone is currently relevant ---
-    # High quality demand + price in demand = strong buy setup
     df["active_zone_quality"] = np.where(
         df["in_demand_zone"].fillna(0) == 1.0, df["demand_zone_quality"],
         np.where(
@@ -264,10 +279,6 @@ def add_zone_quality(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def add_confirmation_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add candlestick confirmation signals as numeric features.
-    These are FEATURES for the model — not hard gates on signal generation.
-    """
     df = df.copy()
 
     body       = (df["close"] - df["open"]).abs()
@@ -277,7 +288,6 @@ def add_confirmation_signals(df: pd.DataFrame) -> pd.DataFrame:
     prev_open  = df["open"].shift(1)
     prev_close = df["close"].shift(1)
 
-    # Bullish engulfing
     df["bullish_engulfing"] = (
         (prev_close < prev_open) &
         (df["close"] > df["open"]) &
@@ -285,7 +295,6 @@ def add_confirmation_signals(df: pd.DataFrame) -> pd.DataFrame:
         (df["close"] > prev_open)
     ).astype(float)
 
-    # Bearish engulfing
     df["bearish_engulfing"] = (
         (prev_close > prev_open) &
         (df["close"] < df["open"]) &
@@ -293,30 +302,25 @@ def add_confirmation_signals(df: pd.DataFrame) -> pd.DataFrame:
         (df["close"] < prev_open)
     ).astype(float)
 
-    # Pin bar bullish (long lower wick)
     safe_body = body.clip(lower=1e-10)
     df["pin_bar_bullish"] = (
         (wick_lower > 2.0 * safe_body) &
         (wick_lower > 2.0 * wick_upper)
     ).astype(float)
 
-    # Pin bar bearish (long upper wick)
     df["pin_bar_bearish"] = (
         (wick_upper > 2.0 * safe_body) &
         (wick_upper > 2.0 * wick_lower)
     ).astype(float)
 
-    # Market structure
     df["higher_low"]  = (df["low"]  > df["low"].shift(1)).astype(float)
     df["lower_high"]  = (df["high"] < df["high"].shift(1)).astype(float)
 
-    # Break of structure
     swing_high = df["high"].rolling(5).max().shift(1)
     swing_low  = df["low"].rolling(5).min().shift(1)
     df["bos_bullish"] = (df["close"] > swing_high).astype(float)
     df["bos_bearish"] = (df["close"] < swing_low).astype(float)
 
-    # Composite scores (0–4) — used as features, not gates
     df["buy_confirmation_score"]  = (
         df["bullish_engulfing"] + df["pin_bar_bullish"] +
         df["higher_low"]        + df["bos_bullish"]
@@ -377,11 +381,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5) -> pd.DataFrame:
-    """
-    Run zone detection on a HTF DataFrame and return a
-    time-indexed table of active zone price levels.
-    Each row represents the active demand/supply zone at that HTF bar.
-    """
     htf_df = htf_df.copy().reset_index(drop=True)
     htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"])
     atr = _atr(htf_df, 14)
@@ -394,18 +393,27 @@ def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5
         cur  = htf_df.iloc[i]
         catr = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
         body = float(abs(cur["close"] - cur["open"]))
+        cur_close = float(cur["close"])
 
         if cur["close"] > cur["open"] and body > impulse_atr_multiplier * catr:
-            active_demand = {
+            new_demand = {
                 "top":    float(max(cur["open"], cur["close"])),
                 "bottom": float(cur["low"]),
             }
+            if active_demand is None:
+                active_demand = new_demand
+            elif cur_close > active_demand["top"] + catr:
+                active_demand = new_demand
 
         if cur["close"] < cur["open"] and body > impulse_atr_multiplier * catr:
-            active_supply = {
+            new_supply = {
                 "top":    float(cur["high"]),
                 "bottom": float(min(cur["open"], cur["close"])),
             }
+            if active_supply is None:
+                active_supply = new_supply
+            elif cur_close < active_supply["bottom"] - catr:
+                active_supply = new_supply
 
         records.append({
             "timestamp":            cur["timestamp"],
@@ -428,24 +436,12 @@ def add_htf_context(
     h1_df:  pd.DataFrame,
     h4_df:  pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Merge real HTF zone price levels onto every LTF row.
-
-    Stores on each LTF row:
-      htf_demand_zone_top/bottom  — actual 1H demand zone prices
-      htf_supply_zone_top/bottom  — actual 1H supply zone prices
-      htf_1h_bias                 — direction of last 1H zone (+1/-1/0)
-      htf_4h_bias                 — direction of last 4H zone (+1/-1/0)
-      htf_aligned                 — 1 if 1H and 4H agree on direction
-    """
     ltf_df = ltf_df.copy()
     ltf_df["timestamp"] = pd.to_datetime(ltf_df["timestamp"])
 
-    # --- 1H zones: extract real price levels and merge ---
     if h1_df is not None and len(h1_df) > 0:
         h1_zones = _extract_htf_zones(h1_df, impulse_atr_multiplier=0.5)
         h1_zones["timestamp"] = pd.to_datetime(h1_zones["timestamp"])
-        # Drop any existing HTF columns from ltf_df before merge to avoid suffix conflicts
         drop_cols = [c for c in ["htf_demand_zone_top", "htf_demand_zone_bottom",
                                   "htf_supply_zone_top", "htf_supply_zone_bottom",
                                   "htf_1h_bias"] if c in ltf_df.columns]
@@ -463,7 +459,6 @@ def add_htf_context(
         ltf_df["htf_supply_zone_bottom"] = np.nan
         ltf_df["htf_1h_bias"]            = 0.0
 
-    # --- 4H zones: bias direction only ---
     if h4_df is not None and len(h4_df) > 0:
         h4_df = h4_df.copy()
         h4_df["timestamp"] = pd.to_datetime(h4_df["timestamp"])
@@ -501,9 +496,6 @@ def build_features(
     zone_lookback: int = 30,
     impulse_atr_multiplier: float = 0.5,
 ) -> pd.DataFrame:
-    """
-    Full feature pipeline. Lower impulse_atr_multiplier = more zones detected.
-    """
     logger.info(f"Building features for {len(df)} rows...")
 
     df = detect_zones(df, lookback=zone_lookback, impulse_atr_multiplier=impulse_atr_multiplier)

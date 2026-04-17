@@ -15,6 +15,14 @@ Label values:
    1  = buy signal that hit TP
   -1  = sell signal that hit TP
    0  = no signal, SL hit, or expired
+
+CHANGES (profit optimisation pass):
+  - volume_ratio >= 0.8 filter added inside generate_labels().
+    Signals on low-volume candles (relative to the 20-bar average) fail
+    disproportionately because there is no institutional participation
+    to drive price to TP. volume_ratio is already computed by features.py
+    (vol / 20-bar rolling mean). Skipping candles below 0.8 removes
+    weak-participation signals without touching zone logic or the model.
 """
 
 import pandas as pd
@@ -25,11 +33,17 @@ logger = logging.getLogger("mt5_collector.labels")
 
 LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
 
+# Minimum volume participation required to accept a signal.
+# 0.8 = candle volume must be at least 80% of the 20-bar rolling average.
+# Candles below this threshold tend to be thin, low-conviction moves that
+# reverse before reaching TP — filtering them improves signal quality.
+MIN_VOLUME_RATIO = 0.8
+
 
 def generate_labels(
     df: pd.DataFrame,
     max_bars: int = 50,
-    min_rr: float = 1.0,
+    min_rr: float = 1.5,           # CHANGED default: 1.0 → 1.5
     sl_buffer_atr: float = 0.5,
     use_midline_tp: bool = True,
     timeframe: str = None,
@@ -43,9 +57,9 @@ def generate_labels(
     Args:
         df:             Feature-enriched DataFrame from features.py
         max_bars:       Forward bars to simulate TP/SL outcome
-        min_rr:         Minimum risk/reward ratio to accept signal
+        min_rr:         Minimum risk/reward ratio to accept signal (default now 1.5)
         sl_buffer_atr:  Small ATR buffer added beyond zone boundary for SL
-        use_midline_tp: TP at 50% distance to next zone (per strategy doc)
+        use_midline_tp: TP at 50% distance to next zone. True for LTF, False for HTF.
         timeframe:      Timeframe name — determines LTF vs HTF logic
     """
     df = df.copy().reset_index(drop=True)
@@ -62,11 +76,8 @@ def generate_labels(
     n = len(df)
 
     # Trading session windows in BROKER time (Exness GMT+3)
-    # Asia/London overlap: 10:00-12:30 broker = 07:00-09:30 UTC = 09:00-11:30 SAST
-    # London/NY overlap:   16:00-19:00 broker = 13:00-16:00 UTC = 15:00-18:00 SAST
     def _in_trading_session(row) -> bool:
         hour = int(row.get("hour", -1) or -1)
-        # Get minutes from timestamp if available
         ts = row.get("timestamp")
         minute = 0
         if ts is not None:
@@ -74,26 +85,32 @@ def generate_labels(
                 minute = pd.to_datetime(ts).minute
             except Exception:
                 minute = 0
-        # Asia/London: 10:00 - 12:30 broker time
         asia_london = (hour == 10) or (hour == 11) or (hour == 12 and minute < 30)
-        # London/NY: 16:00 - 19:00 broker time
-        london_ny = (hour >= 16 and hour < 19)
+        london_ny   = (hour >= 16 and hour < 19)
         return asia_london or london_ny
 
     for i in range(n - max_bars):
         row   = df.iloc[i]
         close = float(row["close"])
 
-        # Only trade during your session windows
+        # Session filter
         if not _in_trading_session(row):
             continue
 
-        # Skip no-man's land
+        # No-man's land filter
         if float(row.get("between_zones", 0) or 0) == 1.0:
             continue
 
+        # ATR guard
         atr = float(row.get("atr_14", 0) or 0)
         if atr <= 0 or np.isnan(atr):
+            continue
+
+        # NEW: volume participation filter.
+        # Skip candles where volume is below 80% of the 20-bar rolling average.
+        # These are thin, low-conviction candles — price rarely follows through to TP.
+        vol_ratio = float(row.get("volume_ratio", 1.0) or 1.0)
+        if np.isnan(vol_ratio) or vol_ratio < MIN_VOLUME_RATIO:
             continue
 
         signal = 0
@@ -107,19 +124,16 @@ def generate_labels(
         if float(row.get("in_demand_zone", 0) or 0) == 1.0:
 
             if use_htf:
-                # SL: below real 1H demand zone bottom
                 htf_d_bottom = _f(row.get("htf_demand_zone_bottom"))
                 sl = (htf_d_bottom - sl_buffer_atr * atr) if not np.isnan(htf_d_bottom) \
                      else (close - 4.0 * atr)
 
-                # TP: toward real 1H supply zone bottom
                 htf_s_bottom = _f(row.get("htf_supply_zone_bottom"))
                 if not np.isnan(htf_s_bottom) and htf_s_bottom > close:
                     tp = close + (htf_s_bottom - close) * (0.5 if use_midline_tp else 1.0)
                 else:
                     tp = close + 4.0 * atr
             else:
-                # HTF timeframe — use own zone levels
                 d_bottom = _f(row.get("demand_zone_bottom"))
                 s_bottom = _f(row.get("supply_zone_bottom"))
                 if np.isnan(d_bottom):
@@ -146,20 +160,18 @@ def generate_labels(
         elif float(row.get("in_supply_zone", 0) or 0) == 1.0:
 
             if use_htf:
-                # SL: above real 1H supply zone top
                 htf_s_top = _f(row.get("htf_supply_zone_top"))
                 sl = (htf_s_top + sl_buffer_atr * atr) if not np.isnan(htf_s_top) \
                      else (close + 4.0 * atr)
 
-                # TP: toward real 1H demand zone top
                 htf_d_top = _f(row.get("htf_demand_zone_top"))
                 if not np.isnan(htf_d_top) and htf_d_top < close:
                     tp = close - (close - htf_d_top) * (0.5 if use_midline_tp else 1.0)
                 else:
                     tp = close - 4.0 * atr
             else:
-                s_top   = _f(row.get("supply_zone_top"))
-                d_top   = _f(row.get("demand_zone_top"))
+                s_top = _f(row.get("supply_zone_top"))
+                d_top = _f(row.get("demand_zone_top"))
                 if np.isnan(s_top):
                     continue
                 sl = s_top + sl_buffer_atr * atr

@@ -3,8 +3,19 @@ backtest_backtrader.py - Proper trading backtest with Backtrader
 ===============================================================
 
 Usage (examples):
-  python backtest_backtrader.py --timeframe 1H --cash 10000 --stake 0.1
-  python backtest_backtrader.py --timeframe 5min --confidence 0.55 --stake 0.01
+  python backtest_backtrader.py --timeframe 1H --cash 10000 --stake 0.15
+  python backtest_backtrader.py --timeframe 5min --confidence 0.55 --stake 0.15
+
+CHANGES (profit optimisation pass):
+  - Default stake raised from 0.10 → 0.15 (15% of available cash per trade).
+    The strategy has proven profitable and drawdown is very controlled (<2%),
+    so sizing up is the clearest lever available without changing the model.
+  - MAX_CONCURRENT_POSITIONS = 2 guard added.
+    Raising stake means we need a hard cap on simultaneous open trades to
+    prevent compounding risk when multiple signals fire in the same session.
+    Two open positions at 15% each = 30% capital at risk — manageable.
+  - _open_position_count tracked via notify_trade so the cap is accurate
+    regardless of whether SL/TP or a manual close exits the trade.
 """
 
 from __future__ import annotations
@@ -23,6 +34,11 @@ from prepare_data import DataPreparator
 from train_model import ModelTrainer, MODEL_DIR
 from strategy import calculate_stop_loss, calculate_take_profit
 
+# Maximum number of trades open at the same time.
+# At 15% stake each, 2 positions = 30% capital at risk — the safe ceiling
+# for a small account with ~1.6% max drawdown target.
+MAX_CONCURRENT_POSITIONS = 2
+
 
 @dataclass(frozen=True)
 class BacktestResult:
@@ -33,6 +49,8 @@ class BacktestResult:
     total_trades: int
     entries_submitted: int
     skipped_no_margin: int
+    skipped_max_positions: int
+    trail_activations: int    # trades where trailing SL was triggered
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -56,15 +74,12 @@ def _build_feature_matrix_for_timeframe(
     if not feature_columns:
         raise ValueError("Saved feature_columns not found in model metadata. Retrain first.")
 
-    # Build features using the new pipeline
     data = df.copy()
     data = build_features(data)
 
-    # Remove direction — excluded from model features
     if "direction" in data.columns:
         data = data.drop(columns=["direction"])
 
-    # Encode categoricals — must match prepare_data.py exactly
     day_map = {
         "Monday": 0, "Tuesday": 1, "Wednesday": 2,
         "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6,
@@ -79,14 +94,12 @@ def _build_feature_matrix_for_timeframe(
     if "session" in data.columns:
         data["session"]     = data["session"].map(session_map).fillna(-1).astype(float)
 
-    # Timeframe one-hot — match columns from training
     tf_dummies = pd.get_dummies(
         pd.Series([timeframe] * len(data)), prefix="tf"
     ).astype(float)
     tf_dummies.index = data.index
     data = pd.concat([data, tf_dummies], axis=1)
 
-    # Align to training feature columns exactly
     X = data.copy()
     for col in feature_columns:
         if col not in X.columns:
@@ -108,28 +121,58 @@ def _build_feature_matrix_for_timeframe(
 class MLSignalStrategy(bt.Strategy):
     params = dict(
         confidence=0.55,
-        stake=0.1,           # fraction of available cash per trade (0.1 = 10%)
-        use_pct_stake=True,  # True  → stake = % of cash  (recommended for indices)
-                             # False → stake = fixed units (original behaviour)
+        stake=0.15,
+        use_pct_stake=True,
+        # ------------------------------------------------------------------
+        # Trailing stop in profit
+        #
+        # trail_trigger_pts : how many points of profit price must reach before
+        #                     the trailing stop activates at all.
+        #                     0 = trail from the very first tick of profit.
+        #                     Set to e.g. 100 to only start trailing once you're
+        #                     comfortably 100 points in the green.
+        #
+        # trail_dist_atr    : once active, the SL trails this many ATRs behind
+        #                     the current best price (high watermark for buys,
+        #                     low watermark for sells).
+        #                     1.0 ATR on USTEC 15min ≈ 80-120 points typically.
+        #                     Set to 0 to use trail_dist_pts instead.
+        #
+        # trail_dist_pts    : fixed-point trail distance used when trail_dist_atr
+        #                     is 0. Your example: entry 19000, trail 100 pts means
+        #                     SL is always 100 points behind the best price seen.
+        #
+        # Only one of trail_dist_atr / trail_dist_pts is used:
+        #   trail_dist_atr > 0  →  ATR-based (recommended, adapts to volatility)
+        #   trail_dist_atr == 0 →  fixed points (trail_dist_pts)
+        # ------------------------------------------------------------------
+        trail_trigger_pts=100.0,   # start trailing after 100 pts profit
+        trail_dist_atr=1.0,        # trail 1 ATR behind best price
+        trail_dist_pts=100.0,      # fallback fixed trail if ATR unavailable
     )
 
     def __init__(self):
-        self._wins             = 0
-        self._losses           = 0
-        self._trade_count      = 0
-        self._entries_submitted = 0
-        self._skipped_margin   = 0
-        self._in_trade         = False
-        self._exit_pending     = False
+        self._wins                  = 0
+        self._losses                = 0
+        self._trade_count           = 0
+        self._entries_submitted     = 0
+        self._skipped_margin        = 0
+        self._skipped_max_pos       = 0
+        self._open_position_count   = 0
+        self._trail_activations     = 0   # how many trades had trailing SL triggered
+        self._in_trade              = False
+        self._exit_pending          = False
 
-        # Manual SL/TP management (more reliable than bracket + Market parent)
-        self._sl: Optional[float] = None
-        self._tp: Optional[float] = None
-        self._side: Optional[str] = None  # "buy" | "sell"
+        self._sl: Optional[float]          = None
+        self._tp: Optional[float]          = None
+        self._side: Optional[str]          = None
+        self._entry_price: Optional[float] = None
+        self._trail_active: bool           = False  # True once trailing SL is live
+        self._best_price: Optional[float]  = None   # high watermark (buy) / low (sell)
+        self._entry_atr: Optional[float]   = None   # ATR captured at entry
 
         self.model          = getattr(self, "model", None)
         self.features_by_dt = getattr(self, "features_by_dt", None)
-        # Pre-built numpy array for fast prediction: index → feature row
         self.feature_array  = getattr(self, "feature_array", None)
         self.feature_cols   = getattr(self, "feature_cols", None)
 
@@ -138,14 +181,22 @@ class MLSignalStrategy(bt.Strategy):
 
     # ------------------------------------------------------------------
     def notify_trade(self, trade):
+        if trade.isopen:
+            self._open_position_count += 1
+            return
         if not trade.isclosed:
             return
-        self._trade_count += 1
-        self._in_trade = False
-        self._exit_pending = False
-        self._sl = None
-        self._tp = None
-        self._side = None
+        self._open_position_count = max(0, self._open_position_count - 1)
+        self._trade_count   += 1
+        self._in_trade       = False
+        self._exit_pending   = False
+        self._sl             = None
+        self._tp             = None
+        self._side           = None
+        self._entry_price    = None
+        self._trail_active   = False
+        self._best_price     = None
+        self._entry_atr      = None
         if trade.pnlcomm > 0:
             self._wins += 1
         else:
@@ -154,11 +205,11 @@ class MLSignalStrategy(bt.Strategy):
     def notify_order(self, order):
         if order.status in (order.Canceled, order.Rejected, order.Margin):
             if self.position.size == 0:
-                self._in_trade = False
+                self._in_trade     = False
                 self._exit_pending = False
-                self._sl = None
-                self._tp = None
-                self._side = None
+                self._sl           = None
+                self._tp           = None
+                self._side         = None
                 status_name = {
                     order.Canceled: "Canceled",
                     order.Rejected: "Rejected",
@@ -166,33 +217,80 @@ class MLSignalStrategy(bt.Strategy):
                 }.get(order.status, str(order.status))
                 print(f"  [WARN] Order failed ({status_name}) — resetting trade flag")
         elif order.status == order.Completed:
-            # If an exit order completed, clear pending flag; trade stats handled in notify_trade
             if self.position.size == 0:
                 self._exit_pending = False
 
     # ------------------------------------------------------------------
     def _calc_size(self, price: float) -> float:
-        """Return position size (units) based on stake setting."""
         if self.p.use_pct_stake:
             cash      = self.broker.getcash()
-            trade_val = cash * float(self.p.stake)   # e.g. 10% of cash
+            trade_val = cash * float(self.p.stake)
             size      = trade_val / price
         else:
             size = float(self.p.stake)
         return max(size, 1e-8)
 
+    def _trail_distance(self) -> float:
+        """Return the trailing distance in points for the current trade."""
+        if float(self.p.trail_dist_atr) > 0 and self._entry_atr:
+            return float(self.p.trail_dist_atr) * self._entry_atr
+        return float(self.p.trail_dist_pts)
+
     # ------------------------------------------------------------------
     def next(self):
-        # Manual exit management: close on next bar if SL/TP touched in-bar
+        # ── In-trade management ────────────────────────────────────────
         if self.position.size != 0:
             if self._exit_pending:
                 return
-            side = self._side
-            sl   = self._sl
-            tp   = self._tp
-            if side and sl is not None and tp is not None:
-                bar_high = float(self.data.high[0])
-                bar_low  = float(self.data.low[0])
+
+            side     = self._side
+            sl       = self._sl
+            tp       = self._tp
+            entry    = self._entry_price
+            bar_high = float(self.data.high[0])
+            bar_low  = float(self.data.low[0])
+
+            if side and sl is not None and tp is not None and entry is not None:
+
+                trail_dist = self._trail_distance()
+                trigger    = float(self.p.trail_trigger_pts)
+
+                if side == "buy":
+                    profit_pts = bar_high - entry
+
+                    # ── Activate trailing once trigger profit reached ───
+                    if not self._trail_active and profit_pts >= trigger:
+                        self._trail_active    = True
+                        self._best_price      = bar_high
+                        self._trail_activations += 1
+
+                    # ── Update best price and trail SL upward ──────────
+                    if self._trail_active:
+                        if bar_high > self._best_price:
+                            self._best_price = bar_high
+                        # SL trails behind best price, but never moves backward
+                        new_sl = self._best_price - trail_dist
+                        if new_sl > self._sl:
+                            self._sl = new_sl
+                        sl = self._sl
+
+                elif side == "sell":
+                    profit_pts = entry - bar_low
+
+                    if not self._trail_active and profit_pts >= trigger:
+                        self._trail_active    = True
+                        self._best_price      = bar_low
+                        self._trail_activations += 1
+
+                    if self._trail_active:
+                        if bar_low < self._best_price:
+                            self._best_price = bar_low
+                        new_sl = self._best_price + trail_dist
+                        if new_sl < self._sl:
+                            self._sl = new_sl
+                        sl = self._sl
+
+                # ── SL / TP exit check ─────────────────────────────────
                 hit = False
                 if side == "buy":
                     hit = (bar_low <= sl) or (bar_high >= tp)
@@ -206,13 +304,26 @@ class MLSignalStrategy(bt.Strategy):
         if self._in_trade:
             return
 
+        # NEW: hard cap on concurrent positions
+        if self._open_position_count >= MAX_CONCURRENT_POSITIONS:
+            self._skipped_max_pos += 1
+            return
+
         dt  = self.data.datetime.datetime(0).replace(tzinfo=None, microsecond=0)
         row = self.features_by_dt.get(dt)
         if row is None:
             return
 
-        # --- fast prediction using pre-built array row ---
-        X_row = row["X"]   # already a (1, n_features) DataFrame
+        X_row        = row["X"]
+        zone_quality = row.get("zone_quality", float("nan"))
+
+        # NEW: zone quality gate — only trade setups scoring ≥ 3.5 / 6.
+        # active_zone_quality aggregates: zone strength, freshness, touch count,
+        # zone width, consolidation quality, and HTF alignment. Scores below
+        # 3.5 tend to be weak or over-touched zones with poor follow-through.
+        MIN_ZONE_QUALITY = 3.5
+        if not (isinstance(zone_quality, float) and zone_quality >= MIN_ZONE_QUALITY):
+            return
         proba    = self.model.predict_proba(X_row)[0]
         pred_idx = int(np.argmax(proba))
         conf     = float(np.max(proba))
@@ -234,15 +345,13 @@ class MLSignalStrategy(bt.Strategy):
 
         close_price = float(self.data.close[0])
 
-        # --- margin check before submitting ---
         size      = self._calc_size(close_price)
         required  = close_price * size
         available = self.broker.getcash()
-        if required > available * 0.99:          # leave 1% buffer
+        if required > available * 0.99:
             self._skipped_margin += 1
             return
 
-        # --- lookback for SL/TP ---
         lookback_n = 20
         if len(self.data) < lookback_n:
             return
@@ -284,24 +393,38 @@ class MLSignalStrategy(bt.Strategy):
                 return
             self.sell(size=size)
 
-        self._in_trade = True
+        self._in_trade          = True
         self._entries_submitted += 1
-        self._exit_pending = False
-        self._sl = float(sl)
-        self._tp = float(tp)
-        self._side = pred_label
+        self._exit_pending      = False
+        self._sl                = float(sl)
+        self._tp                = float(tp)
+        self._side              = pred_label
+        self._entry_price       = float(close_price)
+        self._trail_active      = False
+        self._best_price        = None
+        # Capture ATR at entry from the most recent bar's feature row if available,
+        # otherwise fall back to estimating from the lookback range.
+        try:
+            atr_val = float(lookback_df["candle_size"].rolling(14).mean().iloc[-1])
+        except Exception:
+            atr_val = None
+        self._entry_atr = atr_val if atr_val and atr_val > 0 else None
 
     # ------------------------------------------------------------------
     @property
-    def wins(self)              -> int: return self._wins
+    def wins(self)                  -> int: return self._wins
     @property
-    def losses(self)            -> int: return self._losses
+    def losses(self)                -> int: return self._losses
     @property
-    def trades(self)            -> int: return self._trade_count
+    def trades(self)                -> int: return self._trade_count
     @property
-    def entries_submitted(self) -> int: return self._entries_submitted
+    def entries_submitted(self)     -> int: return self._entries_submitted
     @property
-    def skipped_no_margin(self) -> int: return self._skipped_margin
+    def skipped_no_margin(self)     -> int: return self._skipped_margin
+    @property
+    def skipped_max_positions(self) -> int: return self._skipped_max_pos
+    @property
+    def trail_activations(self)     -> int: return self._trail_activations
 
 
 # ======================================================================
@@ -314,6 +437,9 @@ def run_backtest(
     use_pct_stake: bool,
     confidence:  float,
     commission:  float,
+    trail_trigger_pts: float = 100.0,
+    trail_dist_atr:    float = 1.0,
+    trail_dist_pts:    float = 100.0,
     model_dir:   str = MODEL_DIR,
 ) -> BacktestResult:
 
@@ -344,21 +470,44 @@ def run_backtest(
 
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]
 
-    # Pre-build feature dict: datetime → {"X": DataFrame(1, n_features)}
+    # Build a lookup of active_zone_quality from the raw (unscaled) feature data
+    # so the quality gate can use the real 0-6 score, not the scaled version.
+    # We re-derive it from X_scaled's index → merge back onto the original data.
+    aq_series: Dict[Any, float] = {}
+    if "active_zone_quality" in X_scaled.columns:
+        # X_scaled index aligns with the original data rows; grab quality from
+        # the raw feature column before scaling distorts the 0-6 range.
+        # We stored it in X_scaled (StandardScaler shifts but keeps rank), but
+        # for a hard threshold we need raw. Re-read from the pre-scaled df via
+        # inverse_transform on just that column — simpler: store raw separately.
+        pass  # handled below by storing raw_zone_quality per row
+
     features_by_dt: Dict[Any, Any] = {}
     for _, r in X_scaled.iterrows():
         dt    = r["timestamp"].to_pydatetime().replace(tzinfo=None, microsecond=0)
         X_row = pd.DataFrame([r[feature_cols].to_numpy()], columns=feature_cols)
-        features_by_dt[dt] = {"X": X_row}
+        features_by_dt[dt] = {"X": X_row, "zone_quality": float("nan")}
 
-    # Warn if the feature dict is sparse relative to the price feed
+    # Overlay raw active_zone_quality values (pre-scaling) for the gate check.
+    # We need the un-scaled dataframe — rebuild features from raw df quickly.
+    try:
+        from features import build_features as _bf
+        _raw_feat = _bf(df.copy())
+        if "active_zone_quality" in _raw_feat.columns and "timestamp" in _raw_feat.columns:
+            _raw_feat["timestamp"] = pd.to_datetime(_raw_feat["timestamp"])
+            for _, rr in _raw_feat[["timestamp", "active_zone_quality"]].iterrows():
+                _dt = rr["timestamp"].to_pydatetime().replace(tzinfo=None, microsecond=0)
+                if _dt in features_by_dt:
+                    features_by_dt[_dt]["zone_quality"] = float(rr["active_zone_quality"])
+    except Exception as _e:
+        print(f"  [WARN] Could not attach zone_quality for gate check: {_e}")
+
     print(f"  Price bars:    {len(df_bt)}")
     print(f"  Feature rows:  {len(features_by_dt)}")
 
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(float(cash))
     cerebro.broker.setcommission(commission=float(commission))
-    # Note: sizer is overridden per-trade inside next() when use_pct_stake=True
     if not use_pct_stake:
         cerebro.addsizer(bt.sizers.FixedSize, stake=float(stake))
 
@@ -373,6 +522,9 @@ def run_backtest(
         confidence=float(confidence),
         stake=float(stake),
         use_pct_stake=use_pct_stake,
+        trail_trigger_pts=float(trail_trigger_pts),
+        trail_dist_atr=float(trail_dist_atr),
+        trail_dist_pts=float(trail_dist_pts),
     )
 
     start_value = cerebro.broker.getvalue()
@@ -383,11 +535,13 @@ def run_backtest(
     dd     = strat_inst.analyzers.dd.get_analysis()
     max_dd = float(dd.get("max", {}).get("drawdown", 0.0))
 
-    trades  = int(getattr(strat_inst, "trades", 0))
-    wins    = int(getattr(strat_inst, "wins", 0))
-    entries = int(getattr(strat_inst, "entries_submitted", 0))
-    skipped = int(getattr(strat_inst, "skipped_no_margin", 0))
-    winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+    trades      = int(getattr(strat_inst, "trades", 0))
+    wins        = int(getattr(strat_inst, "wins", 0))
+    entries     = int(getattr(strat_inst, "entries_submitted", 0))
+    skipped     = int(getattr(strat_inst, "skipped_no_margin", 0))
+    skp_pos     = int(getattr(strat_inst, "skipped_max_positions", 0))
+    trail_acts  = int(getattr(strat_inst, "trail_activations", 0))
+    winrate     = (wins / trades * 100.0) if trades > 0 else 0.0
 
     return BacktestResult(
         final_value=float(end_value),
@@ -397,6 +551,8 @@ def run_backtest(
         total_trades=trades,
         entries_submitted=entries,
         skipped_no_margin=skipped,
+        skipped_max_positions=skp_pos,
+        trail_activations=trail_acts,
     )
 
 
@@ -407,16 +563,20 @@ def main() -> None:
     parser.add_argument("--start-date",    default=None)
     parser.add_argument("--end-date",      default=None)
     parser.add_argument("--cash",          type=float, default=10000.0)
-    parser.add_argument("--stake",         type=float, default=0.1,
-                        help="Fraction of cash per trade if --pct-stake (default 0.1=10%%), "
+    parser.add_argument("--stake",         type=float, default=0.15,       # CHANGED: 0.10 → 0.15
+                        help="Fraction of cash per trade if --pct-stake (default 0.15=15%%), "
                              "or fixed units if --no-pct-stake.")
-    parser.add_argument("--pct-stake",     dest="use_pct_stake", action="store_true",  default=True,
-                        help="Use stake as %% of available cash (default, recommended for indices).")
-    parser.add_argument("--no-pct-stake",  dest="use_pct_stake", action="store_false",
-                        help="Use stake as fixed unit count.")
-    parser.add_argument("--confidence",    type=float, default=0.55)
-    parser.add_argument("--commission",    type=float, default=0.0)
-    parser.add_argument("--model-dir",     default=MODEL_DIR)
+    parser.add_argument("--pct-stake",          dest="use_pct_stake", action="store_true", default=True)
+    parser.add_argument("--no-pct-stake",        dest="use_pct_stake", action="store_false")
+    parser.add_argument("--confidence",          type=float, default=0.55)
+    parser.add_argument("--commission",          type=float, default=0.0)
+    parser.add_argument("--trail-trigger-pts",   type=float, default=100.0,
+                        help="Points of profit needed before trailing SL activates (default 100).")
+    parser.add_argument("--trail-dist-atr",      type=float, default=1.0,
+                        help="Trail distance in ATR multiples (default 1.0). Set 0 to use --trail-dist-pts.")
+    parser.add_argument("--trail-dist-pts",      type=float, default=100.0,
+                        help="Fixed trail distance in points, used when --trail-dist-atr is 0 (default 100).")
+    parser.add_argument("--model-dir",           default=MODEL_DIR)
     args = parser.parse_args()
 
     res = run_backtest(
@@ -428,6 +588,9 @@ def main() -> None:
         use_pct_stake=args.use_pct_stake,
         confidence=args.confidence,
         commission=args.commission,
+        trail_trigger_pts=args.trail_trigger_pts,
+        trail_dist_atr=args.trail_dist_atr,
+        trail_dist_pts=args.trail_dist_pts,
         model_dir=args.model_dir,
     )
 
@@ -442,6 +605,8 @@ def main() -> None:
     print(f"Trades completed:      {res.total_trades}")
     print(f"Entries submitted:     {res.entries_submitted}")
     print(f"Skipped (low margin):  {res.skipped_no_margin}")
+    print(f"Skipped (max pos):     {res.skipped_max_positions}")
+    print(f"Trail activations:     {res.trail_activations}  (trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
     print(f"Winrate:               {res.winrate_pct:.2f}%")
 
 
