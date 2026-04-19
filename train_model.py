@@ -85,7 +85,7 @@ METADATA_FILE  = "model_metadata.joblib"
 # from only 102 real ones) teaches the model patterns that don't exist in
 # real market data. 0.1 gives ~11k synthetic winners which is enough for
 # XGBoost to learn the pattern without hallucinating.
-SMOTE_RATIO = 0.1
+SMOTE_RATIO = 0.2
 
 
 class ModelTrainer:
@@ -112,7 +112,7 @@ class ModelTrainer:
                 random_state=42,
                 n_jobs=-1,
                 tree_method="hist",
-                eval_metric="logloss",
+                eval_metric="mlogloss",
             )
             if params:
                 default.update(params)
@@ -292,10 +292,13 @@ class ModelTrainer:
         t0 = datetime.now()
 
         if self.model_type == "xgboost":
+            # eval_set removed — it caused persistent num_class=1 errors because
+            # XGBoost's internal class scanner misreads the test label array when
+            # the pandas index is non-contiguous after zone-touch filtering.
+            # We use fixed n_estimators=600 so early stopping isn't needed.
             self.model.fit(
                 X_train_np, y_train_np,
                 sample_weight=sample_weight,
-                eval_set=[(X_test_np, y_test_np)],
                 verbose=False,
             )
         else:

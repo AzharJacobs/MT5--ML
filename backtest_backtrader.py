@@ -6,16 +6,19 @@ Usage (examples):
   python backtest_backtrader.py --timeframe 1H --cash 10000 --stake 0.15
   python backtest_backtrader.py --timeframe 5min --confidence 0.55 --stake 0.15
 
-CHANGES (profit optimisation pass):
-  - Default stake raised from 0.10 → 0.15 (15% of available cash per trade).
-    The strategy has proven profitable and drawdown is very controlled (<2%),
-    so sizing up is the clearest lever available without changing the model.
+CHANGES (zone alignment fix):
+  - features_by_dt now stores a "raw" key per bar containing the unscaled
+    zone boundary values (demand_zone_bottom, supply_zone_top, htf zones, atr_14).
+    These are passed as feature_row= to calculate_stop_loss() and
+    calculate_take_profit() so SL/TP use the SAME zone boundaries the model
+    was trained on, eliminating the train/execute mismatch.
+
+  - Raw zone columns are extracted from _raw_feat (already built for zone_quality)
+    so there is zero extra DB query or feature rebuild cost.
+
+PREVIOUS CHANGES:
+  - Default stake raised from 0.10 → 0.15.
   - MAX_CONCURRENT_POSITIONS = 2 guard added.
-    Raising stake means we need a hard cap on simultaneous open trades to
-    prevent compounding risk when multiple signals fire in the same session.
-    Two open positions at 15% each = 30% capital at risk — manageable.
-  - _open_position_count tracked via notify_trade so the cap is accurate
-    regardless of whether SL/TP or a manual close exits the trade.
 """
 
 from __future__ import annotations
@@ -34,10 +37,16 @@ from prepare_data import DataPreparator
 from train_model import ModelTrainer, MODEL_DIR
 from strategy import calculate_stop_loss, calculate_take_profit
 
-# Maximum number of trades open at the same time.
-# At 15% stake each, 2 positions = 30% capital at risk — the safe ceiling
-# for a small account with ~1.6% max drawdown target.
 MAX_CONCURRENT_POSITIONS = 2
+
+# Raw zone columns we need at execution time (unscaled, real price levels)
+RAW_ZONE_COLS = [
+    "demand_zone_bottom", "demand_zone_top",
+    "supply_zone_bottom", "supply_zone_top",
+    "htf_demand_zone_top", "htf_demand_zone_bottom",
+    "htf_supply_zone_top", "htf_supply_zone_bottom",
+    "atr_14",
+]
 
 
 @dataclass(frozen=True)
@@ -50,7 +59,7 @@ class BacktestResult:
     entries_submitted: int
     skipped_no_margin: int
     skipped_max_positions: int
-    trail_activations: int    # trades where trailing SL was triggered
+    trail_activations: int
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -63,7 +72,6 @@ def _build_feature_matrix_for_timeframe(
     timeframe: str,
     metadata_bundle: Dict[str, Any]
 ) -> pd.DataFrame:
-    import numpy as np
     from features import build_features
 
     saved_scaler    = metadata_bundle.get("scaler")
@@ -123,32 +131,9 @@ class MLSignalStrategy(bt.Strategy):
         confidence=0.55,
         stake=0.15,
         use_pct_stake=True,
-        # ------------------------------------------------------------------
-        # Trailing stop in profit
-        #
-        # trail_trigger_pts : how many points of profit price must reach before
-        #                     the trailing stop activates at all.
-        #                     0 = trail from the very first tick of profit.
-        #                     Set to e.g. 100 to only start trailing once you're
-        #                     comfortably 100 points in the green.
-        #
-        # trail_dist_atr    : once active, the SL trails this many ATRs behind
-        #                     the current best price (high watermark for buys,
-        #                     low watermark for sells).
-        #                     1.0 ATR on USTEC 15min ≈ 80-120 points typically.
-        #                     Set to 0 to use trail_dist_pts instead.
-        #
-        # trail_dist_pts    : fixed-point trail distance used when trail_dist_atr
-        #                     is 0. Your example: entry 19000, trail 100 pts means
-        #                     SL is always 100 points behind the best price seen.
-        #
-        # Only one of trail_dist_atr / trail_dist_pts is used:
-        #   trail_dist_atr > 0  →  ATR-based (recommended, adapts to volatility)
-        #   trail_dist_atr == 0 →  fixed points (trail_dist_pts)
-        # ------------------------------------------------------------------
-        trail_trigger_pts=100.0,   # start trailing after 100 pts profit
-        trail_dist_atr=1.0,        # trail 1 ATR behind best price
-        trail_dist_pts=100.0,      # fallback fixed trail if ATR unavailable
+        trail_trigger_pts=100.0,
+        trail_dist_atr=1.0,
+        trail_dist_pts=100.0,
     )
 
     def __init__(self):
@@ -159,7 +144,7 @@ class MLSignalStrategy(bt.Strategy):
         self._skipped_margin        = 0
         self._skipped_max_pos       = 0
         self._open_position_count   = 0
-        self._trail_activations     = 0   # how many trades had trailing SL triggered
+        self._trail_activations     = 0
         self._in_trade              = False
         self._exit_pending          = False
 
@@ -167,19 +152,16 @@ class MLSignalStrategy(bt.Strategy):
         self._tp: Optional[float]          = None
         self._side: Optional[str]          = None
         self._entry_price: Optional[float] = None
-        self._trail_active: bool           = False  # True once trailing SL is live
-        self._best_price: Optional[float]  = None   # high watermark (buy) / low (sell)
-        self._entry_atr: Optional[float]   = None   # ATR captured at entry
+        self._trail_active: bool           = False
+        self._best_price: Optional[float]  = None
+        self._entry_atr: Optional[float]   = None
 
         self.model          = getattr(self, "model", None)
         self.features_by_dt = getattr(self, "features_by_dt", None)
-        self.feature_array  = getattr(self, "feature_array", None)
-        self.feature_cols   = getattr(self, "feature_cols", None)
 
         if self.model is None or self.features_by_dt is None:
             raise RuntimeError("Strategy missing injected `model` or `features_by_dt`.")
 
-    # ------------------------------------------------------------------
     def notify_trade(self, trade):
         if trade.isopen:
             self._open_position_count += 1
@@ -220,7 +202,6 @@ class MLSignalStrategy(bt.Strategy):
             if self.position.size == 0:
                 self._exit_pending = False
 
-    # ------------------------------------------------------------------
     def _calc_size(self, price: float) -> float:
         if self.p.use_pct_stake:
             cash      = self.broker.getcash()
@@ -231,12 +212,10 @@ class MLSignalStrategy(bt.Strategy):
         return max(size, 1e-8)
 
     def _trail_distance(self) -> float:
-        """Return the trailing distance in points for the current trade."""
         if float(self.p.trail_dist_atr) > 0 and self._entry_atr:
             return float(self.p.trail_dist_atr) * self._entry_atr
         return float(self.p.trail_dist_pts)
 
-    # ------------------------------------------------------------------
     def next(self):
         # ── In-trade management ────────────────────────────────────────
         if self.position.size != 0:
@@ -257,18 +236,13 @@ class MLSignalStrategy(bt.Strategy):
 
                 if side == "buy":
                     profit_pts = bar_high - entry
-
-                    # ── Activate trailing once trigger profit reached ───
                     if not self._trail_active and profit_pts >= trigger:
                         self._trail_active    = True
                         self._best_price      = bar_high
                         self._trail_activations += 1
-
-                    # ── Update best price and trail SL upward ──────────
                     if self._trail_active:
                         if bar_high > self._best_price:
                             self._best_price = bar_high
-                        # SL trails behind best price, but never moves backward
                         new_sl = self._best_price - trail_dist
                         if new_sl > self._sl:
                             self._sl = new_sl
@@ -276,12 +250,10 @@ class MLSignalStrategy(bt.Strategy):
 
                 elif side == "sell":
                     profit_pts = entry - bar_low
-
                     if not self._trail_active and profit_pts >= trigger:
                         self._trail_active    = True
                         self._best_price      = bar_low
                         self._trail_activations += 1
-
                     if self._trail_active:
                         if bar_low < self._best_price:
                             self._best_price = bar_low
@@ -290,7 +262,6 @@ class MLSignalStrategy(bt.Strategy):
                             self._sl = new_sl
                         sl = self._sl
 
-                # ── SL / TP exit check ─────────────────────────────────
                 hit = False
                 if side == "buy":
                     hit = (bar_low <= sl) or (bar_high >= tp)
@@ -304,7 +275,6 @@ class MLSignalStrategy(bt.Strategy):
         if self._in_trade:
             return
 
-        # NEW: hard cap on concurrent positions
         if self._open_position_count >= MAX_CONCURRENT_POSITIONS:
             self._skipped_max_pos += 1
             return
@@ -317,13 +287,10 @@ class MLSignalStrategy(bt.Strategy):
         X_row        = row["X"]
         zone_quality = row.get("zone_quality", float("nan"))
 
-        # NEW: zone quality gate — only trade setups scoring ≥ 3.5 / 6.
-        # active_zone_quality aggregates: zone strength, freshness, touch count,
-        # zone width, consolidation quality, and HTF alignment. Scores below
-        # 3.5 tend to be weak or over-touched zones with poor follow-through.
         MIN_ZONE_QUALITY = 3.5
         if not (isinstance(zone_quality, float) and zone_quality >= MIN_ZONE_QUALITY):
             return
+
         proba    = self.model.predict_proba(X_row)[0]
         pred_idx = int(np.argmax(proba))
         conf     = float(np.max(proba))
@@ -377,8 +344,21 @@ class MLSignalStrategy(bt.Strategy):
         lookback_df["wick_upper"]  = wick_upper
         lookback_df["wick_lower"]  = wick_lower
 
-        sl = calculate_stop_loss(close_price, pred_label, lookback_df)
-        tp = calculate_take_profit(close_price, pred_label, lookback_df)
+        # ── CHANGED: pass raw feature row for zone-aligned SL/TP ──────
+        raw_feat_series = row.get("raw")  # unscaled zone boundaries from features.py
+
+        sl = calculate_stop_loss(
+            close_price, pred_label, lookback_df,
+            feature_row=raw_feat_series,
+        )
+        tp = calculate_take_profit(
+            close_price, pred_label, lookback_df,
+            feature_row=raw_feat_series,
+        )
+
+        # ── Sanity print for first few trades (remove after confirming) ─
+        # print(f"  [TRADE] {pred_label} entry={close_price:.2f} sl={sl} tp={tp} "
+        #       f"raw_feat={'ok' if raw_feat_series is not None else 'MISSING'}")
 
         if pred_label == "buy":
             if sl is None: sl = close_price * 0.997
@@ -402,15 +382,13 @@ class MLSignalStrategy(bt.Strategy):
         self._entry_price       = float(close_price)
         self._trail_active      = False
         self._best_price        = None
-        # Capture ATR at entry from the most recent bar's feature row if available,
-        # otherwise fall back to estimating from the lookback range.
+
         try:
             atr_val = float(lookback_df["candle_size"].rolling(14).mean().iloc[-1])
         except Exception:
             atr_val = None
         self._entry_atr = atr_val if atr_val and atr_val > 0 else None
 
-    # ------------------------------------------------------------------
     @property
     def wins(self)                  -> int: return self._wins
     @property
@@ -470,40 +448,49 @@ def run_backtest(
 
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]
 
-    # Build a lookup of active_zone_quality from the raw (unscaled) feature data
-    # so the quality gate can use the real 0-6 score, not the scaled version.
-    # We re-derive it from X_scaled's index → merge back onto the original data.
-    aq_series: Dict[Any, float] = {}
-    if "active_zone_quality" in X_scaled.columns:
-        # X_scaled index aligns with the original data rows; grab quality from
-        # the raw feature column before scaling distorts the 0-6 range.
-        # We stored it in X_scaled (StandardScaler shifts but keeps rank), but
-        # for a hard threshold we need raw. Re-read from the pre-scaled df via
-        # inverse_transform on just that column — simpler: store raw separately.
-        pass  # handled below by storing raw_zone_quality per row
-
+    # Build scaled feature lookup
     features_by_dt: Dict[Any, Any] = {}
     for _, r in X_scaled.iterrows():
         dt    = r["timestamp"].to_pydatetime().replace(tzinfo=None, microsecond=0)
         X_row = pd.DataFrame([r[feature_cols].to_numpy()], columns=feature_cols)
-        features_by_dt[dt] = {"X": X_row, "zone_quality": float("nan")}
+        features_by_dt[dt] = {
+            "X":           X_row,
+            "zone_quality": float("nan"),
+            "raw":         None,   # filled below with unscaled zone values
+        }
 
-    # Overlay raw active_zone_quality values (pre-scaling) for the gate check.
-    # We need the un-scaled dataframe — rebuild features from raw df quickly.
+    # Overlay raw (unscaled) zone values and quality from pre-scaled feature build
     try:
         from features import build_features as _bf
         _raw_feat = _bf(df.copy())
-        if "active_zone_quality" in _raw_feat.columns and "timestamp" in _raw_feat.columns:
+
+        if "timestamp" in _raw_feat.columns:
             _raw_feat["timestamp"] = pd.to_datetime(_raw_feat["timestamp"])
-            for _, rr in _raw_feat[["timestamp", "active_zone_quality"]].iterrows():
+
+            # Columns we need unscaled
+            available_raw_cols = ["timestamp"] + [
+                c for c in RAW_ZONE_COLS + ["active_zone_quality"]
+                if c in _raw_feat.columns
+            ]
+
+            for _, rr in _raw_feat[available_raw_cols].iterrows():
                 _dt = rr["timestamp"].to_pydatetime().replace(tzinfo=None, microsecond=0)
                 if _dt in features_by_dt:
-                    features_by_dt[_dt]["zone_quality"] = float(rr["active_zone_quality"])
+                    # Zone quality gate value (real 0-6 score)
+                    if "active_zone_quality" in rr:
+                        features_by_dt[_dt]["zone_quality"] = float(rr["active_zone_quality"])
+                    # Raw zone boundaries for SL/TP (real price levels, not scaled)
+                    features_by_dt[_dt]["raw"] = rr
+
     except Exception as _e:
-        print(f"  [WARN] Could not attach zone_quality for gate check: {_e}")
+        print(f"  [WARN] Could not attach raw zone features: {_e}")
 
     print(f"  Price bars:    {len(df_bt)}")
     print(f"  Feature rows:  {len(features_by_dt)}")
+
+    # Check how many bars have raw zone data attached
+    raw_count = sum(1 for v in features_by_dt.values() if v.get("raw") is not None)
+    print(f"  Raw zone rows: {raw_count} ({raw_count/max(len(features_by_dt),1)*100:.1f}% coverage)")
 
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(float(cash))
@@ -559,24 +546,19 @@ def run_backtest(
 # ======================================================================
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--timeframe",     default="1min")
-    parser.add_argument("--start-date",    default=None)
-    parser.add_argument("--end-date",      default=None)
-    parser.add_argument("--cash",          type=float, default=10000.0)
-    parser.add_argument("--stake",         type=float, default=0.15,       # CHANGED: 0.10 → 0.15
-                        help="Fraction of cash per trade if --pct-stake (default 0.15=15%%), "
-                             "or fixed units if --no-pct-stake.")
+    parser.add_argument("--timeframe",          default="1min")
+    parser.add_argument("--start-date",         default=None)
+    parser.add_argument("--end-date",           default=None)
+    parser.add_argument("--cash",               type=float, default=10000.0)
+    parser.add_argument("--stake",              type=float, default=0.15)
     parser.add_argument("--pct-stake",          dest="use_pct_stake", action="store_true", default=True)
-    parser.add_argument("--no-pct-stake",        dest="use_pct_stake", action="store_false")
-    parser.add_argument("--confidence",          type=float, default=0.55)
-    parser.add_argument("--commission",          type=float, default=0.0)
-    parser.add_argument("--trail-trigger-pts",   type=float, default=100.0,
-                        help="Points of profit needed before trailing SL activates (default 100).")
-    parser.add_argument("--trail-dist-atr",      type=float, default=1.0,
-                        help="Trail distance in ATR multiples (default 1.0). Set 0 to use --trail-dist-pts.")
-    parser.add_argument("--trail-dist-pts",      type=float, default=100.0,
-                        help="Fixed trail distance in points, used when --trail-dist-atr is 0 (default 100).")
-    parser.add_argument("--model-dir",           default=MODEL_DIR)
+    parser.add_argument("--no-pct-stake",       dest="use_pct_stake", action="store_false")
+    parser.add_argument("--confidence",         type=float, default=0.55)
+    parser.add_argument("--commission",         type=float, default=0.0)
+    parser.add_argument("--trail-trigger-pts",  type=float, default=100.0)
+    parser.add_argument("--trail-dist-atr",     type=float, default=1.0)
+    parser.add_argument("--trail-dist-pts",     type=float, default=100.0)
+    parser.add_argument("--model-dir",          default=MODEL_DIR)
     args = parser.parse_args()
 
     res = run_backtest(
@@ -606,7 +588,8 @@ def main() -> None:
     print(f"Entries submitted:     {res.entries_submitted}")
     print(f"Skipped (low margin):  {res.skipped_no_margin}")
     print(f"Skipped (max pos):     {res.skipped_max_positions}")
-    print(f"Trail activations:     {res.trail_activations}  (trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
+    print(f"Trail activations:     {res.trail_activations}  "
+          f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
     print(f"Winrate:               {res.winrate_pct:.2f}%")
 
 
