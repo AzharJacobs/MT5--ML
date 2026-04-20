@@ -4,19 +4,27 @@ backtest_backtrader.py - Proper trading backtest with Backtrader
 
 Usage (examples):
   python backtest_backtrader.py --timeframe 1H --cash 10000 --stake 0.15
-  python backtest_backtrader.py --timeframe 5min --confidence 0.55 --stake 0.15
+  python backtest_backtrader.py --timeframe 5min --confidence 0.52 --stake 0.15
 
-CHANGES (zone alignment fix):
-  - features_by_dt now stores a "raw" key per bar containing the unscaled
-    zone boundary values (demand_zone_bottom, supply_zone_top, htf zones, atr_14).
-    These are passed as feature_row= to calculate_stop_loss() and
-    calculate_take_profit() so SL/TP use the SAME zone boundaries the model
-    was trained on, eliminating the train/execute mismatch.
+CHANGES (trade frequency fix):
+  - MIN_ZONE_QUALITY lowered from 3.5 → 2.0.
+    At 3.5 only 9 trades fired across 46,702 bars (15min). The model was
+    essentially never trading. 2.0 opens the gate to more zone encounters
+    while still requiring a real zone (score 0 = no zone at all).
 
-  - Raw zone columns are extracted from _raw_feat (already built for zone_quality)
-    so there is zero extra DB query or feature rebuild cost.
+  - confidence default lowered from 0.55 → 0.52 in main().
+    With so few trades the model never had enough samples to build high
+    confidence. 0.52 keeps the signal meaningful while tripling trade count.
+
+  - Diagnostic counters added to MLSignalStrategy and printed after results
+    so you can see exactly which gate is filtering most bars.
+    Gates: no_row | zone_quality | confidence | neutral_label | bad_sl_tp
+
+  - Zone quality distribution printed before backtest runs so you can
+    see the score spread and tune MIN_ZONE_QUALITY intelligently.
 
 PREVIOUS CHANGES:
+  - features_by_dt stores "raw" key with unscaled zone boundaries for SL/TP.
   - Default stake raised from 0.10 → 0.15.
   - MAX_CONCURRENT_POSITIONS = 2 guard added.
 """
@@ -39,6 +47,11 @@ from strategy import calculate_stop_loss, calculate_take_profit
 
 MAX_CONCURRENT_POSITIONS = 2
 
+# CHANGED: lowered from 3.5 → 2.0
+# Score of 2.0 means the zone has at least some strength + is fresh OR has good width.
+# Score of 3.5 was so strict that only 9 trades fired across 46k bars.
+MIN_ZONE_QUALITY = 2.0
+
 # Raw zone columns we need at execution time (unscaled, real price levels)
 RAW_ZONE_COLS = [
     "demand_zone_bottom", "demand_zone_top",
@@ -60,6 +73,11 @@ class BacktestResult:
     skipped_no_margin: int
     skipped_max_positions: int
     trail_activations: int
+    filtered_no_row: int
+    filtered_zone_quality: int
+    filtered_confidence: int
+    filtered_neutral: int
+    filtered_bad_sltp: int
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -128,7 +146,7 @@ def _build_feature_matrix_for_timeframe(
 
 class MLSignalStrategy(bt.Strategy):
     params = dict(
-        confidence=0.55,
+        confidence=0.52,
         stake=0.15,
         use_pct_stake=True,
         trail_trigger_pts=100.0,
@@ -155,6 +173,15 @@ class MLSignalStrategy(bt.Strategy):
         self._trail_active: bool           = False
         self._best_price: Optional[float]  = None
         self._entry_atr: Optional[float]   = None
+
+        # Diagnostic counters — tells you exactly which gate kills most bars
+        self._diag = {
+            "no_row":       0,  # bar has no feature row (warmup or timestamp mismatch)
+            "zone_quality": 0,  # zone quality score below MIN_ZONE_QUALITY
+            "confidence":   0,  # model confidence below threshold
+            "neutral":      0,  # model predicted neutral/hold label
+            "bad_sltp":     0,  # SL/TP geometrically invalid after calculation
+        }
 
         self.model          = getattr(self, "model", None)
         self.features_by_dt = getattr(self, "features_by_dt", None)
@@ -237,8 +264,8 @@ class MLSignalStrategy(bt.Strategy):
                 if side == "buy":
                     profit_pts = bar_high - entry
                     if not self._trail_active and profit_pts >= trigger:
-                        self._trail_active    = True
-                        self._best_price      = bar_high
+                        self._trail_active      = True
+                        self._best_price        = bar_high
                         self._trail_activations += 1
                     if self._trail_active:
                         if bar_high > self._best_price:
@@ -251,8 +278,8 @@ class MLSignalStrategy(bt.Strategy):
                 elif side == "sell":
                     profit_pts = entry - bar_low
                     if not self._trail_active and profit_pts >= trigger:
-                        self._trail_active    = True
-                        self._best_price      = bar_low
+                        self._trail_active      = True
+                        self._best_price        = bar_low
                         self._trail_activations += 1
                     if self._trail_active:
                         if bar_low < self._best_price:
@@ -279,35 +306,42 @@ class MLSignalStrategy(bt.Strategy):
             self._skipped_max_pos += 1
             return
 
+        # ── Gate 1: feature row lookup ─────────────────────────────────
         dt  = self.data.datetime.datetime(0).replace(tzinfo=None, microsecond=0)
         row = self.features_by_dt.get(dt)
         if row is None:
+            self._diag["no_row"] += 1
             return
 
         X_row        = row["X"]
         zone_quality = row.get("zone_quality", float("nan"))
 
-        MIN_ZONE_QUALITY = 3.5
+        # ── Gate 2: zone quality (CHANGED 3.5 → 2.0) ──────────────────
         if not (isinstance(zone_quality, float) and zone_quality >= MIN_ZONE_QUALITY):
+            self._diag["zone_quality"] += 1
             return
 
+        # ── Gate 3: model confidence (CHANGED default 0.55 → 0.52) ────
         proba    = self.model.predict_proba(X_row)[0]
         pred_idx = int(np.argmax(proba))
         conf     = float(np.max(proba))
 
         if conf < float(self.p.confidence):
+            self._diag["confidence"] += 1
             return
 
+        # ── Gate 4: label decode ───────────────────────────────────────
         classes = getattr(self.model, "classes_", None)
         if classes is None:
             pred_label = "buy" if pred_idx == 1 else "sell"
         else:
-            raw_label = classes[pred_idx]
+            raw_label  = classes[pred_idx]
             pred_label = ("buy" if int(raw_label) == 1 else "sell") \
                 if isinstance(raw_label, (int, np.integer)) \
                 else str(raw_label).lower()
 
         if pred_label in {"neutral", "hold"}:
+            self._diag["neutral"] += 1
             return
 
         close_price = float(self.data.close[0])
@@ -344,8 +378,8 @@ class MLSignalStrategy(bt.Strategy):
         lookback_df["wick_upper"]  = wick_upper
         lookback_df["wick_lower"]  = wick_lower
 
-        # ── CHANGED: pass raw feature row for zone-aligned SL/TP ──────
-        raw_feat_series = row.get("raw")  # unscaled zone boundaries from features.py
+        # Raw feature row for zone-aligned SL/TP (features.py boundaries)
+        raw_feat_series = row.get("raw")
 
         sl = calculate_stop_loss(
             close_price, pred_label, lookback_df,
@@ -356,20 +390,19 @@ class MLSignalStrategy(bt.Strategy):
             feature_row=raw_feat_series,
         )
 
-        # ── Sanity print for first few trades (remove after confirming) ─
-        # print(f"  [TRADE] {pred_label} entry={close_price:.2f} sl={sl} tp={tp} "
-        #       f"raw_feat={'ok' if raw_feat_series is not None else 'MISSING'}")
-
+        # ── Gate 5: SL/TP geometry sanity ─────────────────────────────
         if pred_label == "buy":
             if sl is None: sl = close_price * 0.997
             if tp is None: tp = close_price * 1.006
             if sl >= close_price or tp <= close_price:
+                self._diag["bad_sltp"] += 1
                 return
             self.buy(size=size)
         else:
             if sl is None: sl = close_price * 1.003
             if tp is None: tp = close_price * 0.994
             if sl <= close_price or tp >= close_price:
+                self._diag["bad_sltp"] += 1
                 return
             self.sell(size=size)
 
@@ -390,19 +423,21 @@ class MLSignalStrategy(bt.Strategy):
         self._entry_atr = atr_val if atr_val and atr_val > 0 else None
 
     @property
-    def wins(self)                  -> int: return self._wins
+    def wins(self)                  -> int:  return self._wins
     @property
-    def losses(self)                -> int: return self._losses
+    def losses(self)                -> int:  return self._losses
     @property
-    def trades(self)                -> int: return self._trade_count
+    def trades(self)                -> int:  return self._trade_count
     @property
-    def entries_submitted(self)     -> int: return self._entries_submitted
+    def entries_submitted(self)     -> int:  return self._entries_submitted
     @property
-    def skipped_no_margin(self)     -> int: return self._skipped_margin
+    def skipped_no_margin(self)     -> int:  return self._skipped_margin
     @property
-    def skipped_max_positions(self) -> int: return self._skipped_max_pos
+    def skipped_max_positions(self) -> int:  return self._skipped_max_pos
     @property
-    def trail_activations(self)     -> int: return self._trail_activations
+    def trail_activations(self)     -> int:  return self._trail_activations
+    @property
+    def diag(self)                  -> dict: return self._diag
 
 
 # ======================================================================
@@ -456,10 +491,10 @@ def run_backtest(
         features_by_dt[dt] = {
             "X":           X_row,
             "zone_quality": float("nan"),
-            "raw":         None,   # filled below with unscaled zone values
+            "raw":         None,
         }
 
-    # Overlay raw (unscaled) zone values and quality from pre-scaled feature build
+    # Overlay raw (unscaled) zone values and zone quality
     try:
         from features import build_features as _bf
         _raw_feat = _bf(df.copy())
@@ -467,7 +502,6 @@ def run_backtest(
         if "timestamp" in _raw_feat.columns:
             _raw_feat["timestamp"] = pd.to_datetime(_raw_feat["timestamp"])
 
-            # Columns we need unscaled
             available_raw_cols = ["timestamp"] + [
                 c for c in RAW_ZONE_COLS + ["active_zone_quality"]
                 if c in _raw_feat.columns
@@ -476,21 +510,30 @@ def run_backtest(
             for _, rr in _raw_feat[available_raw_cols].iterrows():
                 _dt = rr["timestamp"].to_pydatetime().replace(tzinfo=None, microsecond=0)
                 if _dt in features_by_dt:
-                    # Zone quality gate value (real 0-6 score)
                     if "active_zone_quality" in rr:
                         features_by_dt[_dt]["zone_quality"] = float(rr["active_zone_quality"])
-                    # Raw zone boundaries for SL/TP (real price levels, not scaled)
                     features_by_dt[_dt]["raw"] = rr
 
     except Exception as _e:
         print(f"  [WARN] Could not attach raw zone features: {_e}")
 
-    print(f"  Price bars:    {len(df_bt)}")
-    print(f"  Feature rows:  {len(features_by_dt)}")
+    print(f"  Price bars:    {len(df_bt):,}")
+    print(f"  Feature rows:  {len(features_by_dt):,}")
 
-    # Check how many bars have raw zone data attached
     raw_count = sum(1 for v in features_by_dt.values() if v.get("raw") is not None)
-    print(f"  Raw zone rows: {raw_count} ({raw_count/max(len(features_by_dt),1)*100:.1f}% coverage)")
+    print(f"  Raw zone rows: {raw_count:,} ({raw_count/max(len(features_by_dt),1)*100:.1f}% coverage)")
+
+    # Zone quality distribution — tune MIN_ZONE_QUALITY intelligently
+    zq_values = [
+        v["zone_quality"] for v in features_by_dt.values()
+        if isinstance(v.get("zone_quality"), float) and not np.isnan(v["zone_quality"])
+    ]
+    if zq_values:
+        zq = np.array(zq_values)
+        above_zero = (zq > 0).sum()
+        print(f"  Zone quality  | mean={zq.mean():.2f} min={zq.min():.2f} max={zq.max():.2f}")
+        print(f"  Bars in zone  | >0: {above_zero:,} | ≥2.0: {(zq>=2.0).sum():,} | "
+              f"≥3.0: {(zq>=3.0).sum():,} | ≥3.5: {(zq>=3.5).sum():,}")
 
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(float(cash))
@@ -529,6 +572,7 @@ def run_backtest(
     skp_pos     = int(getattr(strat_inst, "skipped_max_positions", 0))
     trail_acts  = int(getattr(strat_inst, "trail_activations", 0))
     winrate     = (wins / trades * 100.0) if trades > 0 else 0.0
+    diag        = getattr(strat_inst, "diag", {})
 
     return BacktestResult(
         final_value=float(end_value),
@@ -540,6 +584,11 @@ def run_backtest(
         skipped_no_margin=skipped,
         skipped_max_positions=skp_pos,
         trail_activations=trail_acts,
+        filtered_no_row=diag.get("no_row", 0),
+        filtered_zone_quality=diag.get("zone_quality", 0),
+        filtered_confidence=diag.get("confidence", 0),
+        filtered_neutral=diag.get("neutral", 0),
+        filtered_bad_sltp=diag.get("bad_sltp", 0),
     )
 
 
@@ -553,7 +602,7 @@ def main() -> None:
     parser.add_argument("--stake",              type=float, default=0.15)
     parser.add_argument("--pct-stake",          dest="use_pct_stake", action="store_true", default=True)
     parser.add_argument("--no-pct-stake",       dest="use_pct_stake", action="store_false")
-    parser.add_argument("--confidence",         type=float, default=0.55)
+    parser.add_argument("--confidence",         type=float, default=0.52)
     parser.add_argument("--commission",         type=float, default=0.0)
     parser.add_argument("--trail-trigger-pts",  type=float, default=100.0)
     parser.add_argument("--trail-dist-atr",     type=float, default=1.0)
@@ -591,6 +640,13 @@ def main() -> None:
     print(f"Trail activations:     {res.trail_activations}  "
           f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
     print(f"Winrate:               {res.winrate_pct:.2f}%")
+    print()
+    print("── Filter breakdown (bars rejected per gate) ──────────────")
+    print(f"  No feature row:         {res.filtered_no_row:,}")
+    print(f"  Zone quality < {MIN_ZONE_QUALITY}:     {res.filtered_zone_quality:,}")
+    print(f"  Low confidence:         {res.filtered_confidence:,}")
+    print(f"  Neutral prediction:     {res.filtered_neutral:,}")
+    print(f"  Bad SL/TP geometry:     {res.filtered_bad_sltp:,}")
 
 
 if __name__ == "__main__":

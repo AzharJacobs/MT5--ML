@@ -16,13 +16,17 @@ Label values:
   -1  = sell signal that hit TP
    0  = no signal, SL hit, or expired
 
-CHANGES (profit optimisation pass):
-  - volume_ratio >= 0.8 filter added inside generate_labels().
-    Signals on low-volume candles (relative to the 20-bar average) fail
-    disproportionately because there is no institutional participation
-    to drive price to TP. volume_ratio is already computed by features.py
-    (vol / 20-bar rolling mean). Skipping candles below 0.8 removes
-    weak-participation signals without touching zone logic or the model.
+CHANGES (trade frequency fix):
+  - MIN_VOLUME_RATIO lowered from 0.8 → 0.6.
+    At 0.8 too many valid zone touches were being thrown away during
+    labeling, starving the model of winner examples. 0.6 still filters
+    genuinely thin candles (below 60% of average volume) while passing
+    enough signals for the model to learn from.
+
+PREVIOUS CHANGES (profit optimisation pass):
+  - volume_ratio >= 0.8 filter added (now relaxed to 0.6).
+  - Signals on low-volume candles fail disproportionately because there
+    is no institutional participation to drive price to TP.
 """
 
 import pandas as pd
@@ -33,17 +37,17 @@ logger = logging.getLogger("mt5_collector.labels")
 
 LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
 
-# Minimum volume participation required to accept a signal.
-# 0.8 = candle volume must be at least 80% of the 20-bar rolling average.
-# Candles below this threshold tend to be thin, low-conviction moves that
-# reverse before reaching TP — filtering them improves signal quality.
-MIN_VOLUME_RATIO = 0.8
+# CHANGED: lowered from 0.8 → 0.6
+# Candle volume must be at least 60% of the 20-bar rolling average to qualify.
+# 0.8 was too strict — it filtered out too many valid zone touches during
+# training, leaving the model with too few winner examples to learn from.
+MIN_VOLUME_RATIO = 0.6
 
 
 def generate_labels(
     df: pd.DataFrame,
     max_bars: int = 50,
-    min_rr: float = 1.5,           # CHANGED default: 1.0 → 1.5
+    min_rr: float = 1.5,
     sl_buffer_atr: float = 0.5,
     use_midline_tp: bool = True,
     timeframe: str = None,
@@ -57,7 +61,7 @@ def generate_labels(
     Args:
         df:             Feature-enriched DataFrame from features.py
         max_bars:       Forward bars to simulate TP/SL outcome
-        min_rr:         Minimum risk/reward ratio to accept signal (default now 1.5)
+        min_rr:         Minimum risk/reward ratio to accept signal
         sl_buffer_atr:  Small ATR buffer added beyond zone boundary for SL
         use_midline_tp: TP at 50% distance to next zone. True for LTF, False for HTF.
         timeframe:      Timeframe name — determines LTF vs HTF logic
@@ -106,9 +110,8 @@ def generate_labels(
         if atr <= 0 or np.isnan(atr):
             continue
 
-        # NEW: volume participation filter.
-        # Skip candles where volume is below 80% of the 20-bar rolling average.
-        # These are thin, low-conviction candles — price rarely follows through to TP.
+        # Volume participation filter (CHANGED: 0.8 → 0.6)
+        # Skip candles where volume is below 60% of the 20-bar rolling average.
         vol_ratio = float(row.get("volume_ratio", 1.0) or 1.0)
         if np.isnan(vol_ratio) or vol_ratio < MIN_VOLUME_RATIO:
             continue
