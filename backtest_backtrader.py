@@ -406,6 +406,9 @@ class MLSignalStrategy(bt.Strategy):
                 return
             self.sell(size=size)
 
+        print(f"  [TRADE] {pred_label} entry={close_price:.2f} sl={sl:.2f} tp={tp:.2f} "
+              f"raw_feat={'ok' if raw_feat_series is not None else 'MISSING'}")
+
         self._in_trade          = True
         self._entries_submitted += 1
         self._exit_pending      = False
@@ -479,6 +482,13 @@ def run_backtest(
     df_bt = df_bt.dropna(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
 
     model, metadata_bundle = _load_model_bundle(model_dir=model_dir)
+
+    # Use optimal threshold saved during training if confidence not overridden
+    saved_threshold = float(metadata_bundle.get("optimal_threshold", confidence))
+    if confidence == 0.52:  # default — use saved threshold
+        confidence = saved_threshold
+        print(f"  Using saved optimal threshold: {confidence:.3f}")
+
     X_scaled = _build_feature_matrix_for_timeframe(df, timeframe, metadata_bundle)
 
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]

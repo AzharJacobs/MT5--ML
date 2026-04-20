@@ -12,21 +12,23 @@ Why this works:
   and produces valid RR ratios.
 
 Label values:
-   1  = buy signal that hit TP
-  -1  = sell signal that hit TP
-   0  = no signal, SL hit, or expired
+   1  = winner (buy OR sell signal that hit TP)
+   0  = loser  (SL hit, expired, or no signal)
+
+CRITICAL FIX (sell_wins=0 bug):
+  Previously sell winners produced label=-1 because signal=-1 and the
+  code did `label = signal if outcome == 1 else 0`. The XGBoost label
+  map only contained {0, 1} so every -1 was silently treated as a
+  separate third class — the model NEVER learned from sell winners.
+  Result: sell_wins=0 across all timeframes, model predicted only buys.
+
+  Fix: label is now BINARY — 1=winner (either direction), 0=loser.
+  Direction is encoded in the features (in_supply_zone, in_demand_zone,
+  confirmation scores) so the model still learns what conditions lead to
+  wins. A separate `signal_direction` column is kept for diagnostics.
 
 CHANGES (trade frequency fix):
   - MIN_VOLUME_RATIO lowered from 0.8 → 0.6.
-    At 0.8 too many valid zone touches were being thrown away during
-    labeling, starving the model of winner examples. 0.6 still filters
-    genuinely thin candles (below 60% of average volume) while passing
-    enough signals for the model to learn from.
-
-PREVIOUS CHANGES (profit optimisation pass):
-  - volume_ratio >= 0.8 filter added (now relaxed to 0.6).
-  - Signals on low-volume candles fail disproportionately because there
-    is no institutional participation to drive price to TP.
 """
 
 import pandas as pd
@@ -37,10 +39,7 @@ logger = logging.getLogger("mt5_collector.labels")
 
 LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
 
-# CHANGED: lowered from 0.8 → 0.6
 # Candle volume must be at least 60% of the 20-bar rolling average to qualify.
-# 0.8 was too strict — it filtered out too many valid zone touches during
-# training, leaving the model with too few winner examples to learn from.
 MIN_VOLUME_RATIO = 0.6
 
 
@@ -65,16 +64,21 @@ def generate_labels(
         sl_buffer_atr:  Small ATR buffer added beyond zone boundary for SL
         use_midline_tp: TP at 50% distance to next zone. True for LTF, False for HTF.
         timeframe:      Timeframe name — determines LTF vs HTF logic
+
+    Label output (binary):
+        label=1  → zone entry that hit TP (winner, buy or sell)
+        label=0  → not a signal, SL hit, or expired
     """
     df = df.copy().reset_index(drop=True)
 
-    df["signal"]        = 0
-    df["signal_reason"] = ""
-    df["trade_outcome"] = 0
-    df["label"]         = 0
-    df["tp_price"]      = np.nan
-    df["sl_price"]      = np.nan
-    df["rr_ratio"]      = np.nan
+    df["signal"]           = 0       # -1=sell entry, 0=none, 1=buy entry
+    df["signal_direction"] = 0       # same as signal — kept for diagnostics only
+    df["signal_reason"]    = ""
+    df["trade_outcome"]    = 0       # 1=TP hit, -1=SL hit, 0=expired
+    df["label"]            = 0       # BINARY target: 1=winner, 0=loser
+    df["tp_price"]         = np.nan
+    df["sl_price"]         = np.nan
+    df["rr_ratio"]         = np.nan
 
     use_htf = (timeframe in LTF_TIMEFRAMES) if timeframe else False
     n = len(df)
@@ -82,7 +86,7 @@ def generate_labels(
     # Trading session windows in BROKER time (Exness GMT+3)
     def _in_trading_session(row) -> bool:
         hour = int(row.get("hour", -1) or -1)
-        ts = row.get("timestamp")
+        ts   = row.get("timestamp")
         minute = 0
         if ts is not None:
             try:
@@ -110,8 +114,7 @@ def generate_labels(
         if atr <= 0 or np.isnan(atr):
             continue
 
-        # Volume participation filter (CHANGED: 0.8 → 0.6)
-        # Skip candles where volume is below 60% of the 20-bar rolling average.
+        # Volume participation filter
         vol_ratio = float(row.get("volume_ratio", 1.0) or 1.0)
         if np.isnan(vol_ratio) or vol_ratio < MIN_VOLUME_RATIO:
             continue
@@ -196,10 +199,11 @@ def generate_labels(
         if signal == 0:
             continue
 
-        df.at[i, "signal"]        = signal
-        df.at[i, "signal_reason"] = reason
-        df.at[i, "tp_price"]      = float(tp)
-        df.at[i, "sl_price"]      = float(sl)
+        df.at[i, "signal"]           = signal
+        df.at[i, "signal_direction"] = signal
+        df.at[i, "signal_reason"]    = reason
+        df.at[i, "tp_price"]         = float(tp)
+        df.at[i, "sl_price"]         = float(sl)
 
         # ----------------------------------------------------------------
         # Simulate forward price action
@@ -210,15 +214,21 @@ def generate_labels(
         for _, fbar in future.iterrows():
             fh = float(fbar["high"])
             fl = float(fbar["low"])
-            if signal == 1:
+            if signal == 1:       # buy: TP above entry, SL below entry
                 if fh >= tp: outcome =  1; break
                 if fl <= sl: outcome = -1; break
-            else:
+            else:                 # sell: TP below entry, SL above entry
                 if fl <= tp: outcome =  1; break
                 if fh >= sl: outcome = -1; break
 
         df.at[i, "trade_outcome"] = outcome
-        df.at[i, "label"]         = signal if outcome == 1 else 0
+
+        # FIXED: binary label — 1=winner regardless of direction
+        # Old code: label = signal if outcome == 1 else 0
+        #   → sell wins became label=-1, invisible to XGBoost's {0,1} classes
+        #   → sell_wins=0 in training, model never learned sells
+        # New code: label = 1 if winner, 0 if loser — direction lives in features
+        df.at[i, "label"] = 1 if outcome == 1 else 0
 
     _log_summary(df, timeframe)
     return df
@@ -234,16 +244,23 @@ def _f(val) -> float:
 
 
 def _log_summary(df: pd.DataFrame, timeframe: str = None) -> None:
-    signals  = (df["signal"] != 0).sum()
-    buys     = (df["label"] ==  1).sum()
-    sells    = (df["label"] == -1).sum()
-    tp_hits  = (df["trade_outcome"] ==  1).sum()
-    sl_hits  = (df["trade_outcome"] == -1).sum()
+    signals   = (df["signal"] != 0).sum()
+    buy_sigs  = (df["signal"] ==  1).sum()
+    sell_sigs = (df["signal"] == -1).sum()
+    winners   = (df["label"]  ==  1).sum()
+    tp_hits   = (df["trade_outcome"] ==  1).sum()
+    sl_hits   = (df["trade_outcome"] == -1).sum()
+
+    # Direction breakdown using signal_direction (not label)
+    buy_wins  = ((df["label"] == 1) & (df["signal_direction"] ==  1)).sum()
+    sell_wins = ((df["label"] == 1) & (df["signal_direction"] == -1)).sum()
+
     win_rate = tp_hits / max(signals, 1) * 100
     tf_tag   = f"{timeframe} " if timeframe else ""
     logger.info(
         f"{tf_tag}Labels | signals={signals} "
-        f"buy_wins={buys} sell_wins={sells} "
+        f"(buys={buy_sigs} sells={sell_sigs}) | "
+        f"winners={winners} (buy_wins={buy_wins} sell_wins={sell_wins}) | "
         f"win_rate={win_rate:.1f}% TP={tp_hits} SL={sl_hits}"
     )
 

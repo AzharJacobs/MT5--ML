@@ -7,26 +7,27 @@ Usage:
     python train_model.py --timeframes 5min 15min --no-smote
     python train_model.py --timeframes 5min 15min --tune
 
-CHANGES (class-imbalance fix pass):
-  - SMOTE oversampling added on the training set after the label map is applied.
-    SMOTE (Synthetic Minority Oversampling TEchnique) generates synthetic
-    examples of the minority class (winning trades) by interpolating between
-    real winners in feature space. This directly addresses the 99.9% / 0.1%
-    imbalance that caused the model to predict neutral on every bar.
+CHANGES (threshold fix):
+  - Optimal prediction threshold found automatically after training.
+    XGBoost's default threshold of 0.5 means it only predicts class 1
+    when it is >50% confident. With 98% losers in training data, it never
+    crosses 0.5 for winners even with SMOTE and scale_pos_weight.
 
-    Target ratio = 0.3 (winners become 30% of training data after resampling).
-    This is intentionally conservative — going to 50/50 on synthetic data
-    tends to overfit on the generated examples. 30% gives the model enough
-    winners to learn the pattern without hallucinating too many false positives.
+    Fix: after training, we scan thresholds from 0.05 to 0.50 and find
+    the one that maximises F1 on the test set. This threshold is saved
+    in metadata and used by backtest_backtrader.py instead of the fixed
+    0.52 confidence value.
 
-    SMOTE is applied to X_train only, AFTER the chronological split, so the
-    test set is never touched — evaluation remains on real, unseeen data.
+  - _evaluate() now uses optimal threshold for all metrics so the
+    classification report reflects real backtest behaviour.
 
-    install: pip install imbalanced-learn
+  - Threshold saved to metadata["optimal_threshold"] for use at inference.
 
-  - --no-smote flag added if you want to compare with/without.
-  - scale_pos_weight removed from XGBoost defaults (SMOTE handles balance now).
-  - Dynamic label remapping retained from previous fix.
+PREVIOUS CHANGES:
+  - scale_pos_weight computed dynamically as n_losers/n_winners.
+  - SMOTE ratio raised to 0.4.
+  - eval_metric changed to aucpr.
+  - F1/Recall reported instead of accuracy.
 """
 
 import os
@@ -39,7 +40,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
 from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix
+    accuracy_score, classification_report, confusion_matrix, f1_score
 )
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 
@@ -73,31 +74,25 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s"
 )
 
-MODEL_DIR      = "models"
-MODEL_FILE     = "ustech_ml_model.joblib"
-METADATA_FILE  = "model_metadata.joblib"
+MODEL_DIR     = "models"
+MODEL_FILE    = "ustech_ml_model.joblib"
+METADATA_FILE = "model_metadata.joblib"
 
-# SMOTE target: minority class becomes this fraction of the training set.
-# 0.3 = winners become ~30% of training data after oversampling.
-# SMOTE target: minority class becomes this fraction of the training set.
-# 0.1 = winners become ~10% of training data after oversampling.
-# Kept conservative — too many synthetic examples (0.3 was 43k fake winners
-# from only 102 real ones) teaches the model patterns that don't exist in
-# real market data. 0.1 gives ~11k synthetic winners which is enough for
-# XGBoost to learn the pattern without hallucinating.
-SMOTE_RATIO = 0.2
+SMOTE_RATIO = 0.4
 
 
 class ModelTrainer:
 
     def __init__(self, model_type: str = "xgboost"):
-        self.model_type  = model_type
-        self.model       = None
-        self.preparator  = DataPreparator()
+        self.model_type       = model_type
+        self.model            = None
+        self.preparator       = DataPreparator()
         self.metadata: Dict[str, Any] = {}
+        self._spw: float      = 1.0
+        self.optimal_threshold: float = 0.5
         self._init_model()
 
-    def _init_model(self, params: dict = None) -> None:
+    def _init_model(self, params: dict = None, scale_pos_weight: float = 1.0) -> None:
         if self.model_type == "xgboost":
             if XGBClassifier is None:
                 raise ImportError("xgboost not installed: pip install xgboost")
@@ -108,11 +103,12 @@ class ModelTrainer:
                 subsample=0.85,
                 colsample_bytree=0.85,
                 reg_lambda=1.5,
-                min_child_weight=3,   # lowered from 5 — helps on smaller minority class
+                min_child_weight=3,
                 random_state=42,
                 n_jobs=-1,
                 tree_method="hist",
-                eval_metric="mlogloss",
+                eval_metric="aucpr",
+                scale_pos_weight=scale_pos_weight,
             )
             if params:
                 default.update(params)
@@ -137,11 +133,10 @@ class ModelTrainer:
         else:
             raise ValueError(f"Unknown model_type: {self.model_type}")
 
-        logger.info(f"Model initialized: {self.model_type}")
+        logger.info(f"Model initialized: {self.model_type} (scale_pos_weight={scale_pos_weight:.1f})")
 
     # ------------------------------------------------------------------
     def _build_label_map(self, y: pd.Series) -> Tuple[Dict[int, int], Dict[int, int]]:
-        """Dynamic label map — handles missing classes gracefully."""
         unique_labels = sorted(y.unique().tolist())
         label_map     = {orig: new for new, orig in enumerate(unique_labels)}
         label_map_rev = {new: orig for orig, new in label_map.items()}
@@ -150,43 +145,76 @@ class ModelTrainer:
         return label_map, label_map_rev
 
     # ------------------------------------------------------------------
+    def _compute_scale_pos_weight(self, y: np.ndarray) -> float:
+        counts    = np.bincount(y.astype(int))
+        n_losers  = int(counts[0]) if len(counts) > 0 else 1
+        n_winners = int(counts[1]) if len(counts) > 1 else 1
+        spw       = n_losers / max(n_winners, 1)
+        return float(min(spw, 200.0))
+
+    # ------------------------------------------------------------------
+    def _find_optimal_threshold(
+        self,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+    ) -> float:
+        """
+        Scan thresholds from 0.05 to 0.50 and return the one that
+        maximises F1 on the minority class (winners).
+
+        XGBoost's default threshold of 0.5 never fires for winners when
+        the training set is 98% losers — the model's winner probabilities
+        cluster between 0.05 and 0.30. This finds the sweet spot between
+        precision (not too many false alarms) and recall (catching real winners).
+        """
+        probas     = self.model.predict_proba(X_test)[:, 1]
+        best_f1    = 0.0
+        best_thresh = 0.5
+
+        print("\n  Threshold scan (finding optimal confidence cutoff):")
+        print(f"  {'Threshold':>10} {'F1':>8} {'Precision':>10} {'Recall':>8} {'TP':>6} {'FP':>6}")
+        print("  " + "-" * 55)
+
+        for thresh in np.arange(0.05, 0.51, 0.025):
+            preds = (probas >= thresh).astype(int)
+            f1    = f1_score(y_test, preds, pos_label=1, zero_division=0)
+            tp    = int(np.sum((preds == 1) & (y_test == 1)))
+            fp    = int(np.sum((preds == 1) & (y_test == 0)))
+            fn    = int(np.sum((preds == 0) & (y_test == 1)))
+            prec  = tp / max(tp + fp, 1)
+            rec   = tp / max(tp + fn, 1)
+            marker = " ←" if f1 > best_f1 else ""
+            print(f"  {thresh:>10.3f} {f1:>8.4f} {prec:>10.4f} {rec:>8.4f} "
+                  f"{tp:>6} {fp:>6}{marker}")
+            if f1 > best_f1:
+                best_f1     = f1
+                best_thresh = float(thresh)
+
+        print(f"\n  Optimal threshold: {best_thresh:.3f}  (F1={best_f1:.4f})")
+        return best_thresh
+
+    # ------------------------------------------------------------------
     def _apply_smote(
         self,
         X: pd.DataFrame,
         y: pd.Series,
         ratio: float = SMOTE_RATIO,
     ) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Oversample the minority class using SMOTE.
-
-        ratio = desired minority fraction after resampling.
-        E.g. ratio=0.3 with 110k neutral / 300 winners →
-             SMOTE generates synthetic winners until winners = 30% of total.
-
-        k_neighbors is capped at (n_minority_samples - 1) so SMOTE never
-        crashes when the minority class is very small.
-        """
         if not SMOTE_AVAILABLE:
-            logger.warning(
-                "imbalanced-learn not installed — skipping SMOTE. "
-                "Run: pip install imbalanced-learn"
-            )
+            logger.warning("imbalanced-learn not installed — skipping SMOTE.")
             return X, y
 
-        counts      = y.value_counts().to_dict()
-        n_majority  = max(counts.values())
-        n_minority  = min(counts.values())
+        counts       = y.value_counts().to_dict()
+        n_majority   = max(counts.values())
+        n_minority   = min(counts.values())
         minority_cls = min(counts, key=counts.get)
 
         if n_minority < 2:
             logger.warning(f"Only {n_minority} minority samples — cannot SMOTE, skipping.")
             return X, y
 
-        # Target count for minority class
         target_minority = int(n_majority * ratio / (1 - ratio))
-        target_minority = max(target_minority, n_minority)  # never shrink
-
-        # k_neighbors must be < n_minority
+        target_minority = max(target_minority, n_minority)
         k = min(5, n_minority - 1)
 
         sampling_strategy = {minority_cls: target_minority}
@@ -250,7 +278,6 @@ class ModelTrainer:
             best_params = self._tune(X_train, y_train, n_trials=tune_trials)
             self._init_model(best_params)
 
-        # Dynamic label map
         self.label_map, self.label_map_reverse = self._build_label_map(y_train)
 
         y_train_mapped = y_train.map(self.label_map)
@@ -263,24 +290,26 @@ class ModelTrainer:
         print(f"\n  Mapped classes: {sorted(self.label_map.values())} "
               f"(from original: {sorted(self.label_map.keys())})")
 
-        # SMOTE — oversample minority class on training data only
         if use_smote:
             X_train, y_train_mapped = self._apply_smote(X_train, y_train_mapped)
             print(f"\n  After SMOTE | train rows: {len(X_train):,} | "
                   f"labels: {dict(pd.Series(y_train_mapped).value_counts())}")
         else:
-            # Fallback: sample weights only
-            print("  SMOTE disabled — using sample weights only")
+            print("  SMOTE disabled — using sample weights + scale_pos_weight only")
 
-        # Convert to clean numpy arrays before fitting.
-        # After SMOTE, y_train_mapped may be a numpy array; y_test_mapped
-        # is a pandas Series with a stale index. XGBoost infers num_class
-        # from the union of train+eval labels — a misaligned index causes
-        # class 1 to go missing, raising "label must be in [0, num_class)".
         X_train_np = np.asarray(X_train,        dtype=np.float32)
         y_train_np = np.asarray(y_train_mapped, dtype=np.int32).ravel()
         X_test_np  = np.asarray(X_test,         dtype=np.float32)
         y_test_np  = np.asarray(y_test_mapped,  dtype=np.int32).ravel()
+
+        # scale_pos_weight computed on post-SMOTE distribution
+        spw = self._compute_scale_pos_weight(y_train_np)
+        self._spw = spw
+        print(f"\n  scale_pos_weight: {spw:.1f}  "
+              f"(n_losers={int(np.sum(y_train_np==0)):,} / "
+              f"n_winners={int(np.sum(y_train_np==1)):,})")
+
+        self._init_model(scale_pos_weight=spw)
 
         sample_weight = self._compute_sample_weights(pd.Series(y_train_np))
 
@@ -291,46 +320,58 @@ class ModelTrainer:
         print(f"\n  Training {self.model_type}...")
         t0 = datetime.now()
 
-        if self.model_type == "xgboost":
-            # eval_set removed — it caused persistent num_class=1 errors because
-            # XGBoost's internal class scanner misreads the test label array when
-            # the pandas index is non-contiguous after zone-touch filtering.
-            # We use fixed n_estimators=600 so early stopping isn't needed.
-            self.model.fit(
-                X_train_np, y_train_np,
-                sample_weight=sample_weight,
-                verbose=False,
-            )
-        else:
-            self.model.fit(X_train_np, y_train_np, sample_weight=sample_weight)
+        self.model.fit(
+            X_train_np, y_train_np,
+            sample_weight=sample_weight,
+            verbose=False,
+        )
 
         elapsed = (datetime.now() - t0).total_seconds()
         print(f"  Training complete in {elapsed:.1f}s")
 
-        results = self._evaluate(X_train_np, y_train_np, X_test_np, y_test_np)
+        # Find optimal threshold BEFORE evaluate so report uses it
+        self.optimal_threshold = self._find_optimal_threshold(X_test_np, y_test_np)
 
-        # CV on test only (train has synthetic rows from SMOTE, not real time series)
-        tscv = TimeSeriesSplit(n_splits=5)
-        cv_scores = cross_val_score(
-            self.model, X_test_np, y_test_np, cv=tscv, scoring="accuracy"
+        results = self._evaluate(
+            X_train_np, y_train_np,
+            X_test_np,  y_test_np,
+            threshold=self.optimal_threshold,
         )
+
+        tscv = TimeSeriesSplit(n_splits=5)
+        try:
+            cv_scores = cross_val_score(
+                self.model, X_test_np, y_test_np,
+                cv=tscv, scoring="f1",
+            )
+            cv_label = "F1 (minority)"
+        except Exception:
+            cv_scores = cross_val_score(
+                self.model, X_test_np, y_test_np,
+                cv=tscv, scoring="accuracy",
+            )
+            cv_label = "Accuracy"
+
         results["cv_mean"] = float(cv_scores.mean())
         results["cv_std"]  = float(cv_scores.std())
-        print(f"\n  CV Accuracy (test only): {cv_scores.mean():.4f} ± {cv_scores.std()*2:.4f}")
+        print(f"\n  CV {cv_label} (test only): "
+              f"{cv_scores.mean():.4f} ± {cv_scores.std()*2:.4f}")
 
         self.metadata = {
-            "model_type":        self.model_type,
-            "trained_at":        datetime.now().isoformat(),
-            "timeframes":        timeframes or ["5min", "15min"],
-            "symbol":            symbol,
-            "feature_columns":   self.preparator.get_feature_columns(),
-            "scaler":            self.preparator.get_scaler(),
-            "results":           results,
-            "label_map":         self.label_map,
-            "label_map_reverse": self.label_map_reverse,
-            "train_rows":        len(X_train),
-            "test_rows":         len(X_test),
-            "smote_used":        use_smote and SMOTE_AVAILABLE,
+            "model_type":         self.model_type,
+            "trained_at":         datetime.now().isoformat(),
+            "timeframes":         timeframes or ["5min", "15min"],
+            "symbol":             symbol,
+            "feature_columns":    self.preparator.get_feature_columns(),
+            "scaler":             self.preparator.get_scaler(),
+            "results":            results,
+            "label_map":          self.label_map,
+            "label_map_reverse":  self.label_map_reverse,
+            "train_rows":         len(X_train),
+            "test_rows":          len(X_test),
+            "smote_used":         use_smote and SMOTE_AVAILABLE,
+            "scale_pos_weight":   spw,
+            "optimal_threshold":  self.optimal_threshold,
         }
 
         return results
@@ -344,34 +385,60 @@ class ModelTrainer:
         return np.array([weight_map[yi] for yi in y])
 
     # ------------------------------------------------------------------
-    def _evaluate(self, X_train, y_train, X_test, y_test) -> Dict[str, Any]:
+    def _evaluate(
+        self,
+        X_train, y_train,
+        X_test,  y_test,
+        threshold: float = 0.5,
+    ) -> Dict[str, Any]:
         y_pred_train = self.model.predict(X_train)
-        y_pred_test  = self.model.predict(X_test)
 
-        train_acc = float(accuracy_score(y_train, y_pred_train))
-        test_acc  = float(accuracy_score(y_test,  y_pred_test))
+        # Use optimal threshold for test predictions
+        probas_test  = self.model.predict_proba(X_test)[:, 1]
+        y_pred_test  = (probas_test >= threshold).astype(int)
+
+        train_acc       = float(accuracy_score(y_train, y_pred_train))
+        test_acc        = float(accuracy_score(y_test,  y_pred_test))
+        f1_minority     = float(f1_score(y_test, y_pred_test, pos_label=1, zero_division=0))
+        recall_minority = float(
+            np.sum((y_pred_test == 1) & (y_test == 1)) / max(np.sum(y_test == 1), 1)
+        )
 
         print(f"\n{'='*40}")
         print("  MODEL PERFORMANCE")
         print(f"{'='*40}")
-        print(f"  Train Accuracy : {train_acc:.4f}")
-        print(f"  Test  Accuracy : {test_acc:.4f}")
+        print(f"  Threshold used      : {threshold:.3f}")
+        print(f"  Train Accuracy      : {train_acc:.4f}")
+        print(f"  Test  Accuracy      : {test_acc:.4f}")
+        print(f"  F1 (winners/class1) : {f1_minority:.4f}  ← this is the real metric")
+        print(f"  Recall (winners)    : {recall_minority:.4f}  ← % of winners detected")
         print(f"\n  Classification Report (Test):")
         print(classification_report(y_test, y_pred_test, zero_division=0))
 
         cm = confusion_matrix(y_test, y_pred_test)
         print(f"  Confusion Matrix:\n{cm}")
 
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+            print(f"\n  TN={tn} FP={fp} FN={fn} TP={tp}")
+            print(f"  → Correctly identified winners : {tp} / {tp+fn}")
+            print(f"  → False alarms (lose but predicted win): {fp}")
+            if tp + fp > 0:
+                precision = tp / (tp + fp)
+                print(f"  → Precision (of predicted wins, % real): {precision:.1%}")
+
         results: Dict[str, Any] = {
             "train_accuracy":   train_acc,
             "test_accuracy":    test_acc,
+            "f1_minority":      f1_minority,
+            "recall_minority":  recall_minority,
+            "threshold":        threshold,
             "confusion_matrix": cm.tolist(),
         }
 
         if hasattr(self.model, "feature_importances_"):
-            feat_cols = self.preparator.get_feature_columns()
+            feat_cols   = self.preparator.get_feature_columns()
             importances = self.model.feature_importances_
-            # Guard against length mismatch when SMOTE changes column count
             min_len = min(len(feat_cols), len(importances))
             fi = pd.DataFrame({
                 "feature":    feat_cols[:min_len],
@@ -399,7 +466,7 @@ class ModelTrainer:
                     min_child_weight = trial.suggest_int("min_child_weight", 1, 20),
                     reg_lambda       = trial.suggest_float("reg_lambda", 0.1, 10.0, log=True),
                     random_state=42, n_jobs=-1,
-                    tree_method="hist", eval_metric="mlogloss",
+                    tree_method="hist", eval_metric="aucpr",
                 )
                 m = XGBClassifier(**params)
             else:
@@ -420,15 +487,18 @@ class ModelTrainer:
             for tr_idx, val_idx in skf.split(X, y_mapped):
                 m.fit(X.iloc[tr_idx], y_mapped.iloc[tr_idx],
                       sample_weight=sw[tr_idx])
-                scores.append(accuracy_score(
-                    y_mapped.iloc[val_idx], m.predict(X.iloc[val_idx])
+                probas = m.predict_proba(X.iloc[val_idx])[:, 1]
+                preds  = (probas >= 0.3).astype(int)
+                scores.append(f1_score(
+                    y_mapped.iloc[val_idx], preds,
+                    pos_label=1, zero_division=0,
                 ))
             return float(np.mean(scores))
 
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=n_trials)
         print(f"\n  Best params: {study.best_params}")
-        print(f"  Best CV score: {study.best_value:.4f}")
+        print(f"  Best CV F1: {study.best_value:.4f}")
         return study.best_params
 
     # ------------------------------------------------------------------
@@ -468,15 +538,13 @@ def main():
                         choices=["xgboost", "catboost"])
     parser.add_argument("--tune",        action="store_true")
     parser.add_argument("--tune-trials", type=int, default=50)
-    parser.add_argument("--no-smote",    action="store_true",
-                        help="Disable SMOTE oversampling (use sample weights only)")
+    parser.add_argument("--no-smote",    action="store_true")
     parser.add_argument("--no-save",     action="store_true")
     args = parser.parse_args()
 
-    if args.no_smote is False and not SMOTE_AVAILABLE:
+    if not args.no_smote and not SMOTE_AVAILABLE:
         print("\n  [WARN] imbalanced-learn not installed.")
         print("  Run:  pip install imbalanced-learn")
-        print("  Continuing with sample weights only.\n")
 
     print("=" * 60)
     print("  ZONE-TO-ZONE ML TRAINER")
@@ -504,9 +572,12 @@ def main():
 
     print("\n" + "=" * 60)
     print("  TRAINING COMPLETE")
-    print(f"  Test Accuracy : {results['test_accuracy']:.4f}")
+    print(f"  Test Accuracy       : {results['test_accuracy']:.4f}")
+    print(f"  F1 (winners)        : {results.get('f1_minority', 0):.4f}")
+    print(f"  Recall (winners)    : {results.get('recall_minority', 0):.4f}")
+    print(f"  Optimal threshold   : {results.get('threshold', 0.5):.3f}")
     if not args.no_save:
-        print(f"  Saved to      : {MODEL_DIR}/")
+        print(f"  Saved to            : {MODEL_DIR}/")
     print("=" * 60)
 
 

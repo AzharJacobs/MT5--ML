@@ -7,22 +7,25 @@ Zone detection is intentionally lenient here — the goal is to detect
 as many valid zones as possible and let the ML model learn which ones
 are high-probability. Filtering happens via feature scores, not hard gates.
 
-CHANGES (profit optimisation pass):
-  - Zone replacement guard added in detect_zones().
-    Previously a new impulse candle would overwrite the active zone
-    immediately, even if price had never left the old zone. This created
-    "phantom zone switches" — the model would see a fresh zone just as
-    price was still sitting inside the prior one, producing conflicting
-    in_demand_zone / in_supply_zone signals.
+CRITICAL FIX (supply zone stuck at 16,248 while price at 25,000+):
+  The zone replacement guard added previously prevented phantom mid-trade
+  zone switches, but it was too strict — it never expired old zones that
+  price had left far behind.
 
-    Fix: active_demand is only replaced when the current close price is
-    at least 1 ATR ABOVE the old zone top (price has clearly broken out
-    of the demand zone upward before a new one forms). Likewise,
-    active_supply is only replaced when close is at least 1 ATR BELOW
-    the old supply zone bottom.
+  Symptom: supply_zone_top = 16,248 across 46,613 of 46,702 bars while
+  current price was at 25,000+. in_supply_zone = 57 total hits.
+  Result: zero sell signals in labels, model only learned buys.
 
-    This stabilises the zone reference mid-trade and removes a category
-    of false signals that were previously polluting the training labels.
+  Fix: zones now expire when BOTH conditions are true:
+    1. Zone age > MAX_ZONE_AGE_BARS (500 bars, ~5 days on 15min)
+    2. Price is more than ZONE_EXPIRE_ATR (5.0 ATR) away from the zone
+
+  This preserves the replacement guard for active/nearby zones while
+  allowing stale far-away zones to clear so new relevant ones can form.
+
+PREVIOUS CHANGES:
+  - Zone replacement guard added: active zone only replaced when price
+    has clearly broken out by 1 ATR. Prevents phantom mid-trade switches.
 """
 
 import pandas as pd
@@ -30,6 +33,10 @@ import numpy as np
 import logging
 
 logger = logging.getLogger("mt5_collector.features")
+
+# Zone expiry settings
+MAX_ZONE_AGE_BARS  = 500   # expire zone if older than this many bars
+ZONE_EXPIRE_ATR    = 5.0   # AND price is more than this many ATR away
 
 
 # ---------------------------------------------------------------------------
@@ -69,15 +76,12 @@ def detect_zones(
     """
     Detect supply and demand zones.
 
-    Deliberately lenient (0.5x ATR default) so the model sees many zone
-    encounters and learns which are high-probability from the feature set.
-    Freshness, touch count, and strength score give the model enough signal
-    to discriminate good zones from weak ones.
-
-    Zone replacement rule (NEW):
-      A new demand zone only replaces the active one when close > old zone top + 1 ATR.
-      A new supply zone only replaces the active one when close < old zone bottom - 1 ATR.
-      This prevents phantom mid-trade zone switches.
+    Zone replacement rules:
+      1. A new zone only replaces the active one when price has clearly
+         broken out (1 ATR beyond zone boundary). Prevents phantom switches.
+      2. A zone expires when it is older than MAX_ZONE_AGE_BARS AND price
+         is more than ZONE_EXPIRE_ATR away. Prevents stale zones from
+         persisting forever while price trends far away.
     """
     df   = df.copy().reset_index(drop=True)
     atr  = _atr(df, atr_period)
@@ -93,71 +97,95 @@ def detect_zones(
     for col in zone_cols:
         df[col] = np.nan
 
-    active_demand = None
-    active_supply = None
+    active_demand      = None
+    active_demand_age  = 0
+    active_supply      = None
+    active_supply_age  = 0
 
     for i in range(lookback, len(df)):
-        cur     = df.iloc[i]
-        cur_atr = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
-        body    = float(abs(cur["close"] - cur["open"]))
+        cur       = df.iloc[i]
+        cur_atr   = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
+        body      = float(abs(cur["close"] - cur["open"]))
         cur_close = float(cur["close"])
+
+        # --- Increment zone ages ---
+        if active_demand is not None:
+            active_demand_age += 1
+        if active_supply is not None:
+            active_supply_age += 1
+
+        # --- Expire stale zones ---
+        # A zone is expired when it is both OLD and FAR AWAY from current price.
+        # This prevents zones from persisting forever during long trends.
+        if active_demand is not None and active_demand_age > MAX_ZONE_AGE_BARS:
+            dist_atr = abs(cur_close - active_demand["top"]) / cur_atr
+            if dist_atr > ZONE_EXPIRE_ATR:
+                active_demand     = None
+                active_demand_age = 0
+
+        if active_supply is not None and active_supply_age > MAX_ZONE_AGE_BARS:
+            dist_atr = abs(cur_close - active_supply["bottom"]) / cur_atr
+            if dist_atr > ZONE_EXPIRE_ATR:
+                active_supply     = None
+                active_supply_age = 0
 
         # --- Consolidation check ---
         base_candles = df.iloc[max(0, i-3):i]
         if len(base_candles) > 0:
-            base_bodies = (base_candles["close"] - base_candles["open"]).abs()
-            avg_base_body = float(base_bodies.mean()) if len(base_bodies) > 0 else cur_atr
+            base_bodies       = (base_candles["close"] - base_candles["open"]).abs()
+            avg_base_body     = float(base_bodies.mean()) if len(base_bodies) > 0 else cur_atr
             consolidation_score = float(max(0.0, 1.0 - (avg_base_body / max(cur_atr, 1e-10))))
         else:
             consolidation_score = 0.0
 
         # --- Demand zone: bullish impulse ---
         if cur["close"] > cur["open"] and body > impulse_atr_multiplier * cur_atr:
-            strength = float(min(body / cur_atr, 5.0))
+            strength   = float(min(body / cur_atr, 5.0))
             new_demand = {
-                "top":            float(max(cur["open"], cur["close"])),
-                "bottom":         float(cur["low"]),
-                "strength":       strength,
-                "touches":        0,
-                "fresh":          True,
-                "consolidation":  consolidation_score,
+                "top":           float(max(cur["open"], cur["close"])),
+                "bottom":        float(cur["low"]),
+                "strength":      strength,
+                "touches":       0,
+                "fresh":         True,
+                "consolidation": consolidation_score,
             }
-            # NEW: only replace active demand zone if price has clearly left it.
-            # Condition: close must be more than 1 ATR above the old zone top,
-            # meaning price broke out of the zone before this new one formed.
             if active_demand is None:
-                active_demand = new_demand
+                active_demand     = new_demand
+                active_demand_age = 0
             elif cur_close > active_demand["top"] + cur_atr:
-                active_demand = new_demand
-            # else: keep old zone — price is still inside or near it
+                # Price has clearly broken above old zone — replace it
+                active_demand     = new_demand
+                active_demand_age = 0
+            # else: keep old zone — price still near it
 
         # --- Supply zone: bearish impulse ---
         if cur["close"] < cur["open"] and body > impulse_atr_multiplier * cur_atr:
-            strength = float(min(body / cur_atr, 5.0))
+            strength   = float(min(body / cur_atr, 5.0))
             new_supply = {
-                "top":            float(cur["high"]),
-                "bottom":         float(min(cur["open"], cur["close"])),
-                "strength":       strength,
-                "touches":        0,
-                "fresh":          True,
-                "consolidation":  consolidation_score,
+                "top":           float(cur["high"]),
+                "bottom":        float(min(cur["open"], cur["close"])),
+                "strength":      strength,
+                "touches":       0,
+                "fresh":         True,
+                "consolidation": consolidation_score,
             }
-            # NEW: only replace active supply zone if price has clearly left it.
-            # Condition: close must be more than 1 ATR below the old zone bottom.
             if active_supply is None:
-                active_supply = new_supply
+                active_supply     = new_supply
+                active_supply_age = 0
             elif cur_close < active_supply["bottom"] - cur_atr:
-                active_supply = new_supply
-            # else: keep old zone
+                # Price has clearly broken below old zone — replace it
+                active_supply     = new_supply
+                active_supply_age = 0
+            # else: keep old zone — price still near it
 
         # --- Write demand zone to row ---
         if active_demand is not None:
-            df.at[i, "demand_zone_top"]      = active_demand["top"]
-            df.at[i, "demand_zone_bottom"]   = active_demand["bottom"]
-            df.at[i, "demand_zone_strength"] = active_demand["strength"]
-            df.at[i, "demand_zone_fresh"]    = float(active_demand["fresh"])
-            df.at[i, "demand_zone_touches"]       = float(active_demand["touches"])
-            df.at[i, "demand_zone_consolidation"] = float(active_demand.get("consolidation", 0.0))
+            df.at[i, "demand_zone_top"]           = active_demand["top"]
+            df.at[i, "demand_zone_bottom"]         = active_demand["bottom"]
+            df.at[i, "demand_zone_strength"]       = active_demand["strength"]
+            df.at[i, "demand_zone_fresh"]          = float(active_demand["fresh"])
+            df.at[i, "demand_zone_touches"]        = float(active_demand["touches"])
+            df.at[i, "demand_zone_consolidation"]  = float(active_demand.get("consolidation", 0.0))
 
             dist = (cur_close - active_demand["top"]) / cur_atr
             df.at[i, "nearest_demand_dist_atr"] = float(dist)
@@ -170,12 +198,12 @@ def detect_zones(
 
         # --- Write supply zone to row ---
         if active_supply is not None:
-            df.at[i, "supply_zone_top"]      = active_supply["top"]
-            df.at[i, "supply_zone_bottom"]   = active_supply["bottom"]
-            df.at[i, "supply_zone_strength"] = active_supply["strength"]
-            df.at[i, "supply_zone_fresh"]    = float(active_supply["fresh"])
-            df.at[i, "supply_zone_touches"]       = float(active_supply["touches"])
-            df.at[i, "supply_zone_consolidation"] = float(active_supply.get("consolidation", 0.0))
+            df.at[i, "supply_zone_top"]           = active_supply["top"]
+            df.at[i, "supply_zone_bottom"]         = active_supply["bottom"]
+            df.at[i, "supply_zone_strength"]       = active_supply["strength"]
+            df.at[i, "supply_zone_fresh"]          = float(active_supply["fresh"])
+            df.at[i, "supply_zone_touches"]        = float(active_supply["touches"])
+            df.at[i, "supply_zone_consolidation"]  = float(active_supply.get("consolidation", 0.0))
 
             dist = (active_supply["bottom"] - cur_close) / cur_atr
             df.at[i, "nearest_supply_dist_atr"] = float(dist)
@@ -186,17 +214,13 @@ def detect_zones(
                 active_supply["touches"] += 1
                 active_supply["fresh"]    = False
 
-        # Between zones (no-man's land).
-        # Only mark True when BOTH zones exist AND price is clearly between them.
-        # When only one zone exists, price is either inside it or approaching it
-        # — not in no-man's land, so we leave between_zones as 0.0.
+        # Between zones: only when BOTH zones exist and price is clearly between them
         if active_demand is not None and active_supply is not None:
             between = (
                 active_demand["top"] < cur_close < active_supply["bottom"]
             )
             df.at[i, "between_zones"] = float(between)
         else:
-            # One or both zones missing — default to 0.0 (not between zones)
             df.at[i, "between_zones"] = 0.0
 
     return df
@@ -207,32 +231,25 @@ def detect_zones(
 # ---------------------------------------------------------------------------
 
 def add_zone_quality(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Score each zone on quality based on Zone-to-Zone strategy rules.
-    """
-    df = df.copy()
-    safe_atr = df["atr_14"].replace(0, np.nan) if "atr_14" in df.columns else pd.Series(np.nan, index=df.index)
+    df       = df.copy()
+    safe_atr = df["atr_14"].replace(0, np.nan) if "atr_14" in df.columns \
+               else pd.Series(np.nan, index=df.index)
 
     demand_score = pd.Series(0.0, index=df.index)
 
     if "demand_zone_strength" in df.columns:
         demand_score += (df["demand_zone_strength"].fillna(0) / 5.0).clip(0, 1)
-
     if "demand_zone_fresh" in df.columns:
         demand_score += df["demand_zone_fresh"].fillna(0)
-
     if "demand_zone_touches" in df.columns:
-        touch_score = (1.0 - (df["demand_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
+        touch_score   = (1.0 - (df["demand_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
         demand_score += touch_score
-
     if "demand_zone_top" in df.columns and "demand_zone_bottom" in df.columns:
-        zone_width = (df["demand_zone_top"] - df["demand_zone_bottom"]).fillna(0)
-        width_score = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0
+        zone_width    = (df["demand_zone_top"] - df["demand_zone_bottom"]).fillna(0)
+        width_score   = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0
         demand_score += width_score
-
     if "demand_zone_consolidation" in df.columns:
         demand_score += df["demand_zone_consolidation"].fillna(0).clip(0, 1)
-
     if "htf_1h_bias" in df.columns:
         demand_score += (df["htf_1h_bias"].fillna(0) == 1.0).astype(float)
 
@@ -242,22 +259,17 @@ def add_zone_quality(df: pd.DataFrame) -> pd.DataFrame:
 
     if "supply_zone_strength" in df.columns:
         supply_score += (df["supply_zone_strength"].fillna(0) / 5.0).clip(0, 1)
-
     if "supply_zone_fresh" in df.columns:
         supply_score += df["supply_zone_fresh"].fillna(0)
-
     if "supply_zone_touches" in df.columns:
-        touch_score = (1.0 - (df["supply_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
+        touch_score   = (1.0 - (df["supply_zone_touches"].fillna(0) * 0.5)).clip(0, 1)
         supply_score += touch_score
-
     if "supply_zone_top" in df.columns and "supply_zone_bottom" in df.columns:
-        zone_width = (df["supply_zone_top"] - df["supply_zone_bottom"]).fillna(0)
-        width_score = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0
+        zone_width    = (df["supply_zone_top"] - df["supply_zone_bottom"]).fillna(0)
+        width_score   = (zone_width / safe_atr.fillna(1)).clip(0, 2) / 2.0
         supply_score += width_score
-
     if "supply_zone_consolidation" in df.columns:
         supply_score += df["supply_zone_consolidation"].fillna(0).clip(0, 1)
-
     if "htf_1h_bias" in df.columns:
         supply_score += (df["htf_1h_bias"].fillna(0) == -1.0).astype(float)
 
@@ -347,10 +359,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_200"]  = _ema(df["close"], 200)
 
     safe_atr = df["atr_14"].replace(0, np.nan)
-    df["ema_spread_atr"]    = (df["ema_20"] - df["ema_50"]) / safe_atr
-    df["price_above_ema20"] = (df["close"] > df["ema_20"]).astype(float)
-    df["price_above_ema50"] = (df["close"] > df["ema_50"]).astype(float)
-    df["price_above_ema200"]= (df["close"] > df["ema_200"]).astype(float)
+    df["ema_spread_atr"]     = (df["ema_20"] - df["ema_50"]) / safe_atr
+    df["price_above_ema20"]  = (df["close"] > df["ema_20"]).astype(float)
+    df["price_above_ema50"]  = (df["close"] > df["ema_50"]).astype(float)
+    df["price_above_ema200"] = (df["close"] > df["ema_200"]).astype(float)
 
     df["ema_trend_bias"] = np.where(
         (df["ema_20"] > df["ema_50"]) & (df["ema_50"] > df["ema_200"]),  1,
@@ -385,15 +397,33 @@ def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5
     htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"])
     atr = _atr(htf_df, 14)
 
-    records = []
+    records       = []
     active_demand = None
     active_supply = None
+    demand_age    = 0
+    supply_age    = 0
 
     for i in range(len(htf_df)):
-        cur  = htf_df.iloc[i]
-        catr = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
-        body = float(abs(cur["close"] - cur["open"]))
+        cur       = htf_df.iloc[i]
+        catr      = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
+        body      = float(abs(cur["close"] - cur["open"]))
         cur_close = float(cur["close"])
+
+        if active_demand is not None:
+            demand_age += 1
+        if active_supply is not None:
+            supply_age += 1
+
+        # Expire stale HTF zones (same logic as LTF)
+        if active_demand is not None and demand_age > MAX_ZONE_AGE_BARS:
+            if abs(cur_close - active_demand["top"]) / catr > ZONE_EXPIRE_ATR:
+                active_demand = None
+                demand_age    = 0
+
+        if active_supply is not None and supply_age > MAX_ZONE_AGE_BARS:
+            if abs(cur_close - active_supply["bottom"]) / catr > ZONE_EXPIRE_ATR:
+                active_supply = None
+                supply_age    = 0
 
         if cur["close"] > cur["open"] and body > impulse_atr_multiplier * catr:
             new_demand = {
@@ -402,8 +432,10 @@ def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5
             }
             if active_demand is None:
                 active_demand = new_demand
+                demand_age    = 0
             elif cur_close > active_demand["top"] + catr:
                 active_demand = new_demand
+                demand_age    = 0
 
         if cur["close"] < cur["open"] and body > impulse_atr_multiplier * catr:
             new_supply = {
@@ -412,14 +444,16 @@ def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5
             }
             if active_supply is None:
                 active_supply = new_supply
+                supply_age    = 0
             elif cur_close < active_supply["bottom"] - catr:
                 active_supply = new_supply
+                supply_age    = 0
 
         records.append({
-            "timestamp":            cur["timestamp"],
-            "htf_demand_zone_top":  active_demand["top"]    if active_demand else np.nan,
+            "timestamp":              cur["timestamp"],
+            "htf_demand_zone_top":    active_demand["top"]    if active_demand else np.nan,
             "htf_demand_zone_bottom": active_demand["bottom"] if active_demand else np.nan,
-            "htf_supply_zone_top":  active_supply["top"]    if active_supply else np.nan,
+            "htf_supply_zone_top":    active_supply["top"]    if active_supply else np.nan,
             "htf_supply_zone_bottom": active_supply["bottom"] if active_supply else np.nan,
             "htf_1h_bias": (
                 1.0 if active_demand and not active_supply else
