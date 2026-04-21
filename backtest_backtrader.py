@@ -59,6 +59,8 @@ RAW_ZONE_COLS = [
     "htf_demand_zone_top", "htf_demand_zone_bottom",
     "htf_supply_zone_top", "htf_supply_zone_bottom",
     "atr_14",
+    "htf_4h_bias",  # needed for hard HTF trend gate (unscaled: 1.0 / -1.0)
+    "htf_1h_bias",  # needed for hard HTF trend gate
 ]
 
 
@@ -344,6 +346,24 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["neutral"] += 1
             return
 
+        # ── Hard HTF trend gate ────────────────────────────────────────
+        # Enforce strategy rule: don't trade against the HTF trend.
+        # This is a HARD block — the model can't override it.
+        # Sells only when 4H is not bullish. Buys only when 4H is not bearish.
+        _raw = row.get("raw")
+        if _raw is not None:
+            try:
+                # htf_4h_bias is in RAW_ZONE_COLS so it's stored unscaled
+                _htf = float(_raw.get("htf_4h_bias", 0) or 0)
+                # Round to nearest integer to avoid float precision issues
+                _htf_int = round(_htf)
+                if pred_label == "sell" and _htf_int > 0:
+                    return
+                if pred_label == "buy" and _htf_int < 0:
+                    return
+            except Exception:
+                pass
+
         close_price = float(self.data.close[0])
 
         size      = self._calc_size(close_price)
@@ -405,9 +425,6 @@ class MLSignalStrategy(bt.Strategy):
                 self._diag["bad_sltp"] += 1
                 return
             self.sell(size=size)
-
-        print(f"  [TRADE] {pred_label} entry={close_price:.2f} sl={sl:.2f} tp={tp:.2f} "
-              f"raw_feat={'ok' if raw_feat_series is not None else 'MISSING'}")
 
         self._in_trade          = True
         self._entries_submitted += 1

@@ -63,7 +63,7 @@ CATEGORICAL_COLS = ["session", "day_of_week"]
 # How many non-zone rows to keep per zone row as negative context.
 # 2.0 = keep 2x as many non-zone rows as zone rows.
 # This gives zone features real variance so XGBoost learns zone patterns.
-CONTEXT_RATIO = 2.0
+CONTEXT_RATIO = 0.0
 
 
 class DataPreparator:
