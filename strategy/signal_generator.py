@@ -131,24 +131,26 @@ def generate_labels(
 
             if use_htf:
                 htf_d_bottom = _f(row.get("htf_demand_zone_bottom"))
-                sl = (htf_d_bottom - sl_buffer_atr * atr) if not np.isnan(htf_d_bottom) \
-                     else (close - 4.0 * atr)
+                sl   = (htf_d_bottom - sl_buffer_atr * atr) if not np.isnan(htf_d_bottom) \
+                       else (close - 4.0 * atr)
+                risk = close - sl  # compute risk before TP so fallback can guarantee min RR
 
                 htf_s_bottom = _f(row.get("htf_supply_zone_bottom"))
                 if not np.isnan(htf_s_bottom) and htf_s_bottom > close:
                     tp = close + (htf_s_bottom - close) * (0.5 if use_midline_tp else 1.0)
                 else:
-                    tp = close + 4.0 * atr
+                    tp = close + max(min_rr * risk, 2.0 * atr)
             else:
                 d_bottom = _f(row.get("demand_zone_bottom"))
                 s_bottom = _f(row.get("supply_zone_bottom"))
                 if np.isnan(d_bottom):
                     continue
-                sl = d_bottom - sl_buffer_atr * atr
-                tp = (close + (s_bottom - close) * (0.5 if use_midline_tp else 1.0)) \
-                     if not np.isnan(s_bottom) and s_bottom > close else close + 3.0 * atr
+                sl   = d_bottom - sl_buffer_atr * atr
+                risk = close - sl  # compute risk before TP so fallback can guarantee min RR
+                tp   = (close + (s_bottom - close) * (0.5 if use_midline_tp else 1.0)) \
+                       if not np.isnan(s_bottom) and s_bottom > close \
+                       else close + max(min_rr * risk, 3.0 * atr)
 
-            risk   = close - sl
             reward = tp - close
             if risk <= 0 or reward <= 0:
                 continue
@@ -167,24 +169,26 @@ def generate_labels(
 
             if use_htf:
                 htf_s_top = _f(row.get("htf_supply_zone_top"))
-                sl = (htf_s_top + sl_buffer_atr * atr) if not np.isnan(htf_s_top) \
-                     else (close + 4.0 * atr)
+                sl   = (htf_s_top + sl_buffer_atr * atr) if not np.isnan(htf_s_top) \
+                       else (close + 4.0 * atr)
+                risk = sl - close  # compute risk before TP so fallback can guarantee min RR
 
                 htf_d_top = _f(row.get("htf_demand_zone_top"))
                 if not np.isnan(htf_d_top) and htf_d_top < close:
                     tp = close - (close - htf_d_top) * (0.5 if use_midline_tp else 1.0)
                 else:
-                    tp = close - 4.0 * atr
+                    tp = close - max(min_rr * risk, 2.0 * atr)
             else:
                 s_top = _f(row.get("supply_zone_top"))
                 d_top = _f(row.get("demand_zone_top"))
                 if np.isnan(s_top):
                     continue
-                sl = s_top + sl_buffer_atr * atr
-                tp = (close - (close - d_top) * (0.5 if use_midline_tp else 1.0)) \
-                     if not np.isnan(d_top) and d_top < close else close - 3.0 * atr
+                sl   = s_top + sl_buffer_atr * atr
+                risk = sl - close  # compute risk before TP so fallback can guarantee min RR
+                tp   = (close - (close - d_top) * (0.5 if use_midline_tp else 1.0)) \
+                       if not np.isnan(d_top) and d_top < close \
+                       else close - max(min_rr * risk, 3.0 * atr)
 
-            risk   = sl - close
             reward = close - tp
             if risk <= 0 or reward <= 0:
                 continue

@@ -1,0 +1,22 @@
+model:
+  type: xgboost
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  use_smote: true
+  smote_ratio: 0.4
+
+training:
+  timeframes:
+    - "5min"
+    - "15min"
+  train_start: "2021-01-01"
+  train_end: "2023-12-31"
+  val_start: "2024-01-01"
+  val_end: "2024-06-30"
+  test_start: "2024-07-01"
+  test_end: "2024-12-31"
+  min_rr: 1.2
+  max_bars: 60

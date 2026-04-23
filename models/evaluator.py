@@ -12,9 +12,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
-from db_connect import get_connection, DatabaseConnection
-from strategy import apply_strategy, LOOKBACK_PERIODS
-from train_model import MODEL_DIR, MODEL_FILE, METADATA_FILE
+from data.loader import get_connection, DatabaseConnection
+from strategy.base_strategy import apply_strategy, LOOKBACK_PERIODS
+from models.trainer import MODEL_DIR, MODEL_FILE, METADATA_FILE
 
 
 class Predictor:

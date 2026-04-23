@@ -44,7 +44,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 
-from prepare_data import DataPreparator
+from data.pipeline import DataPreparator
 
 try:
     from xgboost import XGBClassifier
@@ -74,7 +74,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s"
 )
 
-MODEL_DIR     = "models"
+MODEL_DIR     = "experiments/runs"
 MODEL_FILE    = "ustech_ml_model.joblib"
 METADATA_FILE = "model_metadata.joblib"
 

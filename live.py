@@ -24,16 +24,11 @@ from datetime import datetime
 from typing import Optional
 
 # Local imports
-from db_connect import get_connection
-from strategy import validate_strategy, STRATEGY_NAME
-from train_model import ModelTrainer, train_model, MODEL_DIR, MODEL_FILE
-try:
-    # When running from repo root: `python signals/main.py`
-    from signals.predict import Predictor, predict, query
-except ModuleNotFoundError:
-    # Fallback for running with cwd=signals or alternative PYTHONPATH setups
-    from predict import Predictor, predict, query
-from prepare_data import DataPreparator
+from data.loader import get_connection
+from strategy.base_strategy import validate_strategy, STRATEGY_NAME
+from models.trainer import ModelTrainer, train_model, MODEL_DIR, MODEL_FILE
+from models.evaluator import Predictor, predict, query
+from data.pipeline import DataPreparator
 
 
 def print_header(title: str) -> None:

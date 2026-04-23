@@ -1,0 +1,12 @@
+position_sizing:
+  risk_per_trade: 0.01      # 1% of account per trade
+  max_concurrent_positions: 2
+  default_stake: 0.15
+
+stop_loss:
+  sl_buffer_atr: 0.5        # ATR multiplier for SL buffer
+  dynamic_sl: true
+
+drawdown:
+  max_drawdown: 0.10        # 10% max drawdown before halt
+  daily_loss_limit: 0.03    # 3% daily loss limit

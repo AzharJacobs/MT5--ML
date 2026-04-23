@@ -40,17 +40,17 @@ import pandas as pd
 
 import backtrader as bt
 
-from db_connect import get_connection
-from prepare_data import DataPreparator
-from train_model import ModelTrainer, MODEL_DIR
-from strategy import calculate_stop_loss, calculate_take_profit
+from data.loader import get_connection
+from data.pipeline import DataPreparator
+from models.trainer import ModelTrainer, MODEL_DIR
+from strategy.base_strategy import calculate_stop_loss, calculate_take_profit
 
 MAX_CONCURRENT_POSITIONS = 2
 
 # CHANGED: lowered from 3.5 → 2.0
 # Score of 2.0 means the zone has at least some strength + is fresh OR has good width.
 # Score of 3.5 was so strict that only 9 trades fired across 46k bars.
-MIN_ZONE_QUALITY = 2.0
+MIN_ZONE_QUALITY = 3.0  # raise from 2.0
 
 # Raw zone columns we need at execution time (unscaled, real price levels)
 RAW_ZONE_COLS = [

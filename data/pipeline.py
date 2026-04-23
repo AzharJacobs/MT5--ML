@@ -32,9 +32,9 @@ import numpy as np
 from typing import List, Tuple, Optional
 from sklearn.preprocessing import StandardScaler
 
-from db_connect import get_connection
-from features import build_features, FEATURE_COLUMNS
-from labels import generate_labels, get_class_weights
+from data.loader import get_connection
+from data.feature_engineer import build_features, FEATURE_COLUMNS
+from strategy.signal_generator import generate_labels, get_class_weights
 
 logger = logging.getLogger("mt5_collector.prepare_data")
 logging.basicConfig(

@@ -75,14 +75,22 @@ def detect_zones(
     lookback: int = 30,
     impulse_atr_multiplier: float = 0.5,
     atr_period: int = 14,
+    max_zones: int = 5,
 ) -> pd.DataFrame:
     """
-    Detect supply and demand zones.
+    Detect supply and demand zones, tracking multiple simultaneous zones.
 
-    Zone replacement rules:
-      1. New zone only replaces active one when price broke out by 1 ATR.
-      2. Zone expires when older than MAX_ZONE_AGE_BARS AND price is
-         more than ZONE_EXPIRE_ATR away.
+    Previously only one active demand and one active supply zone was tracked.
+    When price returned to a demand zone, the supply zone reference had been
+    overwritten by a newer impulse, so supply_zone_bottom was NaN and TP
+    could not be computed. Now both lists are maintained independently so
+    the nearest demand zone below price and nearest supply zone above price
+    are always available simultaneously.
+
+    Zone expiry:
+      - Violated: price breaks clearly through the zone (demand: below bottom,
+        supply: above top) — zone is no longer a valid reference level.
+      - Age + distance: zone is old AND price is far away.
     """
     df   = df.copy().reset_index(drop=True)
     atr  = _atr(df, atr_period)
@@ -98,32 +106,38 @@ def detect_zones(
     for col in zone_cols:
         df[col] = np.nan
 
-    active_demand     = None
-    active_demand_age = 0
-    active_supply     = None
-    active_supply_age = 0
+    demand_zones: list = []   # each: {top, bottom, strength, touches, fresh, consolidation, age}
+    supply_zones: list = []
 
     for i in range(lookback, len(df)):
         cur       = df.iloc[i]
         cur_atr   = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else 1.0
         body      = float(abs(cur["close"] - cur["open"]))
         cur_close = float(cur["close"])
+        cur_high  = float(cur["high"])
+        cur_low   = float(cur["low"])
 
-        if active_demand is not None:
-            active_demand_age += 1
-        if active_supply is not None:
-            active_supply_age += 1
+        for z in demand_zones: z["age"] += 1
+        for z in supply_zones: z["age"] += 1
 
-        # Expire stale zones
-        if active_demand is not None and active_demand_age > MAX_ZONE_AGE_BARS:
-            if abs(cur_close - active_demand["top"]) / cur_atr > ZONE_EXPIRE_ATR:
-                active_demand     = None
-                active_demand_age = 0
-
-        if active_supply is not None and active_supply_age > MAX_ZONE_AGE_BARS:
-            if abs(cur_close - active_supply["bottom"]) / cur_atr > ZONE_EXPIRE_ATR:
-                active_supply     = None
-                active_supply_age = 0
+        # Expire demand zones: violated (price broke below) OR too old + far
+        demand_zones = [
+            z for z in demand_zones
+            if not (
+                cur_close < z["bottom"] - cur_atr or
+                (z["age"] > MAX_ZONE_AGE_BARS and
+                 abs(cur_close - z["top"]) / cur_atr > ZONE_EXPIRE_ATR)
+            )
+        ]
+        # Expire supply zones: violated (price broke above) OR too old + far
+        supply_zones = [
+            z for z in supply_zones
+            if not (
+                cur_close > z["top"] + cur_atr or
+                (z["age"] > MAX_ZONE_AGE_BARS and
+                 abs(cur_close - z["bottom"]) / cur_atr > ZONE_EXPIRE_ATR)
+            )
+        ]
 
         # Consolidation score
         base_candles = df.iloc[max(0, i-3):i]
@@ -144,13 +158,15 @@ def detect_zones(
                 "touches":       0,
                 "fresh":         True,
                 "consolidation": consolidation_score,
+                "age":           0,
             }
-            if active_demand is None:
-                active_demand     = new_demand
-                active_demand_age = 0
-            elif cur_close > active_demand["top"] + cur_atr:
-                active_demand     = new_demand
-                active_demand_age = 0
+            # Skip if near-duplicate of an existing zone
+            if not any(abs(z["top"] - new_demand["top"]) < cur_atr * 0.5 for z in demand_zones):
+                demand_zones.append(new_demand)
+                if len(demand_zones) > max_zones:
+                    # Keep youngest (most relevant); discard the oldest
+                    demand_zones.sort(key=lambda z: z["age"])
+                    demand_zones = demand_zones[:max_zones]
 
         # Supply zone: bearish impulse
         if cur["close"] < cur["open"] and body > impulse_atr_multiplier * cur_atr:
@@ -162,13 +178,22 @@ def detect_zones(
                 "touches":       0,
                 "fresh":         True,
                 "consolidation": consolidation_score,
+                "age":           0,
             }
-            if active_supply is None:
-                active_supply     = new_supply
-                active_supply_age = 0
-            elif cur_close < active_supply["bottom"] - cur_atr:
-                active_supply     = new_supply
-                active_supply_age = 0
+            if not any(abs(z["bottom"] - new_supply["bottom"]) < cur_atr * 0.5 for z in supply_zones):
+                supply_zones.append(new_supply)
+                if len(supply_zones) > max_zones:
+                    supply_zones.sort(key=lambda z: z["age"])
+                    supply_zones = supply_zones[:max_zones]
+
+        # Nearest demand zone: highest zone top at or below current price
+        # (includes zones price is currently inside)
+        rel_demand = [z for z in demand_zones if z["top"] <= cur_close + 0.5 * cur_atr]
+        active_demand = max(rel_demand, key=lambda z: z["top"]) if rel_demand else None
+
+        # Nearest supply zone: lowest zone bottom at or above current price
+        rel_supply = [z for z in supply_zones if z["bottom"] >= cur_close - 0.5 * cur_atr]
+        active_supply = min(rel_supply, key=lambda z: z["bottom"]) if rel_supply else None
 
         # Write demand zone
         if active_demand is not None:
@@ -182,7 +207,7 @@ def detect_zones(
             dist = (cur_close - active_demand["top"]) / cur_atr
             df.at[i, "nearest_demand_dist_atr"] = float(dist)
 
-            in_d = active_demand["bottom"] <= float(cur["low"]) <= active_demand["top"]
+            in_d = active_demand["bottom"] <= cur_low <= active_demand["top"]
             df.at[i, "in_demand_zone"] = float(in_d)
             if in_d:
                 active_demand["touches"] += 1
@@ -200,7 +225,7 @@ def detect_zones(
             dist = (active_supply["bottom"] - cur_close) / cur_atr
             df.at[i, "nearest_supply_dist_atr"] = float(dist)
 
-            in_s = active_supply["bottom"] <= float(cur["high"]) <= active_supply["top"]
+            in_s = active_supply["bottom"] <= cur_high <= active_supply["top"]
             df.at[i, "in_supply_zone"] = float(in_s)
             if in_s:
                 active_supply["touches"] += 1
