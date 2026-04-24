@@ -6,7 +6,7 @@ from features import build_features
 db = get_connection()
 db.connect()
 df = db.fetch_dataframe(
-    'SELECT * FROM ustech_ohlcv WHERE timeframe = %s ORDER BY timestamp ASC',
+    'SELECT * FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s ORDER BY timestamp ASC',
     ('15min',)
 )
 db.disconnect()
@@ -16,8 +16,8 @@ h4 = None
 try:
     db2 = get_connection()
     db2.connect()
-    h1 = db2.fetch_dataframe('SELECT * FROM ustech_ohlcv WHERE timeframe = %s ORDER BY timestamp ASC', ('1H',))
-    h4 = db2.fetch_dataframe('SELECT * FROM ustech_ohlcv WHERE timeframe = %s ORDER BY timestamp ASC', ('4H',))
+    h1 = db2.fetch_dataframe('SELECT * FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s ORDER BY timestamp ASC', ('1H',))
+    h4 = db2.fetch_dataframe('SELECT * FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s ORDER BY timestamp ASC', ('4H',))
     db2.disconnect()
 except:
     pass

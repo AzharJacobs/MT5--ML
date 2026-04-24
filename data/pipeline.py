@@ -80,8 +80,8 @@ class DataPreparator:
             SELECT timestamp, open, high, low, close, volume,
                    hour, day_of_week, month, year, session,
                    candle_size, body_size, wick_upper, wick_lower
-            FROM ustech_ohlcv
-            WHERE symbol = %s AND timeframe = %s
+            FROM ustech_verified
+            WHERE is_verified = TRUE AND symbol = %s AND timeframe = %s
             ORDER BY timestamp ASC
         """
         df = self._db.fetch_dataframe(query, (symbol, timeframe))

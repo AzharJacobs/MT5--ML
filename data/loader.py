@@ -117,7 +117,7 @@ class DatabaseConnection:
 
     def get_available_timeframes(self) -> List[str]:
         """Get list of all available timeframes in the database."""
-        query = "SELECT DISTINCT timeframe FROM ustech_ohlcv ORDER BY timeframe"
+        query = "SELECT DISTINCT timeframe FROM ustech_verified WHERE is_verified = TRUE ORDER BY timeframe"
         results = self.execute_query(query)
         return [row['timeframe'] for row in results]
 
@@ -134,12 +134,12 @@ class DatabaseConnection:
         if timeframe:
             query = """
                 SELECT MIN(date) as min_date, MAX(date) as max_date
-                FROM ustech_ohlcv
-                WHERE timeframe = %s
+                FROM ustech_verified
+                WHERE is_verified = TRUE AND timeframe = %s
             """
             results = self.execute_query(query, (timeframe,))
         else:
-            query = "SELECT MIN(date) as min_date, MAX(date) as max_date FROM ustech_ohlcv"
+            query = "SELECT MIN(date) as min_date, MAX(date) as max_date FROM ustech_verified WHERE is_verified = TRUE"
             results = self.execute_query(query)
 
         if results:
@@ -152,10 +152,10 @@ class DatabaseConnection:
     def get_record_count(self, timeframe: str = None) -> int:
         """Get total number of records, optionally filtered by timeframe."""
         if timeframe:
-            query = "SELECT COUNT(*) as count FROM ustech_ohlcv WHERE timeframe = %s"
+            query = "SELECT COUNT(*) as count FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s"
             results = self.execute_query(query, (timeframe,))
         else:
-            query = "SELECT COUNT(*) as count FROM ustech_ohlcv"
+            query = "SELECT COUNT(*) as count FROM ustech_verified WHERE is_verified = TRUE"
             results = self.execute_query(query)
 
         return results[0]['count'] if results else 0
@@ -179,7 +179,7 @@ class DatabaseConnection:
         Returns:
             pandas DataFrame with OHLCV data
         """
-        query_parts = ["SELECT * FROM ustech_ohlcv WHERE 1=1"]
+        query_parts = ["SELECT * FROM ustech_verified WHERE is_verified = TRUE"]
         params = []
 
         if timeframe:
@@ -225,8 +225,8 @@ class DatabaseConnection:
                 SUM(CASE WHEN direction = 'buy' THEN 1 ELSE 0 END) as buy_count,
                 SUM(CASE WHEN direction = 'sell' THEN 1 ELSE 0 END) as sell_count,
                 COUNT(*) as total_count
-            FROM ustech_ohlcv
-            WHERE timeframe = %s
+            FROM ustech_verified
+            WHERE is_verified = TRUE AND timeframe = %s
         """]
         params = [timeframe]
 
@@ -256,8 +256,8 @@ class DatabaseConnection:
                 SUM(CASE WHEN direction = 'buy' THEN 1 ELSE 0 END) as buy_count,
                 SUM(CASE WHEN direction = 'sell' THEN 1 ELSE 0 END) as sell_count,
                 COUNT(*) as total_count
-            FROM ustech_ohlcv
-            WHERE timeframe = %s
+            FROM ustech_verified
+            WHERE is_verified = TRUE AND timeframe = %s
         """]
         params = [timeframe]
 
@@ -287,8 +287,8 @@ class DatabaseConnection:
                 SUM(CASE WHEN direction = 'buy' THEN 1 ELSE 0 END) as buy_count,
                 SUM(CASE WHEN direction = 'sell' THEN 1 ELSE 0 END) as sell_count,
                 COUNT(*) as total_count
-            FROM ustech_ohlcv
-            WHERE timeframe = %s
+            FROM ustech_verified
+            WHERE is_verified = TRUE AND timeframe = %s
         """]
         params = [timeframe]
 
@@ -318,8 +318,8 @@ class DatabaseConnection:
                 SUM(CASE WHEN direction = 'buy' THEN 1 ELSE 0 END) as buy_count,
                 SUM(CASE WHEN direction = 'sell' THEN 1 ELSE 0 END) as sell_count,
                 COUNT(*) as total_count
-            FROM ustech_ohlcv
-            WHERE timeframe = %s
+            FROM ustech_verified
+            WHERE is_verified = TRUE AND timeframe = %s
         """]
         params = [timeframe]
 

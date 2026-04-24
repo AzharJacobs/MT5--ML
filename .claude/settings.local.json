@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git mv *)"
+      "Bash(git mv *)",
+      "Bash(grep -rn \"open\\(\\\\|pathlib.Path\\\\|os.path\\\\|\\\\.\\\\\\\\./data\\\\|./datasets\" \"f:/MT5- ML\" --include=\"*.py\")",
+      "Bash(grep -rn \"INSERT\\\\|UPDATE\\\\|DELETE\\\\|CREATE TABLE\\\\|execute\\(\" \"f:/MT5- ML\" --include=\"*.py\" -not -path \"*/.venv/*\")",
+      "Bash(grep -rn \"psycopg2\\\\|sqlite3\\\\|cursor\\\\|execute\" \"f:/MT5- ML\" --include=\"*.py\" -not -path \"*/.venv/*\")",
+      "Bash(grep -rn \"open\\\\\\(\" \"f:/MT5- ML\" --include=\"*.py\" -not -path \"*/.venv/*\")",
+      "Bash(grep -rn \"to_csv\\\\|to_pickle\\\\|to_json\\\\|to_sql\\\\|\\\\.write\\(\" \"f:/MT5-Collector\" --include=\"*.py\" -not -path \"*/.venv/*\")"
     ]
   }
 }

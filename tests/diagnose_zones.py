@@ -5,7 +5,7 @@ from features import build_features
 db = get_connection()
 db.connect()
 df = db.fetch_dataframe(
-    'SELECT * FROM ustech_ohlcv WHERE timeframe = %s ORDER BY timestamp ASC',
+    'SELECT * FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s ORDER BY timestamp ASC',
     ('15min',)
 )
 db.disconnect()

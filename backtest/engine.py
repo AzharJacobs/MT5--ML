@@ -480,7 +480,7 @@ def run_backtest(
     if not db.connect():
         raise ConnectionError("Failed to connect to database")
 
-    query  = "SELECT * FROM ustech_ohlcv WHERE timeframe = %s"
+    query  = "SELECT * FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s"
     params = [timeframe]
     if start_date:
         query  += " AND date >= %s"; params.append(start_date)
