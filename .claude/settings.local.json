@@ -7,7 +7,12 @@
       "Bash(grep -rn \"psycopg2\\\\|sqlite3\\\\|cursor\\\\|execute\" \"f:/MT5- ML\" --include=\"*.py\" -not -path \"*/.venv/*\")",
       "Bash(grep -rn \"open\\\\\\(\" \"f:/MT5- ML\" --include=\"*.py\" -not -path \"*/.venv/*\")",
       "Bash(grep -rn \"to_csv\\\\|to_pickle\\\\|to_json\\\\|to_sql\\\\|\\\\.write\\(\" \"f:/MT5-Collector\" --include=\"*.py\" -not -path \"*/.venv/*\")",
-      "Bash(python -m py_compile config.py storage/db_writer.py)"
+      "Bash(python -m py_compile config.py storage/db_writer.py)",
+      "Bash(grep -r \"import requests\\\\|import urllib\\\\|http\\\\|api\\\\|fetch\" \"f:/MT5- ML\" --include=\"*.py\" ! -path \"*/.venv/*\" ! -path \"*/__pycache__/*\")",
+      "Bash(grep -r \"requests\\\\|urllib\\\\|http\" \"f:/MT5- ML\" --include=\"*.py\" ! -path \"*/.venv/*\" ! -path \"*/__pycache__/*\")",
+      "Bash(.venv/Scripts/python.exe -m tests.test_label_logic)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe -m tests.test_wr_breakdown)"
     ]
   }
 }

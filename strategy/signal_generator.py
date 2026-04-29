@@ -27,8 +27,15 @@ CRITICAL FIX (sell_wins=0 bug):
   confirmation scores) so the model still learns what conditions lead to
   wins. A separate `signal_direction` column is kept for diagnostics.
 
-CHANGES (trade frequency fix):
-  - MIN_VOLUME_RATIO lowered from 0.8 → 0.6.
+FILTER CHANGES (win-rate fix, diagnosed 2026-04-29):
+  Three filters added after breakdown analysis showed WR=28% root causes:
+  1. MAX_TP_ATR=6.0  — TP > 6 ATR unreachable in the 5h forward window;
+     those signals had wr=9-17% and were dragging the average down.
+  2. MAX_SL_ATR=3.0  — SL > 3 ATR means the zone is too wide; price wicks
+     through without the move paying off. wr jumped to 43-49% in 1-3 ATR range.
+  3. Session narrowed to hours 10-12:30 + 16:00 only (drop 17-18) — London/NY
+     overlap hours 17-18 had wr=19% on 39% of all signals.
+  - MIN_VOLUME_RATIO lowered from 0.8 → 0.6 (previous change).
 """
 
 import pandas as pd
@@ -42,13 +49,22 @@ LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
 # Candle volume must be at least 60% of the 20-bar rolling average to qualify.
 MIN_VOLUME_RATIO = 0.6
 
+# TP further than this many ATR from entry is unreachable in the forward window.
+MAX_TP_ATR = 6.0
+
+# SL further than this many ATR indicates the zone is too wide to trade cleanly.
+MAX_SL_ATR = 3.0
+
 
 def generate_labels(
     df: pd.DataFrame,
     max_bars: int = 50,
     min_rr: float = 1.5,
+    max_rr: float = None,
     sl_buffer_atr: float = 0.5,
+    min_sl_atr: float = 0.0,
     use_midline_tp: bool = True,
+    include_london_ny: bool = True,
     timeframe: str = None,
 ) -> pd.DataFrame:
     """
@@ -58,12 +74,16 @@ def generate_labels(
     For HTF timeframes: entry and TP/SL from own zone prices.
 
     Args:
-        df:             Feature-enriched DataFrame from features.py
-        max_bars:       Forward bars to simulate TP/SL outcome
-        min_rr:         Minimum risk/reward ratio to accept signal
-        sl_buffer_atr:  Small ATR buffer added beyond zone boundary for SL
-        use_midline_tp: TP at 50% distance to next zone. True for LTF, False for HTF.
-        timeframe:      Timeframe name — determines LTF vs HTF logic
+        df:               Feature-enriched DataFrame from features.py
+        max_bars:         Forward bars to simulate TP/SL outcome
+        min_rr:           Minimum risk/reward ratio to accept signal
+        max_rr:           Maximum RR cap — signals above this are skipped (None = no cap)
+        sl_buffer_atr:    Small ATR buffer added beyond zone boundary for SL
+        min_sl_atr:       Minimum SL distance in ATR — filters noise stops on tiny zones
+        use_midline_tp:   TP at 50% distance to next zone. True for LTF, False for HTF.
+        include_london_ny: Include London/NY overlap window (16:00). Disable for 15min
+                           where H16 wr=24% vs London open H10-12 wr=37-42%.
+        timeframe:        Timeframe name — determines LTF vs HTF logic
 
     Label output (binary):
         label=1  → zone entry that hit TP (winner, buy or sell)
@@ -83,7 +103,9 @@ def generate_labels(
     use_htf = (timeframe in LTF_TIMEFRAMES) if timeframe else False
     n = len(df)
 
-    # Trading session windows in BROKER time (Exness GMT+3)
+    # Trading session windows in BROKER time (Exness GMT+3).
+    # Hours 17-18 dropped for all TFs: wr=19% on 39% of 5min signals.
+    # H16 kept only when include_london_ny=True (5min); dropped for 15min (wr=24%).
     def _in_trading_session(row) -> bool:
         hour = int(row.get("hour", -1) or -1)
         ts   = row.get("timestamp")
@@ -94,7 +116,7 @@ def generate_labels(
             except Exception:
                 minute = 0
         asia_london = (hour == 10) or (hour == 11) or (hour == 12 and minute < 30)
-        london_ny   = (hour >= 16 and hour < 19)
+        london_ny   = include_london_ny and (hour == 16)
         return asia_london or london_ny
 
     for i in range(n - max_bars):
@@ -157,6 +179,14 @@ def generate_labels(
             rr = reward / risk
             if rr < min_rr:
                 continue
+            if max_rr is not None and rr > max_rr:
+                continue
+            if reward / atr > MAX_TP_ATR:
+                continue
+            if risk / atr > MAX_SL_ATR:
+                continue
+            if min_sl_atr > 0 and risk / atr < min_sl_atr:
+                continue
 
             signal = 1
             reason = f"demand_{'htf' if use_htf else 'ltf'} rr={rr:.2f}"
@@ -194,6 +224,14 @@ def generate_labels(
                 continue
             rr = reward / risk
             if rr < min_rr:
+                continue
+            if max_rr is not None and rr > max_rr:
+                continue
+            if reward / atr > MAX_TP_ATR:
+                continue
+            if risk / atr > MAX_SL_ATR:
+                continue
+            if min_sl_atr > 0 and risk / atr < min_sl_atr:
                 continue
 
             signal = -1

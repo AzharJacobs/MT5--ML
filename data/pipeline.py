@@ -45,17 +45,20 @@ logging.basicConfig(
 LTF_TIMEFRAMES = {"1min","2min","3min","4min","5min","10min","15min","30min"}
 
 TF_PARAMS = {
-    "1min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.2, "use_midline_tp": True},
-    "2min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.2, "use_midline_tp": True},
-    "3min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.2, "use_midline_tp": True},
-    "4min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.2, "use_midline_tp": True},
-    "5min":  {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.2, "use_midline_tp": True},
-    "10min": {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.2, "use_midline_tp": True},
-    "15min": {"impulse_atr": 0.5, "max_bars": 80,  "min_rr": 1.2, "use_midline_tp": True},
-    "30min": {"impulse_atr": 0.6, "max_bars": 80,  "min_rr": 1.2, "use_midline_tp": True},
-    "1H":    {"impulse_atr": 0.6, "max_bars": 120, "min_rr": 1.2, "use_midline_tp": True},
-    "4H":    {"impulse_atr": 0.7, "max_bars": 60,  "min_rr": 1.2, "use_midline_tp": False},
-    "1D":    {"impulse_atr": 0.8, "max_bars": 30,  "min_rr": 1.2, "use_midline_tp": False},
+    # include_london_ny: H16 kept for 5min (wr=31.8%), dropped for 15min (wr=24.4%).
+    # min_sl_atr: 15min zones <0.5 ATR get stopped out by noise (wr=12.8%).
+    # max_rr: 15min RR>4 signals have wr=0-8% — cap prevents unreachable TPs.
+    "1min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "2min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "3min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "4min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "5min":  {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "10min": {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "15min": {"impulse_atr": 0.5, "max_bars": 80,  "min_rr": 1.2, "max_rr": 4.0,  "use_midline_tp": True,  "min_sl_atr": 0.5, "include_london_ny": False},
+    "30min": {"impulse_atr": 0.6, "max_bars": 80,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "1H":    {"impulse_atr": 0.6, "max_bars": 120, "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
+    "4H":    {"impulse_atr": 0.7, "max_bars": 60,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": False, "min_sl_atr": 0.0, "include_london_ny": True},
+    "1D":    {"impulse_atr": 0.8, "max_bars": 30,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": False, "min_sl_atr": 0.0, "include_london_ny": True},
 }
 
 CATEGORICAL_COLS = ["session", "day_of_week"]
@@ -106,50 +109,41 @@ class DataPreparator:
 
     def _build_model_dataset(self, df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
         """
-        Build model training dataset with zone-touch rows + non-zone context.
+        Build model training dataset from signal rows only.
 
-        OLD approach: keep ONLY zone-touch rows.
-        Problem: in_demand_zone / in_supply_zone had zero variance (always 1)
-        so XGBoost ignored them and learned time/trend patterns instead.
+        PREVIOUS APPROACH (broken): kept ALL zone-touch rows as training data.
+        This created a 0.4% / 99.6% class split — the model predicted everything
+        as 0 and achieved 98% accuracy while identifying essentially zero winners
+        (F1=0.026, recall=0.06). Training on 87K zone rows with 358 winners is
+        an unsolvable needle-in-haystack problem.
 
-        NEW approach:
-          1. Always keep ALL zone-touch rows (in_demand_zone=1 or in_supply_zone=1)
-          2. Always keep ALL winner rows (label=1) even if zone flag is missing
-          3. Add a random sample of non-zone rows as negative context
-             (CONTEXT_RATIO * n_zone_rows non-zone rows sampled randomly)
+        CURRENT APPROACH: filter to rows where signal != 0 (actual trade entries
+        that passed all filters: session, volume, ATR, SL/TP caps). This produces
+        a ~38% / 62% split (winners vs losers among valid signals), which XGBoost
+        can learn from. The model now answers: "given a valid zone entry, will it
+        hit TP or SL?" instead of "find the 0.4% winners in all zone candles."
 
-        This gives zone features real 0/1 variance — XGBoost can now learn
-        "in zone + quality + confirmation = winner" vs "not in zone = noise".
+        Features still vary between rows:
+          - Zone quality (strength, freshness, touches) differs per signal
+          - HTF bias and confirmation patterns differ
+          - in_demand_zone / in_supply_zone encode direction (buy vs sell)
+          - Hour, session, RR ratio differ per signal
         """
-        in_demand = df.get("in_demand_zone", pd.Series(0.0, index=df.index))
-        in_supply = df.get("in_supply_zone", pd.Series(0.0, index=df.index))
-
-        zone_mask    = (in_demand.fillna(0) == 1.0) | (in_supply.fillna(0) == 1.0)
-        winner_mask  = df["label"] != 0 if "label" in df.columns \
-                       else pd.Series(False, index=df.index)
-
-        # Zone rows + winner rows (always keep all of these)
-        keep_mask    = zone_mask | winner_mask
-        zone_df      = df[keep_mask].copy()
-        non_zone_df  = df[~keep_mask].copy()
-
-        n_zone       = len(zone_df)
-        n_context    = int(n_zone * CONTEXT_RATIO)
-        n_context    = min(n_context, len(non_zone_df))
-
-        if n_context > 0:
-            context_df = non_zone_df.sample(n=n_context, random_state=seed)
-            result_df  = pd.concat([zone_df, context_df], ignore_index=True)
-            result_df  = result_df.sort_values("timestamp").reset_index(drop=True)
+        if "signal" not in df.columns:
+            # Fallback: no signal column — use all zone-touch rows
+            in_demand = df.get("in_demand_zone", pd.Series(0.0, index=df.index))
+            in_supply = df.get("in_supply_zone", pd.Series(0.0, index=df.index))
+            signal_mask = (in_demand.fillna(0) == 1.0) | (in_supply.fillna(0) == 1.0)
         else:
-            result_df = zone_df
+            signal_mask = df["signal"] != 0
+
+        result_df = df[signal_mask].copy()
 
         n_winners = (result_df["label"] != 0).sum() if "label" in result_df.columns else 0
         n_total   = len(result_df)
 
         logger.info(
-            f"Model dataset | zone_rows={n_zone:,} + context={n_context:,} "
-            f"= total={n_total:,} | winners={n_winners:,} "
+            f"Model dataset | signal_rows={n_total:,} | winners={n_winners:,} "
             f"({n_winners/max(n_total,1)*100:.1f}%)"
         )
         return result_df
@@ -206,7 +200,11 @@ class DataPreparator:
                 feat_df,
                 max_bars=params["max_bars"],
                 min_rr=params["min_rr"],
+                max_rr=params.get("max_rr"),
+                sl_buffer_atr=0.5,
+                min_sl_atr=params.get("min_sl_atr", 0.0),
                 use_midline_tp=params["use_midline_tp"],
+                include_london_ny=params.get("include_london_ny", True),
                 timeframe=tf,
             )
 

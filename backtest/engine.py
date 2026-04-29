@@ -59,8 +59,9 @@ RAW_ZONE_COLS = [
     "htf_demand_zone_top", "htf_demand_zone_bottom",
     "htf_supply_zone_top", "htf_supply_zone_bottom",
     "atr_14",
-    "htf_4h_bias",  # needed for hard HTF trend gate (unscaled: 1.0 / -1.0)
-    "htf_1h_bias",  # needed for hard HTF trend gate
+    "htf_4h_bias",   # needed for hard HTF trend gate (unscaled: 1.0 / -1.0)
+    "htf_1h_bias",   # needed for hard HTF trend gate
+    "in_demand_zone", "in_supply_zone",  # direction source — model predicts winner/loser, not buy/sell
 ]
 
 
@@ -76,6 +77,7 @@ class BacktestResult:
     skipped_max_positions: int
     trail_activations: int
     filtered_no_row: int
+    filtered_session: int
     filtered_zone_quality: int
     filtered_confidence: int
     filtered_neutral: int
@@ -92,7 +94,7 @@ def _build_feature_matrix_for_timeframe(
     timeframe: str,
     metadata_bundle: Dict[str, Any]
 ) -> pd.DataFrame:
-    from features import build_features
+    from data.feature_engineer import build_features
 
     saved_scaler    = metadata_bundle.get("scaler")
     feature_columns = metadata_bundle.get("feature_columns") or []
@@ -154,6 +156,7 @@ class MLSignalStrategy(bt.Strategy):
         trail_trigger_pts=100.0,
         trail_dist_atr=1.0,
         trail_dist_pts=100.0,
+        include_london_ny=True,   # match signal_generator: False for 15min, True for 5min
     )
 
     def __init__(self):
@@ -179,6 +182,7 @@ class MLSignalStrategy(bt.Strategy):
         # Diagnostic counters — tells you exactly which gate kills most bars
         self._diag = {
             "no_row":       0,  # bar has no feature row (warmup or timestamp mismatch)
+            "session":      0,  # bar outside trading session window
             "zone_quality": 0,  # zone quality score below MIN_ZONE_QUALITY
             "confidence":   0,  # model confidence below threshold
             "neutral":      0,  # model predicted neutral/hold label
@@ -315,47 +319,79 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["no_row"] += 1
             return
 
+        # Resolve raw early — needed for session filter and direction gate.
+        _raw = row.get("raw")
+
+        # ── Gate 1b: session filter — matches signal_generator exactly ────
+        # Use the pre-computed `hour` column from the DB row (broker time GMT+3),
+        # NOT dt.hour from Backtrader which may be UTC and would be 3h off.
+        # Minute is timezone-safe (same regardless of offset).
+        if _raw is not None:
+            try:
+                hour   = int(_raw.get("hour", dt.hour) or dt.hour)
+                minute = dt.minute
+            except Exception:
+                hour, minute = dt.hour, dt.minute
+        else:
+            hour, minute = dt.hour, dt.minute
+
+        asia_london = (hour == 10) or (hour == 11) or (hour == 12 and minute < 30)
+        london_ny   = self.p.include_london_ny and (hour == 16)
+        if not (asia_london or london_ny):
+            self._diag["session"] += 1
+            return
+
         X_row        = row["X"]
         zone_quality = row.get("zone_quality", float("nan"))
 
-        # ── Gate 2: zone quality (CHANGED 3.5 → 2.0) ──────────────────
+        # ── Gate 2: zone quality ────────────────────────────────────────
         if not (isinstance(zone_quality, float) and zone_quality >= MIN_ZONE_QUALITY):
             self._diag["zone_quality"] += 1
             return
 
-        # ── Gate 3: model confidence (CHANGED default 0.55 → 0.52) ────
-        proba    = self.model.predict_proba(X_row)[0]
-        pred_idx = int(np.argmax(proba))
-        conf     = float(np.max(proba))
+        # ── Gate 3: model confidence ───────────────────────────────────
+        # Model is binary: class 0 = loser, class 1 = winner.
+        # We want the probability of being a WINNER (class 1), not max(proba).
+        # Bug was: conf = np.max(proba) which is always ≥ 0.50 in a binary
+        # classifier — the confidence gate never fired.
+        proba   = self.model.predict_proba(X_row)[0]
+        classes = getattr(self.model, "classes_", np.array([0, 1]))
+        winner_class_idx = int(np.where(classes == 1)[0][0]) \
+            if 1 in classes else 1
+        winner_proba = float(proba[winner_class_idx])
 
-        if conf < float(self.p.confidence):
+        if winner_proba < float(self.p.confidence):
             self._diag["confidence"] += 1
             return
 
-        # ── Gate 4: label decode ───────────────────────────────────────
-        classes = getattr(self.model, "classes_", None)
-        if classes is None:
-            pred_label = "buy" if pred_idx == 1 else "sell"
+        # ── Gate 4: direction from zone, not from model class ──────────
+        # Model predicts winner (1) vs loser (0) — NOT buy vs sell.
+        # Direction comes from which zone price is in at this bar.
+        # _raw already resolved above in Gate 1b.
+        if _raw is not None:
+            try:
+                in_demand = float(_raw.get("in_demand_zone", 0))
+                in_supply = float(_raw.get("in_supply_zone", 0))
+            except Exception:
+                in_demand = in_supply = 0.0
         else:
-            raw_label  = classes[pred_idx]
-            pred_label = ("buy" if int(raw_label) == 1 else "sell") \
-                if isinstance(raw_label, (int, np.integer)) \
-                else str(raw_label).lower()
+            in_demand = in_supply = 0.0
 
-        if pred_label in {"neutral", "hold"}:
+        if in_demand == 1.0:
+            pred_label = "buy"
+        elif in_supply == 1.0:
+            pred_label = "sell"
+        else:
+            # Not clearly in a zone — skip
             self._diag["neutral"] += 1
             return
 
         # ── Hard HTF trend gate ────────────────────────────────────────
-        # Enforce strategy rule: don't trade against the HTF trend.
-        # This is a HARD block — the model can't override it.
         # Sells only when 4H is not bullish. Buys only when 4H is not bearish.
-        _raw = row.get("raw")
+        # _raw already resolved above in Gate 4.
         if _raw is not None:
             try:
-                # htf_4h_bias is in RAW_ZONE_COLS so it's stored unscaled
-                _htf = float(_raw.get("htf_4h_bias", 0) or 0)
-                # Round to nearest integer to avoid float precision issues
+                _htf     = float(_raw.get("htf_4h_bias", 0) or 0)
                 _htf_int = round(_htf)
                 if pred_label == "sell" and _htf_int > 0:
                     return
@@ -470,9 +506,10 @@ def run_backtest(
     use_pct_stake: bool,
     confidence:  float,
     commission:  float,
-    trail_trigger_pts: float = 100.0,
-    trail_dist_atr:    float = 1.0,
-    trail_dist_pts:    float = 100.0,
+    trail_trigger_pts:  float = 100.0,
+    trail_dist_atr:     float = 1.0,
+    trail_dist_pts:     float = 100.0,
+    include_london_ny:  bool  = True,
     model_dir:   str = MODEL_DIR,
 ) -> BacktestResult:
 
@@ -523,7 +560,7 @@ def run_backtest(
 
     # Overlay raw (unscaled) zone values and zone quality
     try:
-        from features import build_features as _bf
+        from data.feature_engineer import build_features as _bf
         _raw_feat = _bf(df.copy())
 
         if "timestamp" in _raw_feat.columns:
@@ -582,6 +619,7 @@ def run_backtest(
         trail_trigger_pts=float(trail_trigger_pts),
         trail_dist_atr=float(trail_dist_atr),
         trail_dist_pts=float(trail_dist_pts),
+        include_london_ny=bool(include_london_ny),
     )
 
     start_value = cerebro.broker.getvalue()
@@ -612,6 +650,7 @@ def run_backtest(
         skipped_max_positions=skp_pos,
         trail_activations=trail_acts,
         filtered_no_row=diag.get("no_row", 0),
+        filtered_session=diag.get("session", 0),
         filtered_zone_quality=diag.get("zone_quality", 0),
         filtered_confidence=diag.get("confidence", 0),
         filtered_neutral=diag.get("neutral", 0),
@@ -635,6 +674,9 @@ def main() -> None:
     parser.add_argument("--trail-dist-atr",     type=float, default=1.0)
     parser.add_argument("--trail-dist-pts",     type=float, default=100.0)
     parser.add_argument("--model-dir",          default=MODEL_DIR)
+    parser.add_argument("--no-london-ny",        dest="include_london_ny",
+                        action="store_false", default=True,
+                        help="Exclude London/NY overlap (H16). Use for 15min.")
     args = parser.parse_args()
 
     res = run_backtest(
@@ -649,6 +691,7 @@ def main() -> None:
         trail_trigger_pts=args.trail_trigger_pts,
         trail_dist_atr=args.trail_dist_atr,
         trail_dist_pts=args.trail_dist_pts,
+        include_london_ny=args.include_london_ny,
         model_dir=args.model_dir,
     )
 
@@ -670,6 +713,7 @@ def main() -> None:
     print()
     print("── Filter breakdown (bars rejected per gate) ──────────────")
     print(f"  No feature row:         {res.filtered_no_row:,}")
+    print(f"  Outside session:        {res.filtered_session:,}")
     print(f"  Zone quality < {MIN_ZONE_QUALITY}:     {res.filtered_zone_quality:,}")
     print(f"  Low confidence:         {res.filtered_confidence:,}")
     print(f"  Neutral prediction:     {res.filtered_neutral:,}")
