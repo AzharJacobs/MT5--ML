@@ -30,6 +30,8 @@ import pandas as pd
 import numpy as np
 import logging
 
+from config.pipeline_config import REQUIRED_FEATURE_COLUMNS
+
 logger = logging.getLogger("mt5_collector.features")
 
 # Zone expiry settings
@@ -268,7 +270,7 @@ def add_strategy_rules(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # --- Session rules (mirror labels.py _in_trading_session) ---
-    hour = df["hour"].fillna(-1).astype(float)
+    hour = df.get("hour", pd.Series(-1, index=df.index)).fillna(-1).astype(float)
     rule_good_session = hour.isin(GOOD_SESSION_HOURS).astype(float)
     rule_valid_hour   = hour.isin(VALID_HOURS).astype(float)
 
@@ -651,14 +653,40 @@ def build_features(
     df = add_confirmation_signals(df)
     df = add_indicators(df)
 
-    if h1_df is not None or h4_df is not None:
-        df = add_htf_context(df, h1_df, h4_df)
+    # Always call add_htf_context so HTF columns are always present.
+    # When h1_df/h4_df are None it fills htf_1h_bias/htf_4h_bias=0 and
+    # zone boundary columns=NaN — which is correct for LTF-only data.
+    df = add_htf_context(df, h1_df, h4_df)
 
     df = add_zone_quality(df)
-    df = add_strategy_rules(df)   # ← NEW: encode strategy rules as features
+    df = add_strategy_rules(df)
+
+    # in_session: 1 if bar falls in the trading session used for label generation.
+    # Kept as a raw feature so the model learns session importance itself rather
+    # than having it enforced as a hard gate at execution time.
+    if "hour" in df.columns:
+        hour_s = df["hour"].fillna(-1).astype(float)
+        if "timestamp" in df.columns:
+            minute_s = pd.to_datetime(df["timestamp"]).dt.minute
+        else:
+            minute_s = pd.Series(0, index=df.index)
+        df["in_session"] = (
+            (hour_s == 10) | (hour_s == 11) |
+            ((hour_s == 12) & (minute_s < 30)) |
+            (hour_s == 16)
+        ).astype(float)
+    else:
+        df["in_session"] = 0.0
 
     warmup = max(200, zone_lookback)
     df = df.iloc[warmup:].reset_index(drop=True)
+
+    # Consistency check: all required columns must be present.
+    missing = [c for c in REQUIRED_FEATURE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"build_features() is missing required columns: {missing}"
+        )
 
     logger.info(f"Features built — shape: {df.shape}")
     return df
@@ -666,58 +694,8 @@ def build_features(
 
 # ---------------------------------------------------------------------------
 # Feature column list for ML
+# Single source of truth lives in config/pipeline_config.py.
+# Re-exported here so all existing callers (data/pipeline.py, etc.) are
+# unchanged: `from data.feature_engineer import FEATURE_COLUMNS` still works.
 # ---------------------------------------------------------------------------
-
-FEATURE_COLUMNS = [
-    # ── Strategy rule features (primary signal) ──────────────────────
-    # These encode the actual strategy conditions directly.
-    # rule_valid_buy/sell_setup already includes session so we don't
-    # need raw hour/session as separate features — they just distract.
-    "rule_valid_buy_setup",
-    "rule_valid_sell_setup",
-    "rule_htf_aligned_buy",
-    "rule_htf_aligned_sell",
-    "rule_htf_strong_buy",
-    "rule_htf_strong_sell",
-    "rule_fresh_zone",
-    "rule_fresh_demand",
-    "rule_fresh_supply",
-    "rule_confirmed_buy",
-    "rule_confirmed_sell",
-    "rule_zone_has_room",
-    "rule_buy_score",
-    "rule_sell_score",
-
-    # ── Zone context (supporting) ─────────────────────────────────────
-    "in_demand_zone", "in_supply_zone", "between_zones",
-    "demand_zone_strength", "demand_zone_fresh", "demand_zone_touches",
-    "demand_zone_consolidation",
-    "supply_zone_strength", "supply_zone_fresh", "supply_zone_touches",
-    "supply_zone_consolidation",
-    "nearest_demand_dist_atr", "nearest_supply_dist_atr",
-    "demand_zone_quality", "supply_zone_quality", "active_zone_quality",
-
-    # ── Confirmation patterns ─────────────────────────────────────────
-    "bullish_engulfing", "bearish_engulfing",
-    "pin_bar_bullish", "pin_bar_bearish",
-    "higher_low", "lower_high",
-    "bos_bullish", "bos_bearish",
-    "buy_confirmation_score", "sell_confirmation_score",
-
-    # ── HTF context ───────────────────────────────────────────────────
-    "htf_1h_bias", "htf_4h_bias", "htf_aligned",
-    "htf_demand_zone_top", "htf_demand_zone_bottom",
-    "htf_supply_zone_top", "htf_supply_zone_bottom",
-
-    # ── Market conditions ─────────────────────────────────────────────
-    "atr_14", "rsi_14",
-    "volume_ratio", "body_atr_ratio",
-    "momentum_5", "momentum_10",
-    "bb_position", "bb_width_atr",
-
-    # ── Candle context ────────────────────────────────────────────────
-    # month kept — seasonal patterns are real
-    # hour/session removed — already encoded in rule_valid_buy/sell_setup
-    "month",
-    "candle_size", "body_size", "wick_upper", "wick_lower",
-]
+FEATURE_COLUMNS = REQUIRED_FEATURE_COLUMNS

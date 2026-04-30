@@ -12,7 +12,17 @@
       "Bash(grep -r \"requests\\\\|urllib\\\\|http\" \"f:/MT5- ML\" --include=\"*.py\" ! -path \"*/.venv/*\" ! -path \"*/__pycache__/*\")",
       "Bash(.venv/Scripts/python.exe -m tests.test_label_logic)",
       "Bash(.venv/Scripts/python.exe -c ' *)",
-      "Bash(.venv/Scripts/python.exe -m tests.test_wr_breakdown)"
+      "Bash(.venv/Scripts/python.exe -m tests.test_wr_breakdown)",
+      "Bash(python scripts/check_model_health.py)",
+      "Bash(python -m pytest tests/test_strategy.py -v)",
+      "Bash(python -m tests.test_strategy)",
+      "Bash(echo \"---EXIT:$?\")",
+      "Bash(pip install *)",
+      "Bash(python -m pytest tests/test_risk.py -v)",
+      "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_backtest.py tests/test_features.py -v)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_backtest.py tests/test_features.py -q)",
+      "Bash(python -m models.trainer --timeframes 5min 15min)"
     ]
   }
 }

@@ -44,13 +44,9 @@ from data.loader import get_connection
 from data.pipeline import DataPreparator
 from models.trainer import ModelTrainer, MODEL_DIR
 from strategy.base_strategy import calculate_stop_loss, calculate_take_profit
+from config.pipeline_config import MIN_ZONE_QUALITY, HTF_EXTREME_THRESHOLD
 
 MAX_CONCURRENT_POSITIONS = 2
-
-# CHANGED: lowered from 3.5 → 2.0
-# Score of 2.0 means the zone has at least some strength + is fresh OR has good width.
-# Score of 3.5 was so strict that only 9 trades fired across 46k bars.
-MIN_ZONE_QUALITY = 3.0  # raise from 2.0
 
 # Raw zone columns we need at execution time (unscaled, real price levels)
 RAW_ZONE_COLS = [
@@ -319,27 +315,12 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["no_row"] += 1
             return
 
-        # Resolve raw early — needed for session filter and direction gate.
+        # Resolve raw early — needed for direction gate and HTF soft filter.
         _raw = row.get("raw")
 
-        # ── Gate 1b: session filter — matches signal_generator exactly ────
-        # Use the pre-computed `hour` column from the DB row (broker time GMT+3),
-        # NOT dt.hour from Backtrader which may be UTC and would be 3h off.
-        # Minute is timezone-safe (same regardless of offset).
-        if _raw is not None:
-            try:
-                hour   = int(_raw.get("hour", dt.hour) or dt.hour)
-                minute = dt.minute
-            except Exception:
-                hour, minute = dt.hour, dt.minute
-        else:
-            hour, minute = dt.hour, dt.minute
-
-        asia_london = (hour == 10) or (hour == 11) or (hour == 12 and minute < 30)
-        london_ny   = self.p.include_london_ny and (hour == 16)
-        if not (asia_london or london_ny):
-            self._diag["session"] += 1
-            return
+        # Session gate removed: in_session is now a model feature so the model
+        # learns session importance itself. Hard-blocking here was preventing
+        # valid out-of-session setups from being evaluated.
 
         X_row        = row["X"]
         zone_quality = row.get("zone_quality", float("nan"))
@@ -386,17 +367,21 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["neutral"] += 1
             return
 
-        # ── Hard HTF trend gate ────────────────────────────────────────
-        # Sells only when 4H is not bullish. Buys only when 4H is not bearish.
-        # _raw already resolved above in Gate 4.
+        # ── Soft HTF trend filter ──────────────────────────────────────
+        # htf_4h_bias and htf_1h_bias are already model features — the model
+        # already penalises counter-trend trades. The old hard gate blocked
+        # ALL sells when 4H was bullish even when model confidence was high.
+        # New rule: only skip if HTF is extreme (|bias| > threshold) AND
+        # the model is not confident enough to override it.
         if _raw is not None:
             try:
-                _htf     = float(_raw.get("htf_4h_bias", 0) or 0)
-                _htf_int = round(_htf)
-                if pred_label == "sell" and _htf_int > 0:
-                    return
-                if pred_label == "buy" and _htf_int < 0:
-                    return
+                _htf = float(_raw.get("htf_4h_bias", 0) or 0)
+                if abs(_htf) > HTF_EXTREME_THRESHOLD:
+                    if winner_proba < float(self.p.confidence):
+                        if pred_label == "sell" and _htf > 0:
+                            return
+                        if pred_label == "buy" and _htf < 0:
+                            return
             except Exception:
                 pass
 
@@ -712,12 +697,43 @@ def main() -> None:
     print(f"Winrate:               {res.winrate_pct:.2f}%")
     print()
     print("── Filter breakdown (bars rejected per gate) ──────────────")
-    print(f"  No feature row:         {res.filtered_no_row:,}")
-    print(f"  Outside session:        {res.filtered_session:,}")
-    print(f"  Zone quality < {MIN_ZONE_QUALITY}:     {res.filtered_zone_quality:,}")
-    print(f"  Low confidence:         {res.filtered_confidence:,}")
-    print(f"  Neutral prediction:     {res.filtered_neutral:,}")
-    print(f"  Bad SL/TP geometry:     {res.filtered_bad_sltp:,}")
+
+    gate_counts = {
+        "no_feature_row":    res.filtered_no_row,
+        "session (inactive)": res.filtered_session,
+        f"zone_quality<{MIN_ZONE_QUALITY}": res.filtered_zone_quality,
+        "low_confidence":    res.filtered_confidence,
+        "neutral_prediction": res.filtered_neutral,
+        "bad_sltp_geometry": res.filtered_bad_sltp,
+    }
+    bars_total = (
+        res.filtered_no_row + res.filtered_session + res.filtered_zone_quality +
+        res.filtered_confidence + res.filtered_neutral + res.filtered_bad_sltp +
+        res.entries_submitted
+    )
+    print(f"  {'Gate':<26} {'Count':>8}  {'% of total':>10}")
+    print(f"  {'-'*26} {'-'*8}  {'-'*10}")
+    for gate_name, count in gate_counts.items():
+        pct = count / max(bars_total, 1) * 100
+        print(f"  {gate_name:<26} {count:>8,}  {pct:>9.1f}%")
+    print(f"  {'entries_submitted':<26} {res.entries_submitted:>8,}  "
+          f"{res.entries_submitted / max(bars_total, 1) * 100:>9.1f}%")
+    print(f"  {'TOTAL':<26} {bars_total:>8,}")
+
+    GATE_WARN_THRESHOLD = 60.0
+    GATE_SUGGESTIONS = {
+        "no_feature_row":     "feature matrix timestamp alignment — check build_features() output",
+        f"zone_quality<{MIN_ZONE_QUALITY}": f"lower MIN_ZONE_QUALITY further in config/pipeline_config.py",
+        "low_confidence":     "lower DEFAULT_CONFIDENCE_THRESHOLD or retrain model",
+        "neutral_prediction": "more bars in both zones — check detect_zones() lookback",
+        "bad_sltp_geometry":  "SL/TP calculation — check calculate_stop_loss/take_profit()",
+    }
+    print()
+    for gate_name, count in gate_counts.items():
+        pct = count / max(bars_total, 1) * 100
+        if pct > GATE_WARN_THRESHOLD and gate_name in GATE_SUGGESTIONS:
+            print(f"  WARNING: '{gate_name}' rejected {pct:.1f}% of bars — "
+                  f"suggested fix: {GATE_SUGGESTIONS[gate_name]}")
 
 
 if __name__ == "__main__":

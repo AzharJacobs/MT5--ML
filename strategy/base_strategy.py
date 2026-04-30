@@ -255,10 +255,9 @@ def apply_strategy(
     hour        = current_candle.get('hour', 12)
     day_of_week = current_candle.get('day_of_week', 1)
 
-    if USE_TIME_FILTERS:
-        low_activity_hours = [0, 1, 2, 3, 4, 5, 22, 23]
-        if hour in low_activity_hours or day_of_week in [5, 6]:
-            return 'neutral'
+    # Session gate removed from live execution path.
+    # in_session is a model feature — the model learns session importance.
+    # Hard-blocking here was preventing valid out-of-session setups.
 
     if not USE_ZONE_DETECTION:
         return signal

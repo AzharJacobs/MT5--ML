@@ -1,10 +1,15 @@
 """
-stop_loss.py — Dynamic stop-loss management logic.
-Reads zone boundaries from feature_row (produced by data/feature_engineer.py).
+stop_loss.py — Dynamic stop-loss management.
+
+Thin wrapper around strategy/base_strategy.py calculate_stop_loss() so that
+risk/ and strategy/ always produce identical results for the same inputs.
+The canonical logic lives in base_strategy.py.
 """
 
 import pandas as pd
 from typing import Optional
+
+from strategy.base_strategy import calculate_stop_loss
 
 
 def get_dynamic_stop_loss(
@@ -16,14 +21,26 @@ def get_dynamic_stop_loss(
 ) -> float:
     """
     Return the stop-loss price.
-    Uses HTF zone boundary when available (from feature_row), else ATR-based.
+
+    Delegates to calculate_stop_loss() (strategy/base_strategy.py) which uses
+    features.py zone boundaries when available, then falls back to ATR-based.
+
+    Args:
+        entry_price:   Trade entry price.
+        direction:     "buy" or "sell".
+        atr:           Current ATR value (used only for the hard fallback).
+        feature_row:   Raw (unscaled) pd.Series from features_by_dt["raw"].
+                       Must contain demand_zone_bottom / supply_zone_top.
+        sl_buffer_atr: Fraction of ATR to add beyond the zone boundary.
     """
+    result = calculate_stop_loss(
+        entry_price,
+        direction,
+        pd.DataFrame(),   # empty — only used when feature_row is None
+        feature_row=feature_row,
+    )
+    if result is not None:
+        return result
+    # Hard ATR fallback when zone boundaries are unavailable
     buffer = atr * sl_buffer_atr
-    if direction == "buy":
-        zone_low = feature_row.get("htf_demand_low") if feature_row is not None else None
-        base = zone_low if zone_low else entry_price
-        return base - buffer
-    else:
-        zone_high = feature_row.get("htf_supply_high") if feature_row is not None else None
-        base = zone_high if zone_high else entry_price
-        return base + buffer
+    return (entry_price - buffer) if direction == "buy" else (entry_price + buffer)

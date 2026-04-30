@@ -157,24 +157,28 @@ class ModelTrainer:
         self,
         X_test: np.ndarray,
         y_test: np.ndarray,
+        min_precision: float = 0.55,
     ) -> float:
         """
-        Scan thresholds from 0.05 to 0.50 and return the one that
-        maximises F1 on the minority class (winners).
+        Scan thresholds 0.05→0.50 and return the one that maximises F1
+        on the minority class (winners) subject to precision >= min_precision.
 
-        XGBoost's default threshold of 0.5 never fires for winners when
-        the training set is 98% losers — the model's winner probabilities
-        cluster between 0.05 and 0.30. This finds the sweet spot between
-        precision (not too many false alarms) and recall (catching real winners).
+        Why the precision floor matters:
+          Without it, F1 always peaks at the lowest threshold (0.05) because
+          recall dominates on a small test set. A threshold of 0.05 means the
+          confidence gate accepts almost every bar — 43-60 false positives for
+          every 46-77 true positives. In a backtest every false positive is a
+          losing trade, so raw F1 is the wrong objective.
+
+          With min_precision=0.55 we find the highest-F1 threshold that also
+          keeps precision above 55%, meaning at least 55% of predicted winners
+          are real winners. If no threshold qualifies, fall back to best F1
+          with a warning so training never crashes.
         """
-        probas     = self.model.predict_proba(X_test)[:, 1]
-        best_f1    = 0.0
-        best_thresh = 0.5
+        probas = self.model.predict_proba(X_test)[:, 1]
 
-        print("\n  Threshold scan (finding optimal confidence cutoff):")
-        print(f"  {'Threshold':>10} {'F1':>8} {'Precision':>10} {'Recall':>8} {'TP':>6} {'FP':>6}")
-        print("  " + "-" * 55)
-
+        # Two-pass: collect all rows, then pick winner
+        rows = []
         for thresh in np.arange(0.05, 0.51, 0.025):
             preds = (probas >= thresh).astype(int)
             f1    = f1_score(y_test, preds, pos_label=1, zero_division=0)
@@ -183,14 +187,34 @@ class ModelTrainer:
             fn    = int(np.sum((preds == 0) & (y_test == 1)))
             prec  = tp / max(tp + fp, 1)
             rec   = tp / max(tp + fn, 1)
-            marker = " ←" if f1 > best_f1 else ""
-            print(f"  {thresh:>10.3f} {f1:>8.4f} {prec:>10.4f} {rec:>8.4f} "
-                  f"{tp:>6} {fp:>6}{marker}")
-            if f1 > best_f1:
-                best_f1     = f1
-                best_thresh = float(thresh)
+            rows.append((float(thresh), f1, prec, rec, tp, fp))
 
-        print(f"\n  Optimal threshold: {best_thresh:.3f}  (F1={best_f1:.4f})")
+        # Best threshold: highest F1 among rows where precision >= floor
+        qualified = [(t, f, p, r, tp, fp) for t, f, p, r, tp, fp in rows
+                     if p >= min_precision]
+        fallback  = False
+        if not qualified:
+            qualified = rows   # drop precision constraint and warn
+            fallback  = True
+
+        best = max(qualified, key=lambda x: x[1])
+        best_thresh, best_f1 = best[0], best[1]
+
+        print("\n  Threshold scan (finding optimal confidence cutoff):")
+        print(f"  {'Threshold':>10} {'F1':>8} {'Precision':>10} {'Recall':>8} "
+              f"{'TP':>6} {'FP':>6}")
+        print("  " + "-" * 55)
+        for thresh, f1, prec, rec, tp, fp in rows:
+            qual_mark = "" if prec >= min_precision else " [low-prec]"
+            sel_mark  = " ←" if thresh == best_thresh else ""
+            print(f"  {thresh:>10.3f} {f1:>8.4f} {prec:>10.4f} {rec:>8.4f} "
+                  f"{tp:>6} {fp:>6}{qual_mark}{sel_mark}")
+
+        if fallback:
+            print(f"\n  WARNING: no threshold reached precision>={min_precision:.2f} "
+                  f"— falling back to best F1 (model may be undertrained)")
+        print(f"\n  Optimal threshold: {best_thresh:.3f}  "
+              f"(F1={best_f1:.4f}, precision floor={min_precision:.2f})")
         return best_thresh
 
     # ------------------------------------------------------------------
@@ -309,7 +333,22 @@ class ModelTrainer:
               f"(n_losers={int(np.sum(y_train_np==0)):,} / "
               f"n_winners={int(np.sum(y_train_np==1)):,})")
 
-        self._init_model(scale_pos_weight=spw)
+        # Auto-regularise for small datasets: deep trees memorise tiny datasets.
+        # < 1000 rows: depth 6 → 4, min_child_weight 3 → 5 (harder to split leaves).
+        # < 500 rows: depth 3, min_child_weight 7 (very conservative).
+        n_train = len(X_train_np)
+        adaptive_params: Dict[str, Any] = {}
+        if n_train < 500:
+            adaptive_params = {"max_depth": 3, "min_child_weight": 7, "gamma": 0.5}
+            print(f"\n  [auto-regularise] {n_train} train rows -> max_depth=3, "
+                  f"min_child_weight=7, gamma=0.5")
+        elif n_train < 1000:
+            adaptive_params = {"max_depth": 4, "min_child_weight": 5, "gamma": 0.2}
+            print(f"\n  [auto-regularise] {n_train} train rows -> max_depth=4, "
+                  f"min_child_weight=5, gamma=0.2")
+
+        self._init_model(params=adaptive_params if adaptive_params else None,
+                         scale_pos_weight=spw)
 
         sample_weight = self._compute_sample_weights(pd.Series(y_train_np))
 
