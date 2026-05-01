@@ -581,8 +581,8 @@ def run_backtest(
         zq = np.array(zq_values)
         above_zero = (zq > 0).sum()
         print(f"  Zone quality  | mean={zq.mean():.2f} min={zq.min():.2f} max={zq.max():.2f}")
-        print(f"  Bars in zone  | >0: {above_zero:,} | ≥2.0: {(zq>=2.0).sum():,} | "
-              f"≥3.0: {(zq>=3.0).sum():,} | ≥3.5: {(zq>=3.5).sum():,}")
+        print(f"  Bars in zone  | >0: {above_zero:,} | >=2.0: {(zq>=2.0).sum():,} | "
+              f">=3.0: {(zq>=3.0).sum():,} | >=3.5: {(zq>=3.5).sum():,}")
 
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(float(cash))
@@ -696,7 +696,7 @@ def main() -> None:
           f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
     print(f"Winrate:               {res.winrate_pct:.2f}%")
     print()
-    print("── Filter breakdown (bars rejected per gate) ──────────────")
+    print("-- Filter breakdown (bars rejected per gate) --")
 
     gate_counts = {
         "no_feature_row":    res.filtered_no_row,

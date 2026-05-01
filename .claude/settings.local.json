@@ -22,7 +22,9 @@
       "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_backtest.py tests/test_features.py -v)",
       "Bash(python -c ' *)",
       "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_backtest.py tests/test_features.py -q)",
-      "Bash(python -m models.trainer --timeframes 5min 15min)"
+      "Bash(python -m models.trainer --timeframes 5min 15min)",
+      "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_features.py -q)",
+      "Bash(python -m backtest.engine --timeframe 15min --cash 1000 --start-date 2024-11-08)"
     ]
   }
 }
