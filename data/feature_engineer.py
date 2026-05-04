@@ -673,6 +673,7 @@ def build_features(
         df["in_session"] = (
             (hour_s == 10) | (hour_s == 11) |
             ((hour_s == 12) & (minute_s < 30)) |
+            (hour_s == 13) | (hour_s == 14) |
             (hour_s == 16)
         ).astype(float)
     else:

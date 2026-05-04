@@ -48,6 +48,7 @@ TF_PARAMS = {
     # include_london_ny: H16 kept for 5min (wr=31.8%), dropped for 15min (wr=24.4%).
     # min_sl_atr: 15min zones <0.5 ATR get stopped out by noise (wr=12.8%).
     # max_rr: 15min RR>4 signals have wr=0-8% — cap prevents unreachable TPs.
+    # Session hours 13-14 (NY open) added globally via signal_generator._in_trading_session().
     "1min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
     "2min":  {"impulse_atr": 0.4, "max_bars": 40,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
     "3min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},

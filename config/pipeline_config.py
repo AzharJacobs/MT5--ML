@@ -10,6 +10,7 @@ Every other module imports from here. No hardcoded values elsewhere.
 # ---------------------------------------------------------------------------
 SESSION_HOURS_CORE = {10, 11}       # London open, always included
 SESSION_HOUR_12_MAX_MINUTE = 30     # Hour 12 included only up to :30
+SESSION_HOURS_NY_OPEN = {13, 14}    # NY open — high volume, added to expand signal count
 SESSION_HOUR_LONDON_NY = 16         # London/NY overlap (conditional per TF)
 
 # ---------------------------------------------------------------------------

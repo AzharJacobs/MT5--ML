@@ -153,6 +153,7 @@ class MLSignalStrategy(bt.Strategy):
         trail_dist_atr=1.0,
         trail_dist_pts=100.0,
         include_london_ny=True,   # match signal_generator: False for 15min, True for 5min
+        min_zone_quality=MIN_ZONE_QUALITY,
     )
 
     def __init__(self):
@@ -326,7 +327,7 @@ class MLSignalStrategy(bt.Strategy):
         zone_quality = row.get("zone_quality", float("nan"))
 
         # ── Gate 2: zone quality ────────────────────────────────────────
-        if not (isinstance(zone_quality, float) and zone_quality >= MIN_ZONE_QUALITY):
+        if not (isinstance(zone_quality, float) and zone_quality >= self.p.min_zone_quality):
             self._diag["zone_quality"] += 1
             return
 
@@ -496,6 +497,7 @@ def run_backtest(
     trail_dist_pts:     float = 100.0,
     include_london_ny:  bool  = True,
     model_dir:   str = MODEL_DIR,
+    min_zone_quality: float = MIN_ZONE_QUALITY,
 ) -> BacktestResult:
 
     db = get_connection()
@@ -605,6 +607,7 @@ def run_backtest(
         trail_dist_atr=float(trail_dist_atr),
         trail_dist_pts=float(trail_dist_pts),
         include_london_ny=bool(include_london_ny),
+        min_zone_quality=float(min_zone_quality),
     )
 
     start_value = cerebro.broker.getvalue()
@@ -662,6 +665,8 @@ def main() -> None:
     parser.add_argument("--no-london-ny",        dest="include_london_ny",
                         action="store_false", default=True,
                         help="Exclude London/NY overlap (H16). Use for 15min.")
+    parser.add_argument("--min-zone-quality",    type=float, default=MIN_ZONE_QUALITY,
+                        help=f"Minimum zone quality score to trade (default={MIN_ZONE_QUALITY})")
     args = parser.parse_args()
 
     res = run_backtest(
@@ -678,6 +683,7 @@ def main() -> None:
         trail_dist_pts=args.trail_dist_pts,
         include_london_ny=args.include_london_ny,
         model_dir=args.model_dir,
+        min_zone_quality=args.min_zone_quality,
     )
 
     print("\n" + "=" * 60)
@@ -701,7 +707,7 @@ def main() -> None:
     gate_counts = {
         "no_feature_row":    res.filtered_no_row,
         "session (inactive)": res.filtered_session,
-        f"zone_quality<{MIN_ZONE_QUALITY}": res.filtered_zone_quality,
+        f"zone_quality<{args.min_zone_quality}": res.filtered_zone_quality,
         "low_confidence":    res.filtered_confidence,
         "neutral_prediction": res.filtered_neutral,
         "bad_sltp_geometry": res.filtered_bad_sltp,
@@ -723,7 +729,7 @@ def main() -> None:
     GATE_WARN_THRESHOLD = 60.0
     GATE_SUGGESTIONS = {
         "no_feature_row":     "feature matrix timestamp alignment — check build_features() output",
-        f"zone_quality<{MIN_ZONE_QUALITY}": f"lower MIN_ZONE_QUALITY further in config/pipeline_config.py",
+        f"zone_quality<{args.min_zone_quality}": f"lower --min-zone-quality or MIN_ZONE_QUALITY in config/pipeline_config.py",
         "low_confidence":     "lower DEFAULT_CONFIDENCE_THRESHOLD or retrain model",
         "neutral_prediction": "more bars in both zones — check detect_zones() lookback",
         "bad_sltp_geometry":  "SL/TP calculation — check calculate_stop_loss/take_profit()",

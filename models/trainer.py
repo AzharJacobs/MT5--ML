@@ -206,7 +206,7 @@ class ModelTrainer:
         print("  " + "-" * 55)
         for thresh, f1, prec, rec, tp, fp in rows:
             qual_mark = "" if prec >= min_precision else " [low-prec]"
-            sel_mark  = " ←" if thresh == best_thresh else ""
+            sel_mark  = " <<" if thresh == best_thresh else ""
             print(f"  {thresh:>10.3f} {f1:>8.4f} {prec:>10.4f} {rec:>8.4f} "
                   f"{tp:>6} {fp:>6}{qual_mark}{sel_mark}")
 
@@ -449,8 +449,8 @@ class ModelTrainer:
         print(f"  Threshold used      : {threshold:.3f}")
         print(f"  Train Accuracy      : {train_acc:.4f}")
         print(f"  Test  Accuracy      : {test_acc:.4f}")
-        print(f"  F1 (winners/class1) : {f1_minority:.4f}  ← this is the real metric")
-        print(f"  Recall (winners)    : {recall_minority:.4f}  ← % of winners detected")
+        print(f"  F1 (winners/class1) : {f1_minority:.4f}  << this is the real metric")
+        print(f"  Recall (winners)    : {recall_minority:.4f}  << % of winners detected")
         print(f"\n  Classification Report (Test):")
         print(classification_report(y_test, y_pred_test, zero_division=0))
 
@@ -460,11 +460,11 @@ class ModelTrainer:
         if cm.shape == (2, 2):
             tn, fp, fn, tp = cm.ravel()
             print(f"\n  TN={tn} FP={fp} FN={fn} TP={tp}")
-            print(f"  → Correctly identified winners : {tp} / {tp+fn}")
-            print(f"  → False alarms (lose but predicted win): {fp}")
+            print(f"  Correctly identified winners : {tp} / {tp+fn}")
+            print(f"  False alarms (lose but predicted win): {fp}")
             if tp + fp > 0:
                 precision = tp / (tp + fp)
-                print(f"  → Precision (of predicted wins, % real): {precision:.1%}")
+                print(f"  Precision (of predicted wins, % real): {precision:.1%}")
 
         results: Dict[str, Any] = {
             "train_accuracy":   train_acc,
@@ -547,8 +547,8 @@ class ModelTrainer:
         meta_path  = os.path.join(model_dir, METADATA_FILE)
         joblib.dump(self.model, model_path)
         joblib.dump(self.metadata, meta_path)
-        print(f"\n  Model saved    → {model_path}")
-        print(f"  Metadata saved → {meta_path}")
+        print(f"\n  Model saved    : {model_path}")
+        print(f"  Metadata saved : {meta_path}")
         return model_path
 
     @staticmethod

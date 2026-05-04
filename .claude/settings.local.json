@@ -24,7 +24,16 @@
       "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_backtest.py tests/test_features.py -q)",
       "Bash(python -m models.trainer --timeframes 5min 15min)",
       "Bash(python -m pytest tests/test_strategy.py tests/test_risk.py tests/test_features.py -q)",
-      "Bash(python -m backtest.engine --timeframe 15min --cash 1000 --start-date 2024-11-08)"
+      "Bash(python -m backtest.engine --timeframe 15min --cash 1000 --start-date 2024-11-08)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(Sort-Object FullName)",
+      "PowerShell(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Recurse -Force | Select-Object FullName | ForEach-Object { $_.FullName } | Sort-Object)",
+      "PowerShell(Get-ChildItem -Path \"f:\\\\MT5-ML\" -Recurse -File -Exclude @\\(\".git\",\"__pycache__\",\".venv\"\\) | Where-Object {$_.Extension -in @\\(\".py\",\".md\",\".yaml\",\".yml\",\".json\",\".txt\"\\)} | Select-Object FullName | Sort-Object FullName | ForEach-Object { $_.FullName })",
+      "PowerShell(Get-ChildItem \"f:\\\\MT5-ML\" | Select-Object Name, @{N='Type';E={if \\($_.PSIsContainer\\) {'Directory'} else {'File'}}} | Format-Table -AutoSize)",
+      "PowerShell(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Exclude \".venv\", \".git\" -Recurse -File | Where-Object { $_.Extension -eq \".py\" } | ForEach-Object { $_.FullName })",
+      "PowerShell(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Exclude \".venv\", \".git\" -Recurse -File | Where-Object { $_.Extension -eq \".py\" } | ForEach-Object { $_.FullName } | Select-String -NotMatch '\\\\.venv')",
+      "Bash(.venv\\\\Scripts\\\\pip install *)"
     ]
   }
 }

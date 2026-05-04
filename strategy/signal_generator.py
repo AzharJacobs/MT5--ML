@@ -116,8 +116,9 @@ def generate_labels(
             except Exception:
                 minute = 0
         asia_london = (hour == 10) or (hour == 11) or (hour == 12 and minute < 30)
+        ny_open     = (hour == 13) or (hour == 14)
         london_ny   = include_london_ny and (hour == 16)
-        return asia_london or london_ny
+        return asia_london or ny_open or london_ny
 
     for i in range(n - max_bars):
         row   = df.iloc[i]
