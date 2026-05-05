@@ -33,7 +33,12 @@
       "PowerShell(Get-ChildItem \"f:\\\\MT5-ML\" | Select-Object Name, @{N='Type';E={if \\($_.PSIsContainer\\) {'Directory'} else {'File'}}} | Format-Table -AutoSize)",
       "PowerShell(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Exclude \".venv\", \".git\" -Recurse -File | Where-Object { $_.Extension -eq \".py\" } | ForEach-Object { $_.FullName })",
       "PowerShell(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Exclude \".venv\", \".git\" -Recurse -File | Where-Object { $_.Extension -eq \".py\" } | ForEach-Object { $_.FullName } | Select-String -NotMatch '\\\\.venv')",
-      "Bash(.venv\\\\Scripts\\\\pip install *)"
+      "Bash(.venv\\\\Scripts\\\\pip install *)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -File)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Name)",
+      "Bash(xargs grep *)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Recurse -File -Name)",
+      "Bash(Select-Object -First 50)"
     ]
   }
 }

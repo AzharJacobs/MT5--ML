@@ -35,7 +35,7 @@ from strategy.signal_generator import generate_labels
 
 
 TIMEFRAMES_TO_TEST = ["5min", "15min"]
-SYMBOL             = "USTECm"
+SYMBOL             = "XAUUSDm"
 DATE_FROM          = "2024-11-08"   # earliest date with 5min data
 DATE_TO            = "2025-06-30"
 
@@ -47,11 +47,10 @@ WARN = "[WARN]"
 def load_raw(db, symbol, timeframe, date_from, date_to):
     query = """
         SELECT *
-        FROM ustech_verified
+        FROM xauusd_ohlcv
         WHERE symbol = %(symbol)s
           AND timeframe = %(tf)s
           AND date BETWEEN %(from)s AND %(to)s
-          AND is_verified = TRUE
         ORDER BY timestamp ASC
     """
     df = db.fetch_dataframe(query, {
@@ -67,11 +66,10 @@ def load_htf_context(db, symbol, date_from, date_to):
     for tf in ["1H", "4H"]:
         query = """
             SELECT *
-            FROM ustech_verified
+            FROM xauusd_ohlcv
             WHERE symbol = %(symbol)s
               AND timeframe = %(tf)s
               AND date BETWEEN %(from)s AND %(to)s
-              AND is_verified = TRUE
             ORDER BY timestamp ASC
         """
         df = db.fetch_dataframe(query, {

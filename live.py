@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py - Main Entry Point for USTech ML Engine
+main.py - Main Entry Point for Gold (XAUUSDm) ML Engine
 =================================================
 
 This script runs all components of the ML engine in the correct order:
@@ -314,7 +314,7 @@ Select an option:
 def main():
     """Main entry point with argument parsing."""
     parser = argparse.ArgumentParser(
-        description="USTech ML Engine - Machine Learning for trading predictions",
+        description="Gold (XAUUSDm) ML Engine - Machine Learning for trading predictions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

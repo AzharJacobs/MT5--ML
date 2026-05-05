@@ -84,8 +84,8 @@ class DataPreparator:
             SELECT timestamp, open, high, low, close, volume,
                    hour, day_of_week, month, year, session,
                    candle_size, body_size, wick_upper, wick_lower
-            FROM ustech_verified
-            WHERE is_verified = TRUE AND symbol = %s AND timeframe = %s
+            FROM xauusd_ohlcv
+            WHERE symbol = %s AND timeframe = %s
             ORDER BY timestamp ASC
         """
         df = self._db.fetch_dataframe(query, (symbol, timeframe))
@@ -154,7 +154,7 @@ class DataPreparator:
         timeframes: List[str] = None,
         start_date: str = None,
         end_date:   str = None,
-        symbol:     str = "USTECm",
+        symbol:     str = "XAUUSDm",
         test_size:  float = 0.2,
     ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
 
@@ -301,7 +301,7 @@ def prepare_data(
     timeframes: List[str] = None,
     start_date: str = None,
     end_date:   str = None,
-    symbol:     str = "USTECm",
+    symbol:     str = "XAUUSDm",
 ):
     prep = DataPreparator()
     return prep.prepare_data(timeframes, start_date, end_date, symbol)

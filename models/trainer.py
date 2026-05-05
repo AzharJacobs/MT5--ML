@@ -75,7 +75,7 @@ logging.basicConfig(
 )
 
 MODEL_DIR     = "experiments/runs"
-MODEL_FILE    = "ustech_ml_model.joblib"
+MODEL_FILE    = "gold_ml_model.joblib"
 METADATA_FILE = "model_metadata.joblib"
 
 SMOTE_RATIO = 0.4
@@ -272,7 +272,7 @@ class ModelTrainer:
         timeframes: List[str] = None,
         start_date: str = None,
         end_date:   str = None,
-        symbol:     str = "USTECm",
+        symbol:     str = "XAUUSDm",
         tune:       bool = False,
         tune_trials: int = 50,
         use_smote:  bool = True,
@@ -572,7 +572,7 @@ def main():
     parser.add_argument("--timeframes",  nargs="+", default=["5min", "15min"])
     parser.add_argument("--start-date",  default=None)
     parser.add_argument("--end-date",    default=None)
-    parser.add_argument("--symbol",      default="USTECm")
+    parser.add_argument("--symbol",      default="XAUUSDm")
     parser.add_argument("--model-type",  default="xgboost",
                         choices=["xgboost", "catboost"])
     parser.add_argument("--tune",        action="store_true")

@@ -93,8 +93,8 @@ class Predictor:
             # Get last N candles for feature calculation
             lookback = LOOKBACK_PERIODS + 1
             query = """
-                SELECT * FROM ustech_verified
-                WHERE is_verified = TRUE AND timeframe = %s
+                SELECT * FROM xauusd_ohlcv
+                WHERE timeframe = %s
                 ORDER BY timestamp DESC
                 LIMIT %s
             """

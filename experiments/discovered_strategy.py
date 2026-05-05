@@ -28,8 +28,8 @@ def load_data():
         SELECT timeframe, timestamp, open, high, low, close, volume,
                hour, day_of_week, month, year,
                candle_size, body_size, wick_upper, wick_lower, direction
-        FROM ustech_verified
-        WHERE is_verified = TRUE
+        FROM xauusd_ohlcv
+        WHERE 1=1
         ORDER BY timeframe, timestamp ASC
     """
     db.cursor.execute(query)

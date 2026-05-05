@@ -31,7 +31,7 @@ from data.feature_engineer import build_features
 from data.pipeline import TF_PARAMS, LTF_TIMEFRAMES
 from strategy.signal_generator import generate_labels
 
-SYMBOL    = "USTECm"
+SYMBOL    = "XAUUSDm"
 DATE_FROM = "2024-11-08"
 DATE_TO   = "2025-06-30"
 TIMEFRAME = "15min"
@@ -51,10 +51,9 @@ def load_and_label():
 
     def fetch(tf, d_from, d_to):
         q = """
-            SELECT * FROM ustech_verified
+            SELECT * FROM xauusd_ohlcv
             WHERE symbol=%(s)s AND timeframe=%(tf)s
               AND date BETWEEN %(f)s AND %(t)s
-              AND is_verified=TRUE
             ORDER BY timestamp ASC
         """
         return db.fetch_dataframe(q, {"s": SYMBOL, "tf": tf, "f": d_from, "t": d_to})

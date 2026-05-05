@@ -149,9 +149,9 @@ class MLSignalStrategy(bt.Strategy):
         confidence=0.52,
         stake=0.15,
         use_pct_stake=True,
-        trail_trigger_pts=100.0,
+        trail_trigger_pts=1500.0,
         trail_dist_atr=1.0,
-        trail_dist_pts=100.0,
+        trail_dist_pts=1000.0,
         include_london_ny=True,   # match signal_generator: False for 15min, True for 5min
         min_zone_quality=MIN_ZONE_QUALITY,
     )
@@ -492,9 +492,9 @@ def run_backtest(
     use_pct_stake: bool,
     confidence:  float,
     commission:  float,
-    trail_trigger_pts:  float = 100.0,
+    trail_trigger_pts:  float = 1500.0,
     trail_dist_atr:     float = 1.0,
-    trail_dist_pts:     float = 100.0,
+    trail_dist_pts:     float = 1000.0,
     include_london_ny:  bool  = True,
     model_dir:   str = MODEL_DIR,
     min_zone_quality: float = MIN_ZONE_QUALITY,
@@ -504,7 +504,7 @@ def run_backtest(
     if not db.connect():
         raise ConnectionError("Failed to connect to database")
 
-    query  = "SELECT * FROM ustech_verified WHERE is_verified = TRUE AND timeframe = %s"
+    query  = "SELECT * FROM xauusd_ohlcv WHERE timeframe = %s"
     params = [timeframe]
     if start_date:
         query  += " AND date >= %s"; params.append(start_date)
@@ -658,9 +658,9 @@ def main() -> None:
     parser.add_argument("--no-pct-stake",       dest="use_pct_stake", action="store_false")
     parser.add_argument("--confidence",         type=float, default=0.52)
     parser.add_argument("--commission",         type=float, default=0.0)
-    parser.add_argument("--trail-trigger-pts",  type=float, default=100.0)
+    parser.add_argument("--trail-trigger-pts",  type=float, default=1500.0)
     parser.add_argument("--trail-dist-atr",     type=float, default=1.0)
-    parser.add_argument("--trail-dist-pts",     type=float, default=100.0)
+    parser.add_argument("--trail-dist-pts",     type=float, default=1000.0)
     parser.add_argument("--model-dir",          default=MODEL_DIR)
     parser.add_argument("--no-london-ny",        dest="include_london_ny",
                         action="store_false", default=True,

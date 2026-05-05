@@ -1,4 +1,4 @@
-USTech ML Engine
+Gold (XAUUSDm) ML Engine
 A complete Machine Learning engine for predicting trading directions using historical OHLCV data from PostgreSQL. This engine connects directly to your database, learns from historical patterns, incorporates your personal trading strategy, and predicts the direction of the next candle.
 
 Features
@@ -10,7 +10,7 @@ Flexible Queries: Answer questions like "How many buy candles in February 2025?"
 Model Persistence: Save trained models to avoid retraining every time
 Retraining Support: Easily retrain when strategy or data changes
 Project Structure
-ustech_ml/
+gold_ml/
 ├── .env                # Database credentials (configure this!)
 ├── requirements.txt    # Python dependencies
 ├── README.md           # This documentation
@@ -21,11 +21,11 @@ ustech_ml/
 ├── predict.py          # Load model and make predictions
 ├── main.py             # Main entry point (run this!)
 └── models/             # Saved model files (created automatically)
-    ├── ustech_ml_model.joblib
+    ├── gold_ml_model.joblib
     └── model_metadata.joblib
 Installation
 1. Install Python Dependencies
-cd ustech_ml
+cd gold_ml
 
 pip install -r requirements.txt
 Or using pip3:
@@ -36,7 +36,7 @@ Edit the .env file with your PostgreSQL credentials:
 
 DB_HOST=localhost
 DB_PORT=5432
-DB_NAME=ustech_data
+DB_NAME=xauusd_ohlcv
 DB_USER=postgres
 DB_PASSWORD=your_password_here
 3. Verify Database Connection
@@ -292,7 +292,7 @@ No Data Found
 No data found for timeframe 1min
 Solution: Verify data exists in database:
 
-SELECT COUNT(*) FROM ustech_ohlcv WHERE timeframe = '1min';
+SELECT COUNT(*) FROM xauusd_ohlcv WHERE timeframe = '1min';
 Model Not Found
 No trained model found. Please train a model first.
 Solution: Train a model first:
@@ -307,7 +307,7 @@ Fix any syntax errors
 Database Schema Expected
 The ML engine expects this table structure:
 
-CREATE TABLE ustech_ohlcv (
+CREATE TABLE xauusd_ohlcv (
 
     id SERIAL PRIMARY KEY,
 
