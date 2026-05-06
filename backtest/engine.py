@@ -88,7 +88,8 @@ def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]
 def _build_feature_matrix_for_timeframe(
     df: pd.DataFrame,
     timeframe: str,
-    metadata_bundle: Dict[str, Any]
+    metadata_bundle: Dict[str, Any],
+    include_london_ny: bool = True,
 ) -> pd.DataFrame:
     from data.feature_engineer import build_features
 
@@ -101,7 +102,7 @@ def _build_feature_matrix_for_timeframe(
         raise ValueError("Saved feature_columns not found in model metadata. Retrain first.")
 
     data = df.copy()
-    data = build_features(data)
+    data = build_features(data, include_london_ny=include_london_ny)
 
     if "direction" in data.columns:
         data = data.drop(columns=["direction"])
@@ -524,13 +525,18 @@ def run_backtest(
 
     model, metadata_bundle = _load_model_bundle(model_dir=model_dir)
 
+    # Auto-detect: 15min model was trained with H16 (London/NY overlap) excluded (WR=24%)
+    if timeframe == "15min" and include_london_ny:
+        include_london_ny = False
+        print("  [auto] 15min: forcing include_london_ny=False (H16 excluded at training)")
+
     # Use optimal threshold saved during training if confidence not overridden
     saved_threshold = float(metadata_bundle.get("optimal_threshold", confidence))
     if confidence == 0.52:  # default — use saved threshold
         confidence = saved_threshold
         print(f"  Using saved optimal threshold: {confidence:.3f}")
 
-    X_scaled = _build_feature_matrix_for_timeframe(df, timeframe, metadata_bundle)
+    X_scaled = _build_feature_matrix_for_timeframe(df, timeframe, metadata_bundle, include_london_ny=include_london_ny)
 
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]
 
@@ -548,7 +554,7 @@ def run_backtest(
     # Overlay raw (unscaled) zone values and zone quality
     try:
         from data.feature_engineer import build_features as _bf
-        _raw_feat = _bf(df.copy())
+        _raw_feat = _bf(df.copy(), include_london_ny=include_london_ny)
 
         if "timestamp" in _raw_feat.columns:
             _raw_feat["timestamp"] = pd.to_datetime(_raw_feat["timestamp"])

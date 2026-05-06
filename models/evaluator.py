@@ -90,8 +90,8 @@ class Predictor:
             if not self.db.connect():
                 raise ConnectionError("Failed to connect to database")
 
-            # Get last N candles for feature calculation
-            lookback = LOOKBACK_PERIODS + 1
+            # Need enough bars for build_features() warmup (200+ bars)
+            lookback = max(LOOKBACK_PERIODS + 1, 250)
             query = """
                 SELECT * FROM xauusd_ohlcv
                 WHERE timeframe = %s
@@ -105,17 +105,19 @@ class Predictor:
 
             # Reverse to chronological order
             latest_data = latest_data.iloc[::-1].reset_index(drop=True)
-            current_candle = latest_data.iloc[-1]
-            lookback_data = latest_data.iloc[:-1] if len(latest_data) > 1 else None
         else:
-            current_candle = custom_data
-            lookback_data = None
+            if not isinstance(custom_data, pd.DataFrame):
+                raise TypeError("custom_data must be a DataFrame with >= 250 rows of OHLCV data.")
+            latest_data = custom_data.reset_index(drop=True)
+
+        current_candle = latest_data.iloc[-1]
+        lookback_data  = latest_data.iloc[:-1] if len(latest_data) > 1 else None
 
         # Apply strategy signal
         strategy_signal = apply_strategy(current_candle, lookback_data)
 
-        # Prepare features
-        features = self._prepare_features(current_candle, lookback_data, timeframe)
+        # Prepare features using same pipeline as training/engine
+        features = self._prepare_features(latest_data, timeframe)
 
         # Make prediction
         prediction = self.model.predict(features)[0]
@@ -155,117 +157,41 @@ class Predictor:
 
     def _prepare_features(
         self,
-        current_candle: pd.Series,
-        lookback_data: pd.DataFrame,
-        timeframe: str
+        raw_df: pd.DataFrame,
+        timeframe: str,
     ) -> pd.DataFrame:
         """
-        Prepare features for a single prediction.
+        Build the feature vector for the latest candle using the same
+        build_features() pipeline as training and engine.py.
 
         Args:
-            current_candle: Current candle data
-            lookback_data: Previous candles for lagged features
-            timeframe: Timeframe string
+            raw_df: Raw OHLCV DataFrame (chronological, enough bars for warmup)
+            timeframe: Timeframe string — used to auto-detect include_london_ny
 
         Returns:
-            Feature DataFrame ready for prediction
+            Scaled feature DataFrame (1 row) ready for model.predict()
         """
-        # IMPORTANT (no lookahead):
-        # The model is trained on lag-only features. For a prediction at time t, we use
-        # candle features from t-1 (the most recent completed candle in lookback_data).
-        if lookback_data is None or len(lookback_data) < 1:
-            raise ValueError("Not enough lookback data to build lagged features (need >= 1 candle).")
+        from data.feature_engineer import build_features
 
-        prev_candle = lookback_data.iloc[-1]
+        # Mirror the 15min training condition: H16 excluded
+        include_london_ny = (timeframe != "15min")
 
-        candle_size = prev_candle.get('candle_size', prev_candle['high'] - prev_candle['low'])
-        body_size = prev_candle.get('body_size', abs(prev_candle['close'] - prev_candle['open']))
+        feat_df = build_features(raw_df, include_london_ny=include_london_ny)
+        if feat_df.empty:
+            raise ValueError("build_features() returned an empty DataFrame — need more warmup bars.")
 
-        features = {
-            # Non-lag features used in training
-            'timeframe_encoded': 0,  # set below
-        }
+        last_row = feat_df.iloc[[-1]].copy()
 
-        # Timeframe encoding
-        try:
-            features['timeframe_encoded'] = self.timeframe_encoder.transform([timeframe])[0]
-        except:
-            features['timeframe_encoded'] = 0
-
-        # Strategy signal (computed at t using current candle + past lookback), but we store it as lagged inputs
-        # by sourcing it from the previous candle's perspective.
-        signal_map = {'buy': 1, 'sell': -1, 'neutral': 0}
-
-        # Build lagged features exactly like training: *_lag{lag}
-        max_lag_needed = 0
+        # Align to the exact columns the model was trained on
         for col in self.feature_columns:
-            if "_lag" in col:
-                try:
-                    lag_n = int(col.split("_lag")[-1])
-                    max_lag_needed = max(max_lag_needed, lag_n)
-                except Exception:
-                    continue
+            if col not in last_row.columns:
+                last_row[col] = 0.0
+        feature_df = last_row[self.feature_columns].fillna(0)
 
-        max_lag = max(1, min(max_lag_needed or LOOKBACK_PERIODS, len(lookback_data)))
-
-        for lag in range(1, max_lag + 1):
-            prev = lookback_data.iloc[-lag]
-            prev_candle_size = prev.get('candle_size', prev['high'] - prev['low'])
-            prev_body_size = prev.get('body_size', abs(prev['close'] - prev['open']))
-            prev_open = float(prev['open']) if float(prev['open']) != 0 else 1.0
-
-            # Candle/shape
-            features[f'candle_size_lag{lag}'] = float(prev_candle_size)
-            features[f'body_size_lag{lag}'] = float(prev_body_size)
-            features[f'wick_upper_lag{lag}'] = float(prev.get('wick_upper', 0))
-            features[f'wick_lower_lag{lag}'] = float(prev.get('wick_lower', 0))
-
-            # Price/ratios
-            features[f'price_change_pct_lag{lag}'] = float((prev['close'] - prev['open']) / prev_open * 100)
-            features[f'body_to_range_ratio_lag{lag}'] = float(prev_body_size / prev_candle_size) if prev_candle_size > 0 else 0.0
-            features[f'upper_wick_ratio_lag{lag}'] = float(prev.get('wick_upper', 0) / prev_candle_size) if prev_candle_size > 0 else 0.0
-            features[f'lower_wick_ratio_lag{lag}'] = float(prev.get('wick_lower', 0) / prev_candle_size) if prev_candle_size > 0 else 0.0
-
-            # Volume normalization using history strictly before that candle
-            hist = lookback_data.iloc[:len(lookback_data) - lag]
-            vol_norm = 0.0
-            if hist is not None and len(hist) > 10:
-                vol_mean = float(hist['volume'].mean())
-                vol_std = float(hist['volume'].std())
-                if vol_std > 0:
-                    vol_norm = float((prev.get('volume', 0) - vol_mean) / vol_std)
-            features[f'volume_normalized_lag{lag}'] = vol_norm
-
-            # Time cyclical (based on candle timestamp fields, lagged)
-            features[f'hour_sin_lag{lag}'] = float(np.sin(2 * np.pi * prev.get('hour', 0) / 24))
-            features[f'hour_cos_lag{lag}'] = float(np.cos(2 * np.pi * prev.get('hour', 0) / 24))
-            features[f'day_sin_lag{lag}'] = float(np.sin(2 * np.pi * prev.get('day_of_week', 0) / 7))
-            features[f'day_cos_lag{lag}'] = float(np.cos(2 * np.pi * prev.get('day_of_week', 0) / 7))
-            features[f'month_sin_lag{lag}'] = float(np.sin(2 * np.pi * prev.get('month', 1) / 12))
-            features[f'month_cos_lag{lag}'] = float(np.cos(2 * np.pi * prev.get('month', 1) / 12))
-
-            # Strategy signal encoded, lagged (compute using the candle at that lag as "current")
-            # and candles before it as lookback.
-            prev_lb = lookback_data.iloc[:len(lookback_data) - lag]
-            sig = apply_strategy(prev, prev_lb if len(prev_lb) > 0 else None)
-            features[f'strategy_signal_encoded_lag{lag}'] = signal_map.get(sig, 0)
-
-        # Create DataFrame with correct column order
-        feature_df = pd.DataFrame([features])
-
-        # Ensure all required columns exist (fill missing with 0)
-        for col in self.feature_columns:
-            if col not in feature_df.columns:
-                feature_df[col] = 0
-
-        # Select only the columns the model expects
-        feature_df = feature_df[self.feature_columns]
-
-        # Scale features
         if self.scaler is not None:
             feature_df = pd.DataFrame(
                 self.scaler.transform(feature_df),
-                columns=self.feature_columns
+                columns=self.feature_columns,
             )
 
         return feature_df

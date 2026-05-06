@@ -646,6 +646,7 @@ def build_features(
     h4_df: pd.DataFrame = None,
     zone_lookback: int = 30,
     impulse_atr_multiplier: float = 0.5,
+    include_london_ny: bool = True,
 ) -> pd.DataFrame:
     logger.info(f"Building features for {len(df)} rows...")
 
@@ -662,22 +663,33 @@ def build_features(
     df = add_strategy_rules(df)
 
     # in_session: 1 if bar falls in the trading session used for label generation.
-    # Kept as a raw feature so the model learns session importance itself rather
-    # than having it enforced as a hard gate at execution time.
+    # session_id: 1=London open, 2=NY open, 3=London/NY overlap, 0=off.
+    # include_london_ny controls whether H16 is counted as in-session —
+    # 15min model was trained with H16 excluded (WR=24% there).
     if "hour" in df.columns:
         hour_s = df["hour"].fillna(-1).astype(float)
         if "timestamp" in df.columns:
             minute_s = pd.to_datetime(df["timestamp"]).dt.minute
         else:
             minute_s = pd.Series(0, index=df.index)
-        df["in_session"] = (
-            (hour_s == 10) | (hour_s == 11) |
-            ((hour_s == 12) & (minute_s < 30)) |
-            (hour_s == 13) | (hour_s == 14) |
-            (hour_s == 16)
+
+        london_open_mask = (hour_s == 10) | (hour_s == 11) | ((hour_s == 12) & (minute_s < 30))
+        ny_open_mask     = (hour_s == 13) | (hour_s == 14)
+        overlap_mask     = (hour_s == 16)
+
+        session_mask = london_open_mask | ny_open_mask
+        if include_london_ny:
+            session_mask = session_mask | overlap_mask
+        df["in_session"] = session_mask.astype(float)
+
+        df["session_id"] = np.where(
+            london_open_mask, 1.0,
+            np.where(ny_open_mask, 2.0,
+            np.where(overlap_mask & include_london_ny, 3.0, 0.0))
         ).astype(float)
     else:
         df["in_session"] = 0.0
+        df["session_id"] = 0.0
 
     warmup = max(200, zone_lookback)
     df = df.iloc[warmup:].reset_index(drop=True)

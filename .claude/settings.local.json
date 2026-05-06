@@ -38,7 +38,8 @@
       "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Name)",
       "Bash(xargs grep *)",
       "Bash(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Recurse -File -Name)",
-      "Bash(Select-Object -First 50)"
+      "Bash(Select-Object -First 50)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Include \"*.py\")"
     ]
   }
 }

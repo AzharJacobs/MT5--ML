@@ -55,7 +55,7 @@ TF_PARAMS = {
     "4min":  {"impulse_atr": 0.4, "max_bars": 50,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
     "5min":  {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
     "10min": {"impulse_atr": 0.5, "max_bars": 60,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
-    "15min": {"impulse_atr": 0.5, "max_bars": 80,  "min_rr": 1.2, "max_rr": 4.0,  "use_midline_tp": True,  "min_sl_atr": 0.5, "include_london_ny": False},
+    "15min": {"impulse_atr": 0.3, "max_bars": 80,  "min_rr": 1.2, "max_rr": 4.0,  "use_midline_tp": True,  "min_sl_atr": 0.3, "include_london_ny": False},
     "30min": {"impulse_atr": 0.6, "max_bars": 80,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
     "1H":    {"impulse_atr": 0.6, "max_bars": 120, "min_rr": 1.2, "max_rr": None, "use_midline_tp": True,  "min_sl_atr": 0.0, "include_london_ny": True},
     "4H":    {"impulse_atr": 0.7, "max_bars": 60,  "min_rr": 1.2, "max_rr": None, "use_midline_tp": False, "min_sl_atr": 0.0, "include_london_ny": True},

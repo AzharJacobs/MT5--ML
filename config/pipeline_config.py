@@ -96,4 +96,7 @@ REQUIRED_FEATURE_COLUMNS = [
 
     # ── Session feature (model learns session importance itself) ──────────
     "in_session",
+
+    # ── Session identity (1=London open, 2=NY open, 3=overlap, 0=off) ────
+    "session_id",
 ]
