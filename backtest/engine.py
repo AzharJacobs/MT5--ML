@@ -32,7 +32,7 @@ PREVIOUS CHANGES:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -78,6 +78,19 @@ class BacktestResult:
     filtered_confidence: int
     filtered_neutral: int
     filtered_bad_sltp: int
+    # Extended P&L fields
+    start_cash: float = 10000.0
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    largest_win: float = 0.0
+    largest_loss: float = 0.0
+    buy_trades: int = 0
+    buy_wins: int = 0
+    sell_trades: int = 0
+    sell_wins: int = 0
+    monthly_pnl: tuple = ()   # ((year, month, pnl_dollars), ...)
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -90,6 +103,7 @@ def _build_feature_matrix_for_timeframe(
     timeframe: str,
     metadata_bundle: Dict[str, Any],
     include_london_ny: bool = True,
+    impulse_atr_multiplier: float = 0.5,
 ) -> pd.DataFrame:
     from data.feature_engineer import build_features
 
@@ -102,7 +116,8 @@ def _build_feature_matrix_for_timeframe(
         raise ValueError("Saved feature_columns not found in model metadata. Retrain first.")
 
     data = df.copy()
-    data = build_features(data, include_london_ny=include_london_ny)
+    data = build_features(data, include_london_ny=include_london_ny,
+                          impulse_atr_multiplier=impulse_atr_multiplier)
 
     if "direction" in data.columns:
         data = data.drop(columns=["direction"])
@@ -177,6 +192,8 @@ class MLSignalStrategy(bt.Strategy):
         self._best_price: Optional[float]  = None
         self._entry_atr: Optional[float]   = None
 
+        self._trade_log: list = []   # [{date, side, pnl, entry_price, size}, ...]
+
         # Diagnostic counters — tells you exactly which gate kills most bars
         self._diag = {
             "no_row":       0,  # bar has no feature row (warmup or timestamp mismatch)
@@ -199,6 +216,16 @@ class MLSignalStrategy(bt.Strategy):
             return
         if not trade.isclosed:
             return
+
+        # Capture before resetting state
+        self._trade_log.append({
+            "date":        self.data.datetime.datetime(0),
+            "side":        self._side,
+            "pnl":         float(trade.pnlcomm),
+            "entry_price": float(self._entry_price) if self._entry_price else 0.0,
+            "size":        float(abs(trade.size)),
+        })
+
         self._open_position_count = max(0, self._open_position_count - 1)
         self._trade_count   += 1
         self._in_trade       = False
@@ -481,6 +508,8 @@ class MLSignalStrategy(bt.Strategy):
     def trail_activations(self)     -> int:  return self._trail_activations
     @property
     def diag(self)                  -> dict: return self._diag
+    @property
+    def trade_log(self)             -> list: return self._trade_log
 
 
 # ======================================================================
@@ -525,6 +554,17 @@ def run_backtest(
 
     model, metadata_bundle = _load_model_bundle(model_dir=model_dir)
 
+    # Read per-TF build params saved at training time so backtest matches training exactly
+    _tf_bp = metadata_bundle.get("tf_build_params", {}).get(timeframe, {})
+    if _tf_bp:
+        saved_impulse_atr    = float(_tf_bp.get("impulse_atr_multiplier", 0.5))
+        saved_include_london = bool(_tf_bp.get("include_london_ny", include_london_ny))
+        if saved_include_london != include_london_ny:
+            print(f"  [meta] include_london_ny overridden by saved metadata: {saved_include_london}")
+            include_london_ny = saved_include_london
+    else:
+        saved_impulse_atr = 0.5
+
     # Auto-detect: 15min model was trained with H16 (London/NY overlap) excluded (WR=24%)
     if timeframe == "15min" and include_london_ny:
         include_london_ny = False
@@ -536,7 +576,9 @@ def run_backtest(
         confidence = saved_threshold
         print(f"  Using saved optimal threshold: {confidence:.3f}")
 
-    X_scaled = _build_feature_matrix_for_timeframe(df, timeframe, metadata_bundle, include_london_ny=include_london_ny)
+    X_scaled = _build_feature_matrix_for_timeframe(df, timeframe, metadata_bundle,
+                                                    include_london_ny=include_london_ny,
+                                                    impulse_atr_multiplier=saved_impulse_atr)
 
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]
 
@@ -554,7 +596,8 @@ def run_backtest(
     # Overlay raw (unscaled) zone values and zone quality
     try:
         from data.feature_engineer import build_features as _bf
-        _raw_feat = _bf(df.copy(), include_london_ny=include_london_ny)
+        _raw_feat = _bf(df.copy(), include_london_ny=include_london_ny,
+                        impulse_atr_multiplier=saved_impulse_atr)
 
         if "timestamp" in _raw_feat.columns:
             _raw_feat["timestamp"] = pd.to_datetime(_raw_feat["timestamp"])
@@ -599,7 +642,9 @@ def run_backtest(
         cerebro.addsizer(bt.sizers.FixedSize, stake=float(stake))
 
     cerebro.adddata(bt.feeds.PandasData(dataname=df_bt))
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name="dd")
+    cerebro.addanalyzer(bt.analyzers.DrawDown,   _name="dd")
+    cerebro.addanalyzer(bt.analyzers.TimeReturn,
+                        timeframe=bt.TimeFrame.Months, _name="monthly")
 
     MLSignalStrategy.model          = model
     MLSignalStrategy.features_by_dt = features_by_dt
@@ -632,6 +677,32 @@ def run_backtest(
     trail_acts  = int(getattr(strat_inst, "trail_activations", 0))
     winrate     = (wins / trades * 100.0) if trades > 0 else 0.0
     diag        = getattr(strat_inst, "diag", {})
+    trade_log   = getattr(strat_inst, "trade_log", [])
+
+    # Extended P&L stats from trade log
+    win_pnls  = [t["pnl"] for t in trade_log if t["pnl"] > 0]
+    loss_pnls = [t["pnl"] for t in trade_log if t["pnl"] <= 0]
+    buy_log   = [t for t in trade_log if t.get("side") == "buy"]
+    sell_log  = [t for t in trade_log if t.get("side") == "sell"]
+
+    gross_profit = sum(win_pnls)
+    gross_loss   = sum(loss_pnls)
+    avg_win      = float(np.mean(win_pnls))  if win_pnls  else 0.0
+    avg_loss     = float(np.mean(loss_pnls)) if loss_pnls else 0.0
+    largest_win  = float(max(win_pnls))      if win_pnls  else 0.0
+    largest_loss = float(min(loss_pnls))     if loss_pnls else 0.0
+    buy_wins_n   = sum(1 for t in buy_log  if t["pnl"] > 0)
+    sell_wins_n  = sum(1 for t in sell_log if t["pnl"] > 0)
+
+    # Monthly P&L from TimeReturn analyzer (returns → dollar P&L)
+    monthly_ret  = strat_inst.analyzers.monthly.get_analysis()
+    running_val  = float(start_value)
+    monthly_pnl_list = []
+    for dt_key in sorted(monthly_ret.keys()):
+        ret = float(monthly_ret[dt_key])
+        month_pnl = running_val * ret
+        running_val *= (1 + ret)
+        monthly_pnl_list.append((dt_key.year, dt_key.month, round(month_pnl, 2)))
 
     return BacktestResult(
         final_value=float(end_value),
@@ -649,6 +720,18 @@ def run_backtest(
         filtered_confidence=diag.get("confidence", 0),
         filtered_neutral=diag.get("neutral", 0),
         filtered_bad_sltp=diag.get("bad_sltp", 0),
+        start_cash=float(start_value),
+        gross_profit=round(gross_profit, 2),
+        gross_loss=round(gross_loss, 2),
+        avg_win=round(avg_win, 2),
+        avg_loss=round(avg_loss, 2),
+        largest_win=round(largest_win, 2),
+        largest_loss=round(largest_loss, 2),
+        buy_trades=len(buy_log),
+        buy_wins=buy_wins_n,
+        sell_trades=len(sell_log),
+        sell_wins=sell_wins_n,
+        monthly_pnl=tuple(monthly_pnl_list),
     )
 
 
@@ -692,23 +775,71 @@ def main() -> None:
         min_zone_quality=args.min_zone_quality,
     )
 
-    print("\n" + "=" * 60)
-    print("BACKTEST RESULTS (Backtrader)")
-    print("=" * 60)
-    print(f"Timeframe:             {args.timeframe}")
-    print(f"Date range:            {args.start_date or 'ALL'} -> {args.end_date or 'ALL'}")
-    print(f"Final portfolio value: {res.final_value:,.2f}")
-    print(f"PnL:                   {res.pnl:,.2f}")
-    print(f"Max drawdown:          {res.max_drawdown_pct:.2f}%")
-    print(f"Trades completed:      {res.total_trades}")
-    print(f"Entries submitted:     {res.entries_submitted}")
-    print(f"Skipped (low margin):  {res.skipped_no_margin}")
-    print(f"Skipped (max pos):     {res.skipped_max_positions}")
-    print(f"Trail activations:     {res.trail_activations}  "
+    W  = 62
+    print("\n" + "=" * W)
+    print(f"  BACKTEST REPORT — {args.timeframe}  |  "
+          f"{args.start_date or 'ALL'} → {args.end_date or 'ALL'}")
+    print("=" * W)
+
+    # ── Capital summary ───────────────────────────────────────────────
+    roi = res.pnl / res.start_cash * 100
+    pf  = res.gross_profit / abs(res.gross_loss) if res.gross_loss != 0 else float("inf")
+    print(f"\n  CAPITAL")
+    print(f"    Starting capital   : ${res.start_cash:>12,.2f}")
+    print(f"    Final value        : ${res.final_value:>12,.2f}")
+    print(f"    Net profit         : ${res.pnl:>+12,.2f}   ({roi:+.2f}%)")
+    print(f"    Gross profit       : ${res.gross_profit:>12,.2f}")
+    print(f"    Gross loss         : ${res.gross_loss:>12,.2f}")
+    print(f"    Profit factor      :  {pf:>11.3f}   (gross profit / gross loss)")
+
+    # ── Risk ──────────────────────────────────────────────────────────
+    max_dd_dollar = res.start_cash * res.max_drawdown_pct / 100
+    print(f"\n  RISK")
+    print(f"    Max drawdown       : ${max_dd_dollar:>12,.2f}   ({res.max_drawdown_pct:.2f}%)")
+
+    # ── Trade statistics ──────────────────────────────────────────────
+    losses = res.total_trades - int(res.winrate_pct * res.total_trades / 100 + 0.5)
+    print(f"\n  TRADES")
+    print(f"    Total trades       : {res.total_trades:>8,}")
+    print(f"    Winners            : {int(res.winrate_pct*res.total_trades/100+0.5):>8,}   ({res.winrate_pct:.1f}%)")
+    print(f"    Losers             : {res.total_trades - int(res.winrate_pct*res.total_trades/100+0.5):>8,}")
+    print(f"    Avg win            : ${res.avg_win:>+11,.2f}")
+    print(f"    Avg loss           : ${res.avg_loss:>+11,.2f}")
+    print(f"    Largest win        : ${res.largest_win:>+11,.2f}")
+    print(f"    Largest loss       : ${res.largest_loss:>+11,.2f}")
+    avg_trade = res.pnl / res.total_trades if res.total_trades else 0
+    print(f"    Avg per trade      : ${avg_trade:>+11,.4f}")
+    print(f"    Trail activations  : {res.trail_activations:>8,}   "
           f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
-    print(f"Winrate:               {res.winrate_pct:.2f}%")
-    print()
-    print("-- Filter breakdown (bars rejected per gate) --")
+
+    # ── By direction ──────────────────────────────────────────────────
+    buy_wr  = res.buy_wins  / res.buy_trades  * 100 if res.buy_trades  else 0
+    sell_wr = res.sell_wins / res.sell_trades * 100 if res.sell_trades else 0
+    print(f"\n  BY DIRECTION")
+    print(f"    {'':6}  {'Trades':>7}  {'Wins':>6}  {'WR':>6}")
+    print(f"    {'Buy':<6}  {res.buy_trades:>7,}  {res.buy_wins:>6,}  {buy_wr:>5.1f}%")
+    print(f"    {'Sell':<6}  {res.sell_trades:>7,}  {res.sell_wins:>6,}  {sell_wr:>5.1f}%")
+
+    # ── Monthly P&L ───────────────────────────────────────────────────
+    if res.monthly_pnl:
+        print(f"\n  MONTHLY P&L")
+        print(f"    {'Month':<10}  {'P&L':>10}  {'Bar'}")
+        print(f"    {'-'*10}  {'-'*10}")
+        MONTH_NAMES = ["","Jan","Feb","Mar","Apr","May","Jun",
+                       "Jul","Aug","Sep","Oct","Nov","Dec"]
+        year_totals: dict = {}
+        for year, month, mpnl in res.monthly_pnl:
+            bar = "█" * int(abs(mpnl) / max(abs(p) for _,_,p in res.monthly_pnl) * 20 + 0.5) if mpnl else ""
+            sign = "+" if mpnl >= 0 else ""
+            print(f"    {MONTH_NAMES[month]} {year}    {sign}${mpnl:>8,.2f}  {bar}")
+            year_totals[year] = year_totals.get(year, 0) + mpnl
+        print(f"    {'-'*10}  {'-'*10}")
+        for year, ytotal in sorted(year_totals.items()):
+            sign = "+" if ytotal >= 0 else ""
+            print(f"    {year} TOTAL   {sign}${ytotal:>8,.2f}")
+
+    # ── Filter breakdown ──────────────────────────────────────────────
+    print(f"\n  FILTER BREAKDOWN (bars rejected per gate)")
 
     gate_counts = {
         "no_feature_row":    res.filtered_no_row,

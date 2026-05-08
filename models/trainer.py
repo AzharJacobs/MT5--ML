@@ -396,10 +396,20 @@ class ModelTrainer:
         print(f"\n  CV {cv_label} (test only): "
               f"{cv_scores.mean():.4f} ± {cv_scores.std()*2:.4f}")
 
+        from data.pipeline import TF_PARAMS
+        _trained_tfs = timeframes or ["5min", "15min"]
+        tf_build_params = {
+            tf: {
+                "impulse_atr_multiplier": TF_PARAMS.get(tf, {}).get("impulse_atr", 0.5),
+                "include_london_ny":      TF_PARAMS.get(tf, {}).get("include_london_ny", True),
+            }
+            for tf in _trained_tfs
+        }
+
         self.metadata = {
             "model_type":         self.model_type,
             "trained_at":         datetime.now().isoformat(),
-            "timeframes":         timeframes or ["5min", "15min"],
+            "timeframes":         _trained_tfs,
             "symbol":             symbol,
             "feature_columns":    self.preparator.get_feature_columns(),
             "scaler":             self.preparator.get_scaler(),
@@ -411,6 +421,7 @@ class ModelTrainer:
             "smote_used":         use_smote and SMOTE_AVAILABLE,
             "scale_pos_weight":   spw,
             "optimal_threshold":  self.optimal_threshold,
+            "tf_build_params":    tf_build_params,
         }
 
         return results

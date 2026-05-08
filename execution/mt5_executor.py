@@ -54,8 +54,32 @@ class MT5Executor(BrokerInterface):
         return result.order
 
     def close_order(self, ticket: int) -> bool:
-        # MT5 close via reverse order — implementation depends on position tracking
-        raise NotImplementedError("close_order not yet implemented")
+        import MetaTrader5 as mt5
+        position = mt5.positions_get(ticket=ticket)
+        if not position:
+            logger.warning("close_order: ticket=%d not found in open positions", ticket)
+            return False
+        pos = position[0]
+        order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        tick = mt5.symbol_info_tick(pos.symbol)
+        price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+        request = {
+            "action":      mt5.TRADE_ACTION_DEAL,
+            "symbol":      pos.symbol,
+            "volume":      pos.volume,
+            "type":        order_type,
+            "position":    ticket,
+            "price":       price,
+            "comment":     "live_trader_close",
+            "type_time":   mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error("close_order failed: ticket=%d %s", ticket, result.comment)
+            return False
+        logger.info("Position closed: ticket=%d", ticket)
+        return True
 
     def get_account_info(self) -> dict:
         import MetaTrader5 as mt5
