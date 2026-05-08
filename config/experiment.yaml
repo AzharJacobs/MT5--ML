@@ -12,11 +12,11 @@ training:
   timeframes:
     - "5min"
     - "15min"
-  train_start: "2021-01-01"
-  train_end: "2023-12-31"
-  val_start: "2024-01-01"
-  val_end: "2024-06-30"
-  test_start: "2024-07-01"
-  test_end: "2024-12-31"
+  train_start: "2024-01-01"
+  train_end: "2026-02-28"
+  val_start: "2026-03-01"
+  val_end: "2026-04-30"
+  test_start: "2026-03-01"
+  test_end: "2026-04-30"
   min_rr: 1.2
   max_bars: 60

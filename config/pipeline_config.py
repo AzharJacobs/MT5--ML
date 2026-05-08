@@ -16,7 +16,7 @@ SESSION_HOUR_LONDON_NY = 16         # London/NY overlap (conditional per TF)
 # ---------------------------------------------------------------------------
 # Zone quality
 # ---------------------------------------------------------------------------
-MIN_ZONE_QUALITY = 1.5              # Lowered from 3.0 — opens more valid zones
+MIN_ZONE_QUALITY = 2.0              # Validated threshold — good trade count without diluting quality
 
 # ---------------------------------------------------------------------------
 # HTF soft filter (normalised htf_4h_bias scale: -1 to +1)

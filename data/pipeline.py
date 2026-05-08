@@ -175,11 +175,11 @@ class DataPreparator:
                 logger.warning(f"No data for {tf} — skipping")
                 continue
 
-            raw["timestamp"] = pd.to_datetime(raw["timestamp"])
+            raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True)
             if start_date:
-                raw = raw[raw["timestamp"] >= pd.to_datetime(start_date)]
+                raw = raw[raw["timestamp"] >= pd.to_datetime(start_date, utc=True)]
             if end_date:
-                raw = raw[raw["timestamp"] <= pd.to_datetime(end_date)]
+                raw = raw[raw["timestamp"] <= pd.to_datetime(end_date, utc=True)]
             if raw.empty:
                 continue
 

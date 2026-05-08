@@ -44,9 +44,22 @@ from data.loader import get_connection
 from data.pipeline import DataPreparator
 from models.trainer import ModelTrainer, MODEL_DIR
 from strategy.base_strategy import calculate_stop_loss, calculate_take_profit
-from config.pipeline_config import MIN_ZONE_QUALITY, HTF_EXTREME_THRESHOLD
+from config.pipeline_config import MIN_ZONE_QUALITY, HTF_EXTREME_THRESHOLD, MIN_RR
 
 MAX_CONCURRENT_POSITIONS = 2
+
+# ── Signal grade thresholds ────────────────────────────────────────────────
+# A = strong setup  (zone>=3.5, conf>=0.42) — sized up when account allows
+# B = skipped       (zone 3.0-3.5) — 47% WR, not worth trading
+# C = base setup    (everything else passing gates) — 67% WR bread-and-butter
+#
+# Multipliers: flat 1x across A and C for $50 account safety.
+# Raise A multiplier as account grows (e.g. A=2 at $150, A=3 at $300+).
+GRADE_A_MIN_ZONE_QUALITY = 3.5
+GRADE_A_MIN_CONFIDENCE   = 0.42
+GRADE_B_MIN_ZONE_QUALITY = 3.0
+GRADE_B_MIN_CONFIDENCE   = 0.40
+GRADE_MULTIPLIERS = {"A": 1, "B": 0, "C": 1}   # B=0 = skip; scale A when account grows
 
 # Raw zone columns we need at execution time (unscaled, real price levels)
 RAW_ZONE_COLS = [
@@ -78,6 +91,7 @@ class BacktestResult:
     filtered_confidence: int
     filtered_neutral: int
     filtered_bad_sltp: int
+    filtered_low_rr: int
     # Extended P&L fields
     start_cash: float = 10000.0
     gross_profit: float = 0.0
@@ -91,6 +105,13 @@ class BacktestResult:
     sell_trades: int = 0
     sell_wins: int = 0
     monthly_pnl: tuple = ()   # ((year, month, pnl_dollars), ...)
+    # Grade breakdown
+    grade_a_trades: int = 0
+    grade_a_wins:   int = 0
+    grade_b_trades: int = 0
+    grade_b_wins:   int = 0
+    grade_c_trades: int = 0
+    grade_c_wins:   int = 0
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -192,7 +213,8 @@ class MLSignalStrategy(bt.Strategy):
         self._best_price: Optional[float]  = None
         self._entry_atr: Optional[float]   = None
 
-        self._trade_log: list = []   # [{date, side, pnl, entry_price, size}, ...]
+        self._trade_log: list = []   # [{date, side, pnl, entry_price, size, grade}, ...]
+        self._current_grade: str = "C"
 
         # Diagnostic counters — tells you exactly which gate kills most bars
         self._diag = {
@@ -202,6 +224,7 @@ class MLSignalStrategy(bt.Strategy):
             "confidence":   0,  # model confidence below threshold
             "neutral":      0,  # model predicted neutral/hold label
             "bad_sltp":     0,  # SL/TP geometrically invalid after calculation
+            "low_rr":       0,  # R:R ratio below MIN_RR after geometry check
         }
 
         self.model          = getattr(self, "model", None)
@@ -224,6 +247,7 @@ class MLSignalStrategy(bt.Strategy):
             "pnl":         float(trade.pnlcomm),
             "entry_price": float(self._entry_price) if self._entry_price else 0.0,
             "size":        float(abs(trade.size)),
+            "grade":       self._current_grade,
         })
 
         self._open_position_count = max(0, self._open_position_count - 1)
@@ -260,13 +284,23 @@ class MLSignalStrategy(bt.Strategy):
             if self.position.size == 0:
                 self._exit_pending = False
 
-    def _calc_size(self, price: float) -> float:
+    def _calc_grade(self, zone_quality: float, winner_proba: float) -> str:
+        if (zone_quality >= GRADE_A_MIN_ZONE_QUALITY and
+                winner_proba >= GRADE_A_MIN_CONFIDENCE):
+            return "A"
+        if (zone_quality >= GRADE_B_MIN_ZONE_QUALITY and
+                winner_proba >= GRADE_B_MIN_CONFIDENCE):
+            return "B"
+        return "C"
+
+    def _calc_size(self, price: float, grade: str = "C") -> float:
+        multiplier = GRADE_MULTIPLIERS.get(grade, 1)
         if self.p.use_pct_stake:
             cash      = self.broker.getcash()
-            trade_val = cash * float(self.p.stake)
+            trade_val = cash * float(self.p.stake) * multiplier
             size      = trade_val / price
         else:
-            size = float(self.p.stake)
+            size = float(self.p.stake) * multiplier
         return max(size, 1e-8)
 
     def _trail_distance(self) -> float:
@@ -416,8 +450,12 @@ class MLSignalStrategy(bt.Strategy):
 
         close_price = float(self.data.close[0])
 
-        size      = self._calc_size(close_price)
-        required  = close_price * size
+        grade    = self._calc_grade(zone_quality, winner_proba)
+        if GRADE_MULTIPLIERS.get(grade, 1) == 0:
+            self._diag["grade_skip"] = self._diag.get("grade_skip", 0) + 1
+            return
+        size     = self._calc_size(close_price, grade)
+        required = close_price * size
         available = self.broker.getcash()
         if required > available * 0.99:
             self._skipped_margin += 1
@@ -467,13 +505,25 @@ class MLSignalStrategy(bt.Strategy):
             if sl >= close_price or tp <= close_price:
                 self._diag["bad_sltp"] += 1
                 return
-            self.buy(size=size)
         else:
             if sl is None: sl = close_price * 1.003
             if tp is None: tp = close_price * 0.994
             if sl <= close_price or tp >= close_price:
                 self._diag["bad_sltp"] += 1
                 return
+
+        # ── Gate 6: minimum risk-reward ratio ─────────────────────────
+        sl_dist = abs(close_price - float(sl))
+        tp_dist = abs(float(tp) - close_price)
+        if sl_dist == 0 or (tp_dist / sl_dist) < MIN_RR:
+            self._diag["low_rr"] += 1
+            return
+
+        self._current_grade = grade
+
+        if pred_label == "buy":
+            self.buy(size=size)
+        else:
             self.sell(size=size)
 
         self._in_trade          = True
@@ -522,7 +572,7 @@ def run_backtest(
     use_pct_stake: bool,
     confidence:  float,
     commission:  float,
-    trail_trigger_pts:  float = 1500.0,
+    trail_trigger_pts:  float = 10.0,
     trail_dist_atr:     float = 1.0,
     trail_dist_pts:     float = 1000.0,
     include_london_ny:  bool  = True,
@@ -685,6 +735,10 @@ def run_backtest(
     buy_log   = [t for t in trade_log if t.get("side") == "buy"]
     sell_log  = [t for t in trade_log if t.get("side") == "sell"]
 
+    grade_a_log = [t for t in trade_log if t.get("grade") == "A"]
+    grade_b_log = [t for t in trade_log if t.get("grade") == "B"]
+    grade_c_log = [t for t in trade_log if t.get("grade") == "C"]
+
     gross_profit = sum(win_pnls)
     gross_loss   = sum(loss_pnls)
     avg_win      = float(np.mean(win_pnls))  if win_pnls  else 0.0
@@ -720,6 +774,7 @@ def run_backtest(
         filtered_confidence=diag.get("confidence", 0),
         filtered_neutral=diag.get("neutral", 0),
         filtered_bad_sltp=diag.get("bad_sltp", 0),
+        filtered_low_rr=diag.get("low_rr", 0),
         start_cash=float(start_value),
         gross_profit=round(gross_profit, 2),
         gross_loss=round(gross_loss, 2),
@@ -732,6 +787,12 @@ def run_backtest(
         sell_trades=len(sell_log),
         sell_wins=sell_wins_n,
         monthly_pnl=tuple(monthly_pnl_list),
+        grade_a_trades=len(grade_a_log),
+        grade_a_wins=sum(1 for t in grade_a_log if t["pnl"] > 0),
+        grade_b_trades=len(grade_b_log),
+        grade_b_wins=sum(1 for t in grade_b_log if t["pnl"] > 0),
+        grade_c_trades=len(grade_c_log),
+        grade_c_wins=sum(1 for t in grade_c_log if t["pnl"] > 0),
     )
 
 
@@ -747,7 +808,7 @@ def main() -> None:
     parser.add_argument("--no-pct-stake",       dest="use_pct_stake", action="store_false")
     parser.add_argument("--confidence",         type=float, default=0.52)
     parser.add_argument("--commission",         type=float, default=0.0)
-    parser.add_argument("--trail-trigger-pts",  type=float, default=1500.0)
+    parser.add_argument("--trail-trigger-pts",  type=float, default=10.0)
     parser.add_argument("--trail-dist-atr",     type=float, default=1.0)
     parser.add_argument("--trail-dist-pts",     type=float, default=1000.0)
     parser.add_argument("--model-dir",          default=MODEL_DIR)
@@ -820,6 +881,19 @@ def main() -> None:
     print(f"    {'Buy':<6}  {res.buy_trades:>7,}  {res.buy_wins:>6,}  {buy_wr:>5.1f}%")
     print(f"    {'Sell':<6}  {res.sell_trades:>7,}  {res.sell_wins:>6,}  {sell_wr:>5.1f}%")
 
+    # ── By grade ──────────────────────────────────────────────────────
+    a_wr = res.grade_a_wins / res.grade_a_trades * 100 if res.grade_a_trades else 0
+    b_wr = res.grade_b_wins / res.grade_b_trades * 100 if res.grade_b_trades else 0
+    c_wr = res.grade_c_wins / res.grade_c_trades * 100 if res.grade_c_trades else 0
+    print(f"\n  BY SIGNAL GRADE  (A=zone>=3.5+conf>=0.42 | B=zone>=3.0+conf>=0.40 | C=rest)")
+    print(f"    {'Grade':<6}  {'Lots':>5}  {'Trades':>7}  {'Wins':>6}  {'WR':>6}")
+    def _fmt_mult(g):
+        m = GRADE_MULTIPLIERS.get(g, 0)
+        return "SKIP" if m == 0 else f"{m}x"
+    print(f"    {'A':<6}  {_fmt_mult('A'):>5}  {res.grade_a_trades:>7,}  {res.grade_a_wins:>6,}  {a_wr:>5.1f}%")
+    print(f"    {'B':<6}  {_fmt_mult('B'):>5}  {res.grade_b_trades:>7,}  {res.grade_b_wins:>6,}  {b_wr:>5.1f}%")
+    print(f"    {'C':<6}  {_fmt_mult('C'):>5}  {res.grade_c_trades:>7,}  {res.grade_c_wins:>6,}  {c_wr:>5.1f}%")
+
     # ── Monthly P&L ───────────────────────────────────────────────────
     if res.monthly_pnl:
         print(f"\n  MONTHLY P&L")
@@ -848,11 +922,12 @@ def main() -> None:
         "low_confidence":    res.filtered_confidence,
         "neutral_prediction": res.filtered_neutral,
         "bad_sltp_geometry": res.filtered_bad_sltp,
+        f"low_rr<{MIN_RR:.1f}":     res.filtered_low_rr,
     }
     bars_total = (
         res.filtered_no_row + res.filtered_session + res.filtered_zone_quality +
         res.filtered_confidence + res.filtered_neutral + res.filtered_bad_sltp +
-        res.entries_submitted
+        res.filtered_low_rr + res.entries_submitted
     )
     print(f"  {'Gate':<26} {'Count':>8}  {'% of total':>10}")
     print(f"  {'-'*26} {'-'*8}  {'-'*10}")
@@ -870,6 +945,7 @@ def main() -> None:
         "low_confidence":     "lower DEFAULT_CONFIDENCE_THRESHOLD or retrain model",
         "neutral_prediction": "more bars in both zones — check detect_zones() lookback",
         "bad_sltp_geometry":  "SL/TP calculation — check calculate_stop_loss/take_profit()",
+        f"low_rr<{MIN_RR:.1f}":      f"zone spacing too tight — raise MIN_RR or lower MIN_ZONE_QUALITY",
     }
     print()
     for gate_name, count in gate_counts.items():

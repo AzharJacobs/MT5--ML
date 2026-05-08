@@ -49,6 +49,14 @@ LOOKBACK_BARS = 350     # need enough for warmup in build_features()
 RISK_PCT      = 1.0     # % of account balance risked per trade (when lot-size is 0)
 DEFAULT_LOTS  = 0.01    # fallback if account-based sizing fails
 
+# ── Grade system (mirrors backtest engine.py exactly) ─────────────────────────
+GRADE_A_MIN_ZONE_QUALITY = 3.5
+GRADE_A_MIN_CONFIDENCE   = 0.42
+GRADE_B_MIN_ZONE_QUALITY = 3.0
+GRADE_B_MIN_CONFIDENCE   = 0.40
+# B=0 means skip; scale A multiplier as account grows (A=2x at $150, A=3x at $300+)
+GRADE_MULTIPLIERS = {"A": 1, "B": 0, "C": 1}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -108,8 +116,8 @@ def compute_sl_tp(
     row: pd.Series,
     direction: int,          # 1=buy, -1=sell
     sl_buffer_atr: float = 0.5,
-    min_rr: float = 1.2,
-    use_midline_tp: bool = True,
+    min_rr: float = 1.5,
+    use_midline_tp: bool = False,
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """
     Returns (sl, tp, rr) using zone levels + ATR, matching signal_generator.py.
@@ -226,7 +234,7 @@ def evaluate_bar(
           "reason":    str,
         }
     """
-    no_trade = {"signal": 0, "sl": None, "tp": None, "rr": None, "prob": 0.0, "reason": ""}
+    no_trade = {"signal": 0, "sl": None, "tp": None, "rr": None, "prob": 0.0, "grade": None, "reason": ""}
 
     feat_df = build_features(
         latest_bars,
@@ -277,9 +285,21 @@ def evaluate_bar(
 
     direction = 1 if in_demand else -1
 
+    # Grade filter — mirrors backtest engine grade system
+    zone_quality = float(row.get("active_zone_quality", 0) or 0)
+    if zone_quality >= GRADE_A_MIN_ZONE_QUALITY and prob_win >= GRADE_A_MIN_CONFIDENCE:
+        grade = "A"
+    elif zone_quality >= GRADE_B_MIN_ZONE_QUALITY and prob_win >= GRADE_B_MIN_CONFIDENCE:
+        grade = "B"
+    else:
+        grade = "C"
+
+    if GRADE_MULTIPLIERS.get(grade, 1) == 0:
+        return {**no_trade, "reason": f"Grade B skipped (zone_quality={zone_quality:.2f} prob={prob_win:.3f})"}
+
     sl, tp, rr = compute_sl_tp(row, direction)
     if sl is None:
-        return {**no_trade, "reason": "SL/TP computation failed (missing zone levels)"}
+        return {**no_trade, "reason": "SL/TP computation failed (missing zone levels or RR<1.5)"}
 
     return {
         "signal":    direction,
@@ -287,7 +307,8 @@ def evaluate_bar(
         "tp":        tp,
         "rr":        rr,
         "prob":      prob_win,
-        "reason":    f"{'buy' if direction==1 else 'sell'} zone prob={prob_win:.3f} rr={rr}",
+        "grade":     grade,
+        "reason":    f"{'buy' if direction==1 else 'sell'} Grade={grade} zone_quality={zone_quality:.2f} prob={prob_win:.3f} rr={rr}",
     }
 
 
@@ -400,8 +421,9 @@ class LiveTrader:
         lots = self._get_lots(entry, sig["sl"])
 
         logger.info(
-            "SIGNAL %s | entry=%.5f sl=%.5f tp=%.5f rr=%.2f prob=%.3f lots=%.2f",
-            direction_str.upper(), entry, sig["sl"], sig["tp"], sig["rr"], sig["prob"], lots,
+            "SIGNAL %s | Grade=%s entry=%.5f sl=%.5f tp=%.5f rr=%.2f prob=%.3f lots=%.2f",
+            direction_str.upper(), sig.get("grade", "?"),
+            entry, sig["sl"], sig["tp"], sig["rr"], sig["prob"], lots,
         )
 
         ticket = self.broker.place_order(
