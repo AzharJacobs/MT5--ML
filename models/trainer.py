@@ -590,6 +590,8 @@ def main():
     parser.add_argument("--tune-trials", type=int, default=50)
     parser.add_argument("--no-smote",    action="store_true")
     parser.add_argument("--no-save",     action="store_true")
+    parser.add_argument("--model-dir",   default=MODEL_DIR,
+                        help="Directory to save model files (default: experiments/runs)")
     args = parser.parse_args()
 
     if not args.no_smote and not SMOTE_AVAILABLE:
@@ -618,7 +620,7 @@ def main():
     )
 
     if not args.no_save:
-        trainer.save_model()
+        trainer.save_model(model_dir=args.model_dir)
 
     print("\n" + "=" * 60)
     print("  TRAINING COMPLETE")
@@ -627,7 +629,7 @@ def main():
     print(f"  Recall (winners)    : {results.get('recall_minority', 0):.4f}")
     print(f"  Optimal threshold   : {results.get('threshold', 0.5):.3f}")
     if not args.no_save:
-        print(f"  Saved to            : {MODEL_DIR}/")
+        print(f"  Saved to            : {args.model_dir}/")
     print("=" * 60)
 
 
