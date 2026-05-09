@@ -112,6 +112,7 @@ class BacktestResult:
     grade_b_wins:   int = 0
     grade_c_trades: int = 0
     grade_c_wins:   int = 0
+    be_lock_count:  int = 0
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -191,6 +192,7 @@ class MLSignalStrategy(bt.Strategy):
         trail_dist_pts=1000.0,
         include_london_ny=True,   # match signal_generator: False for 15min, True for 5min
         min_zone_quality=MIN_ZONE_QUALITY,
+        breakeven_trigger_pts=0.0,  # >0: move SL to entry once profit reaches this level
     )
 
     def __init__(self):
@@ -212,6 +214,8 @@ class MLSignalStrategy(bt.Strategy):
         self._trail_active: bool           = False
         self._best_price: Optional[float]  = None
         self._entry_atr: Optional[float]   = None
+        self._be_locked: bool              = False
+        self._be_lock_count: int           = 0
 
         self._trade_log: list = []   # [{date, side, pnl, entry_price, size, grade}, ...]
         self._current_grade: str = "C"
@@ -261,6 +265,7 @@ class MLSignalStrategy(bt.Strategy):
         self._trail_active   = False
         self._best_price     = None
         self._entry_atr      = None
+        self._be_locked      = False
         if trade.pnlcomm > 0:
             self._wins += 1
         else:
@@ -323,36 +328,52 @@ class MLSignalStrategy(bt.Strategy):
 
             if side and sl is not None and tp is not None and entry is not None:
 
+                # ── Breakeven lock (takes priority over trailing stop) ──
+                be_trigger = float(self.p.breakeven_trigger_pts)
+                if be_trigger > 0 and not self._be_locked:
+                    if side == "buy"  and (bar_high - entry) >= be_trigger:
+                        self._sl       = entry
+                        self._be_locked = True
+                        self._be_lock_count += 1
+                        sl = self._sl
+                    elif side == "sell" and (entry - bar_low) >= be_trigger:
+                        self._sl       = entry
+                        self._be_locked = True
+                        self._be_lock_count += 1
+                        sl = self._sl
+
                 trail_dist = self._trail_distance()
                 trigger    = float(self.p.trail_trigger_pts)
 
-                if side == "buy":
-                    profit_pts = bar_high - entry
-                    if not self._trail_active and profit_pts >= trigger:
-                        self._trail_active      = True
-                        self._best_price        = bar_high
-                        self._trail_activations += 1
-                    if self._trail_active:
-                        if bar_high > self._best_price:
-                            self._best_price = bar_high
-                        new_sl = self._best_price - trail_dist
-                        if new_sl > self._sl:
-                            self._sl = new_sl
-                        sl = self._sl
+                # Trailing stop only runs when breakeven lock is not active
+                if not self._be_locked:
+                    if side == "buy":
+                        profit_pts = bar_high - entry
+                        if not self._trail_active and profit_pts >= trigger:
+                            self._trail_active      = True
+                            self._best_price        = bar_high
+                            self._trail_activations += 1
+                        if self._trail_active:
+                            if bar_high > self._best_price:
+                                self._best_price = bar_high
+                            new_sl = self._best_price - trail_dist
+                            if new_sl > self._sl:
+                                self._sl = new_sl
+                            sl = self._sl
 
-                elif side == "sell":
-                    profit_pts = entry - bar_low
-                    if not self._trail_active and profit_pts >= trigger:
-                        self._trail_active      = True
-                        self._best_price        = bar_low
-                        self._trail_activations += 1
-                    if self._trail_active:
-                        if bar_low < self._best_price:
-                            self._best_price = bar_low
-                        new_sl = self._best_price + trail_dist
-                        if new_sl < self._sl:
-                            self._sl = new_sl
-                        sl = self._sl
+                    elif side == "sell":
+                        profit_pts = entry - bar_low
+                        if not self._trail_active and profit_pts >= trigger:
+                            self._trail_active      = True
+                            self._best_price        = bar_low
+                            self._trail_activations += 1
+                        if self._trail_active:
+                            if bar_low < self._best_price:
+                                self._best_price = bar_low
+                            new_sl = self._best_price + trail_dist
+                            if new_sl < self._sl:
+                                self._sl = new_sl
+                            sl = self._sl
 
                 hit = False
                 if side == "buy":
@@ -557,6 +578,8 @@ class MLSignalStrategy(bt.Strategy):
     @property
     def trail_activations(self)     -> int:  return self._trail_activations
     @property
+    def be_lock_count(self)         -> int:  return self._be_lock_count
+    @property
     def diag(self)                  -> dict: return self._diag
     @property
     def trade_log(self)             -> list: return self._trade_log
@@ -578,6 +601,7 @@ def run_backtest(
     include_london_ny:  bool  = True,
     model_dir:   str = MODEL_DIR,
     min_zone_quality: float = MIN_ZONE_QUALITY,
+    breakeven_trigger_pts: float = 0.0,
 ) -> BacktestResult:
 
     db = get_connection()
@@ -709,6 +733,7 @@ def run_backtest(
         trail_dist_pts=float(trail_dist_pts),
         include_london_ny=bool(include_london_ny),
         min_zone_quality=float(min_zone_quality),
+        breakeven_trigger_pts=float(breakeven_trigger_pts),
     )
 
     start_value = cerebro.broker.getvalue()
@@ -725,6 +750,7 @@ def run_backtest(
     skipped     = int(getattr(strat_inst, "skipped_no_margin", 0))
     skp_pos     = int(getattr(strat_inst, "skipped_max_positions", 0))
     trail_acts  = int(getattr(strat_inst, "trail_activations", 0))
+    be_locks    = int(getattr(strat_inst, "be_lock_count", 0))
     winrate     = (wins / trades * 100.0) if trades > 0 else 0.0
     diag        = getattr(strat_inst, "diag", {})
     trade_log   = getattr(strat_inst, "trade_log", [])
@@ -793,6 +819,7 @@ def run_backtest(
         grade_b_wins=sum(1 for t in grade_b_log if t["pnl"] > 0),
         grade_c_trades=len(grade_c_log),
         grade_c_wins=sum(1 for t in grade_c_log if t["pnl"] > 0),
+        be_lock_count=be_locks,
     )
 
 
@@ -817,6 +844,8 @@ def main() -> None:
                         help="Exclude London/NY overlap (H16). Use for 15min.")
     parser.add_argument("--min-zone-quality",    type=float, default=MIN_ZONE_QUALITY,
                         help=f"Minimum zone quality score to trade (default={MIN_ZONE_QUALITY})")
+    parser.add_argument("--breakeven-trigger-pts", type=float, default=0.0,
+                        help="Move SL to entry once profit reaches this level (0=disabled)")
     args = parser.parse_args()
 
     res = run_backtest(
@@ -834,12 +863,13 @@ def main() -> None:
         include_london_ny=args.include_london_ny,
         model_dir=args.model_dir,
         min_zone_quality=args.min_zone_quality,
+        breakeven_trigger_pts=args.breakeven_trigger_pts,
     )
 
     W  = 62
     print("\n" + "=" * W)
-    print(f"  BACKTEST REPORT — {args.timeframe}  |  "
-          f"{args.start_date or 'ALL'} → {args.end_date or 'ALL'}")
+    print(f"  BACKTEST REPORT - {args.timeframe}  |  "
+          f"{args.start_date or 'ALL'} to {args.end_date or 'ALL'}")
     print("=" * W)
 
     # ── Capital summary ───────────────────────────────────────────────
@@ -872,6 +902,9 @@ def main() -> None:
     print(f"    Avg per trade      : ${avg_trade:>+11,.4f}")
     print(f"    Trail activations  : {res.trail_activations:>8,}   "
           f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
+    if args.breakeven_trigger_pts > 0:
+        print(f"    Breakeven locks    : {res.be_lock_count:>8,}   "
+              f"(trigger={args.breakeven_trigger_pts:.0f}pts)")
 
     # ── By direction ──────────────────────────────────────────────────
     buy_wr  = res.buy_wins  / res.buy_trades  * 100 if res.buy_trades  else 0
@@ -903,7 +936,7 @@ def main() -> None:
                        "Jul","Aug","Sep","Oct","Nov","Dec"]
         year_totals: dict = {}
         for year, month, mpnl in res.monthly_pnl:
-            bar = "█" * int(abs(mpnl) / max(abs(p) for _,_,p in res.monthly_pnl) * 20 + 0.5) if mpnl else ""
+            bar = "#" * int(abs(mpnl) / max(abs(p) for _,_,p in res.monthly_pnl) * 20 + 0.5) if mpnl else ""
             sign = "+" if mpnl >= 0 else ""
             print(f"    {MONTH_NAMES[month]} {year}    {sign}${mpnl:>8,.2f}  {bar}")
             year_totals[year] = year_totals.get(year, 0) + mpnl

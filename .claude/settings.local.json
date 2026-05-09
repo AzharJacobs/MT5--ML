@@ -53,7 +53,17 @@
       "PowerShell(cd \"f:\\\\MT5- ML\"; $env:PYTHONIOENCODING = \"utf-8\"; .venv\\\\Scripts\\\\python.exe backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-04-30 --cash 5000 --no-pct-stake --stake 1.0 --min-zone-quality 2.0 2>&1)",
       "PowerShell(cd \"f:\\\\MT5- ML\"; $env:PYTHONIOENCODING = \"utf-8\"; .venv\\\\Scripts\\\\python.exe backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-04-30 --cash 30000 --no-pct-stake --stake 1.0 --min-zone-quality 2.0 2>&1)",
       "PowerShell(cd \"f:\\\\MT5- ML\"; $env:PYTHONIOENCODING = \"utf-8\"; .venv\\\\Scripts\\\\python.exe backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-04-30 --cash 5000 --no-pct-stake --stake 1.0 2>&1)",
-      "Bash(mkdir -p \"C:\\\\Users\\\\Azhar Jacobs\\\\.claude\\\\projects\\\\f--MT5--ML\\\\memory\")"
+      "Bash(mkdir -p \"C:\\\\Users\\\\Azhar Jacobs\\\\.claude\\\\projects\\\\f--MT5--ML\\\\memory\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2026-01-01 --end-date 2026-12-31)",
+      "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2026-01-01 --end-date 2026-12-31 --trail-trigger-pts 50)",
+      "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2026-01-01 --end-date 2026-12-31 --trail-trigger-pts 100)",
+      "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2026-01-01 --end-date 2026-12-31 --trail-trigger-pts 9999 --breakeven-trigger-pts 20)",
+      "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2026-01-01 --end-date 2026-12-31 --trail-trigger-pts 9999 --breakeven-trigger-pts 30)",
+      "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2025-03-01 --end-date 2025-06-30)",
+      "Bash(python train.py --timeframes 15min --start-date 2024-01-01 --end-date 2026-04-30)",
+      "Bash(python train.py --timeframes 1H --start-date 2024-01-01 --end-date 2026-04-30)",
+      "Bash(python train.py --timeframes 15min --start-date 2024-01-01 --end-date 2026-02-28)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
