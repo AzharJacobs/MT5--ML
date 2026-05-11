@@ -23,6 +23,7 @@ Signal logic (mirrors backtest engine exactly):
 """
 
 import os
+import os
 import time
 import logging
 import argparse
@@ -31,6 +32,12 @@ import pandas as pd
 import joblib
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass
 
 from data.loader import get_connection
 from data.feature_engineer import build_features
@@ -41,6 +48,21 @@ TF_SECONDS = {
     "1min":  60,   "2min":  120,  "3min":  180,  "4min":  240,
     "5min":  300,  "10min": 600,  "15min": 900,  "30min": 1800,
     "1H":    3600, "4H":    14400, "1D":   86400,
+}
+
+# ── Timeframe string → MT5 timeframe constant ─────────────────────────────────
+TF_MT5 = {
+    "1min":  21,    # TIMEFRAME_M1
+    "2min":  22,    # TIMEFRAME_M2
+    "3min":  23,    # TIMEFRAME_M3
+    "4min":  24,    # TIMEFRAME_M4
+    "5min":  25,    # TIMEFRAME_M5
+    "10min": 26,    # TIMEFRAME_M10
+    "15min": 27,    # TIMEFRAME_M15
+    "30min": 28,    # TIMEFRAME_M30
+    "1H":    33,    # TIMEFRAME_H1
+    "4H":    34,    # TIMEFRAME_H4
+    "1D":    38,    # TIMEFRAME_D1
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -333,7 +355,7 @@ class LiveTrader:
         self.symbol     = symbol
         self.risk_pct   = risk_pct
         self.lot_size   = lot_size
-        self.db         = get_connection()
+        self.db         = None if mode == "mt5" else get_connection()
         self.bundle     = load_model_bundle()
         self._ticket: Optional[int] = None   # open position ticket
 
@@ -347,6 +369,29 @@ class LiveTrader:
         )
 
     def _fetch_bars(self) -> pd.DataFrame:
+        if self.mode == "mt5":
+            return self._fetch_bars_from_mt5()
+        return self._fetch_bars_from_db()
+
+    def _fetch_bars_from_mt5(self) -> pd.DataFrame:
+        import MetaTrader5 as mt5
+        tf_const = TF_MT5.get(self.timeframe)
+        if tf_const is None:
+            raise ValueError(f"Unknown timeframe: {self.timeframe}")
+        rates = mt5.copy_rates_from_pos(self.symbol, tf_const, 0, LOOKBACK_BARS)
+        if rates is None or len(rates) == 0:
+            raise ConnectionError(
+                f"mt5.copy_rates_from_pos returned nothing for {self.symbol} {self.timeframe}. "
+                f"Is the symbol visible in Market Watch?"
+            )
+        df = pd.DataFrame(rates)
+        df["timestamp"] = pd.to_datetime(df["time"], unit="s")
+        df.rename(columns={"tick_volume": "volume"}, inplace=True)
+        df["hour"] = df["timestamp"].dt.hour
+        df.drop(columns=["time"], inplace=True)
+        return df.reset_index(drop=True)
+
+    def _fetch_bars_from_db(self) -> pd.DataFrame:
         if not self.db.connect():
             raise ConnectionError("DB connection failed")
         query = """
@@ -500,11 +545,18 @@ Examples:
     args = parser.parse_args()
 
     if args.mode == "mt5":
-        if not all([args.login, args.password, args.server]):
-            parser.error("--mode mt5 requires --login, --password, and --server")
+        # Fall back to .env values if CLI args not provided
+        login    = args.login    or int(os.environ.get("MT5_LOGIN",    0))
+        password = args.password or os.environ.get("MT5_PASSWORD", "")
+        server   = args.server   or os.environ.get("MT5_SERVER",   "")
+        if not all([login, password, server]):
+            parser.error(
+                "--mode mt5 requires --login, --password, and --server "
+                "(or MT5_LOGIN / MT5_PASSWORD / MT5_SERVER in .env)"
+            )
         from execution.mt5_connector import MT5Connector
         from execution.mt5_executor  import MT5Executor
-        connector = MT5Connector(login=args.login, password=args.password, server=args.server)
+        connector = MT5Connector(login=login, password=password, server=server)
         if not connector.connect():
             raise SystemExit("Failed to connect to MT5 terminal")
         broker = MT5Executor(connector)
