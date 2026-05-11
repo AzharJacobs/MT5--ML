@@ -69,7 +69,8 @@
       "Bash(python backtest.py --timeframe 15min --cash 5000 --no-pct-stake --stake 1.0 --start-date 2026-01-01 --end-date 2026-12-31 --model-dir experiments/runs/15min)",
       "Bash(Select-String -Pattern \"Model loaded|Net profit|Profit factor|Win rate|threshold|TOTAL\")",
       "Bash(python train.py --timeframes 1H --start-date 2024-01-01 --end-date 2026-02-28 --model-dir experiments/runs/1H)",
-      "Bash(python train.py --timeframes 1H --start-date 2022-01-01 --end-date 2026-02-28 --model-dir experiments/runs/1H)"
+      "Bash(python train.py --timeframes 1H --start-date 2022-01-01 --end-date 2026-02-28 --model-dir experiments/runs/1H)",
+      "Bash(git rm *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
