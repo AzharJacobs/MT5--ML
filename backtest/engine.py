@@ -204,18 +204,12 @@ class MLSignalStrategy(bt.Strategy):
         self._skipped_max_pos       = 0
         self._open_position_count   = 0
         self._trail_activations     = 0
-        self._in_trade              = False
-        self._exit_pending          = False
+        self._be_lock_count: int    = 0
 
-        self._sl: Optional[float]          = None
-        self._tp: Optional[float]          = None
-        self._side: Optional[str]          = None
-        self._entry_price: Optional[float] = None
-        self._trail_active: bool           = False
-        self._best_price: Optional[float]  = None
-        self._entry_atr: Optional[float]   = None
-        self._be_locked: bool              = False
-        self._be_lock_count: int           = 0
+        # Per-trade state — each dict: {sl, tp, side, entry_price, size, grade,
+        #   trail_active, best_price, entry_atr, be_locked, trade_ref}
+        self._open_trades: list     = []
+        self._any_exit_pending: bool = False
 
         self._trade_log: list = []   # [{date, side, pnl, entry_price, size, grade}, ...]
         self._current_grade: str = "C"
@@ -240,32 +234,65 @@ class MLSignalStrategy(bt.Strategy):
     def notify_trade(self, trade):
         if trade.isopen:
             self._open_position_count += 1
+            # Tag first unregistered entry with this trade.ref
+            for t in self._open_trades:
+                if "trade_ref" not in t:
+                    t["trade_ref"] = trade.ref
+                    break
             return
         if not trade.isclosed:
             return
 
-        # Capture before resetting state
+        self._open_position_count = max(0, self._open_position_count - 1)
+        self._trade_count += 1
+
+        # Match by trade.ref; fallback FIFO
+        matched_idx = None
+        for i, t in enumerate(self._open_trades):
+            if t.get("trade_ref") == trade.ref:
+                matched_idx = i
+                break
+        if matched_idx is None and self._open_trades:
+            matched_idx = 0
+
+        if matched_idx is not None:
+            t = self._open_trades.pop(matched_idx)
+            side        = t["side"]
+            entry_price = t["entry_price"]
+            grade       = t["grade"]
+            size        = t["size"]
+        else:
+            side        = None
+            entry_price = 0.0
+            grade       = "C"
+            size        = 0.0
+
         self._trade_log.append({
             "date":        self.data.datetime.datetime(0),
-            "side":        self._side,
+            "side":        side,
             "pnl":         float(trade.pnlcomm),
-            "entry_price": float(self._entry_price) if self._entry_price else 0.0,
-            "size":        float(abs(trade.size)),
-            "grade":       self._current_grade,
+            "entry_price": entry_price,
+            "size":        size,
+            "grade":       grade,
         })
 
-        self._open_position_count = max(0, self._open_position_count - 1)
-        self._trade_count   += 1
-        self._in_trade       = False
-        self._exit_pending   = False
-        self._sl             = None
-        self._tp             = None
-        self._side           = None
-        self._entry_price    = None
-        self._trail_active   = False
-        self._best_price     = None
-        self._entry_atr      = None
-        self._be_locked      = False
+        # Backtrader netting mode: 2 buys = 1 Trade object at double size.
+        # When that single Trade closes, notify_trade fires once but we may
+        # have 2 entries in _open_trades. Clear all orphans when flat.
+        if self.position.size == 0:
+            # Log any remaining orphaned entries with zero PnL
+            for orphan in self._open_trades:
+                self._trade_log.append({
+                    "date":        self.data.datetime.datetime(0),
+                    "side":        orphan.get("side"),
+                    "pnl":         0.0,
+                    "entry_price": orphan.get("entry_price", 0.0),
+                    "size":        orphan.get("size", 0.0),
+                    "grade":       orphan.get("grade", "C"),
+                })
+            self._open_trades.clear()
+            self._any_exit_pending = False
+
         if trade.pnlcomm > 0:
             self._wins += 1
         else:
@@ -273,21 +300,12 @@ class MLSignalStrategy(bt.Strategy):
 
     def notify_order(self, order):
         if order.status in (order.Canceled, order.Rejected, order.Margin):
-            if self.position.size == 0:
-                self._in_trade     = False
-                self._exit_pending = False
-                self._sl           = None
-                self._tp           = None
-                self._side         = None
-                status_name = {
-                    order.Canceled: "Canceled",
-                    order.Rejected: "Rejected",
-                    order.Margin:   "Margin/Insufficient funds",
-                }.get(order.status, str(order.status))
-                print(f"  [WARN] Order failed ({status_name}) — resetting trade flag")
-        elif order.status == order.Completed:
-            if self.position.size == 0:
-                self._exit_pending = False
+            status_name = {
+                order.Canceled: "Canceled",
+                order.Rejected: "Rejected",
+                order.Margin:   "Margin/Insufficient funds",
+            }.get(order.status, str(order.status))
+            print(f"  [WARN] Order failed ({status_name})")
 
     def _calc_grade(self, zone_quality: float, winner_proba: float) -> str:
         if (zone_quality >= GRADE_A_MIN_ZONE_QUALITY and
@@ -299,97 +317,82 @@ class MLSignalStrategy(bt.Strategy):
         return "C"
 
     def _calc_size(self, price: float, grade: str = "C") -> float:
-        multiplier = GRADE_MULTIPLIERS.get(grade, 1)
-        if self.p.use_pct_stake:
-            cash      = self.broker.getcash()
-            trade_val = cash * float(self.p.stake) * multiplier
-            size      = trade_val / price
-        else:
-            size = float(self.p.stake) * multiplier
-        return max(size, 1e-8)
+        if grade == "A":
+            return 0.02
+        return 0.01
 
-    def _trail_distance(self) -> float:
-        if float(self.p.trail_dist_atr) > 0 and self._entry_atr:
-            return float(self.p.trail_dist_atr) * self._entry_atr
+    def _trail_dist_for(self, t: dict) -> float:
+        if float(self.p.trail_dist_atr) > 0 and t.get("entry_atr"):
+            return float(self.p.trail_dist_atr) * t["entry_atr"]
         return float(self.p.trail_dist_pts)
 
     def next(self):
-        # ── In-trade management ────────────────────────────────────────
-        if self.position.size != 0:
-            if self._exit_pending:
-                return
+        bar_high = float(self.data.high[0])
+        bar_low  = float(self.data.low[0])
 
-            side     = self._side
-            sl       = self._sl
-            tp       = self._tp
-            entry    = self._entry_price
-            bar_high = float(self.data.high[0])
-            bar_low  = float(self.data.low[0])
+        # ── Per-trade in-trade management ─────────────────────────────
+        if self._open_trades and not self._any_exit_pending:
+            for t in self._open_trades:
+                side  = t["side"]
+                entry = t["entry_price"]
 
-            if side and sl is not None and tp is not None and entry is not None:
-
-                # ── Breakeven lock (takes priority over trailing stop) ──
+                # Breakeven lock
                 be_trigger = float(self.p.breakeven_trigger_pts)
-                if be_trigger > 0 and not self._be_locked:
-                    if side == "buy"  and (bar_high - entry) >= be_trigger:
-                        self._sl       = entry
-                        self._be_locked = True
+                if be_trigger > 0 and not t["be_locked"]:
+                    if side == "buy" and (bar_high - entry) >= be_trigger:
+                        t["sl"] = entry
+                        t["be_locked"] = True
                         self._be_lock_count += 1
-                        sl = self._sl
                     elif side == "sell" and (entry - bar_low) >= be_trigger:
-                        self._sl       = entry
-                        self._be_locked = True
+                        t["sl"] = entry
+                        t["be_locked"] = True
                         self._be_lock_count += 1
-                        sl = self._sl
 
-                trail_dist = self._trail_distance()
+                trail_dist = self._trail_dist_for(t)
                 trigger    = float(self.p.trail_trigger_pts)
 
-                # Trailing stop only runs when breakeven lock is not active
-                if not self._be_locked:
+                if not t["be_locked"]:
                     if side == "buy":
                         profit_pts = bar_high - entry
-                        if not self._trail_active and profit_pts >= trigger:
-                            self._trail_active      = True
-                            self._best_price        = bar_high
+                        if not t["trail_active"] and profit_pts >= trigger:
+                            t["trail_active"] = True
+                            t["best_price"]   = bar_high
                             self._trail_activations += 1
-                        if self._trail_active:
-                            if bar_high > self._best_price:
-                                self._best_price = bar_high
-                            new_sl = self._best_price - trail_dist
-                            if new_sl > self._sl:
-                                self._sl = new_sl
-                            sl = self._sl
-
+                        if t["trail_active"]:
+                            if bar_high > t["best_price"]:
+                                t["best_price"] = bar_high
+                            new_sl = t["best_price"] - trail_dist
+                            if new_sl > t["sl"]:
+                                t["sl"] = new_sl
                     elif side == "sell":
                         profit_pts = entry - bar_low
-                        if not self._trail_active and profit_pts >= trigger:
-                            self._trail_active      = True
-                            self._best_price        = bar_low
+                        if not t["trail_active"] and profit_pts >= trigger:
+                            t["trail_active"] = True
+                            t["best_price"]   = bar_low
                             self._trail_activations += 1
-                        if self._trail_active:
-                            if bar_low < self._best_price:
-                                self._best_price = bar_low
-                            new_sl = self._best_price + trail_dist
-                            if new_sl < self._sl:
-                                self._sl = new_sl
-                            sl = self._sl
+                        if t["trail_active"]:
+                            if bar_low < t["best_price"]:
+                                t["best_price"] = bar_low
+                            new_sl = t["best_price"] + trail_dist
+                            if new_sl < t["sl"]:
+                                t["sl"] = new_sl
 
+                sl = t["sl"]
+                tp = t["tp"]
                 hit = False
                 if side == "buy":
                     hit = (bar_low <= sl) or (bar_high >= tp)
                 elif side == "sell":
                     hit = (bar_high >= sl) or (bar_low <= tp)
                 if hit:
-                    self._exit_pending = True
-                    self.close()
-            return
+                    self._any_exit_pending = True
+                    self.close()  # close all open positions
+                    break         # no need to check remaining trades
 
-        if self._in_trade:
-            return
-
-        if self._open_position_count >= MAX_CONCURRENT_POSITIONS:
-            self._skipped_max_pos += 1
+        # ── New entry gate ─────────────────────────────────────────────
+        if self._any_exit_pending or len(self._open_trades) >= MAX_CONCURRENT_POSITIONS:
+            if not self._any_exit_pending:
+                self._skipped_max_pos += 1
             return
 
         # ── Gate 1: feature row lookup ─────────────────────────────────
@@ -399,12 +402,7 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["no_row"] += 1
             return
 
-        # Resolve raw early — needed for direction gate and HTF soft filter.
         _raw = row.get("raw")
-
-        # Session gate removed: in_session is now a model feature so the model
-        # learns session importance itself. Hard-blocking here was preventing
-        # valid out-of-session setups from being evaluated.
 
         X_row        = row["X"]
         zone_quality = row.get("zone_quality", float("nan"))
@@ -415,10 +413,6 @@ class MLSignalStrategy(bt.Strategy):
             return
 
         # ── Gate 3: model confidence ───────────────────────────────────
-        # Model is binary: class 0 = loser, class 1 = winner.
-        # We want the probability of being a WINNER (class 1), not max(proba).
-        # Bug was: conf = np.max(proba) which is always ≥ 0.50 in a binary
-        # classifier — the confidence gate never fired.
         proba   = self.model.predict_proba(X_row)[0]
         classes = getattr(self.model, "classes_", np.array([0, 1]))
         winner_class_idx = int(np.where(classes == 1)[0][0]) \
@@ -429,10 +423,7 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["confidence"] += 1
             return
 
-        # ── Gate 4: direction from zone, not from model class ──────────
-        # Model predicts winner (1) vs loser (0) — NOT buy vs sell.
-        # Direction comes from which zone price is in at this bar.
-        # _raw already resolved above in Gate 1b.
+        # ── Gate 4: direction from zone ────────────────────────────────
         if _raw is not None:
             try:
                 in_demand = float(_raw.get("in_demand_zone", 0))
@@ -447,16 +438,18 @@ class MLSignalStrategy(bt.Strategy):
         elif in_supply == 1.0:
             pred_label = "sell"
         else:
-            # Not clearly in a zone — skip
             self._diag["neutral"] += 1
             return
 
+        # ── Directional consistency: only add trades in same direction ──
+        # Backtrader uses a netting account — a sell against an open buy
+        # would close it rather than open a new short position.
+        if self._open_trades:
+            existing_side = self._open_trades[0]["side"]
+            if pred_label != existing_side:
+                return
+
         # ── Soft HTF trend filter ──────────────────────────────────────
-        # htf_4h_bias and htf_1h_bias are already model features — the model
-        # already penalises counter-trend trades. The old hard gate blocked
-        # ALL sells when 4H was bullish even when model confidence was high.
-        # New rule: only skip if HTF is extreme (|bias| > threshold) AND
-        # the model is not confident enough to override it.
         if _raw is not None:
             try:
                 _htf = float(_raw.get("htf_4h_bias", 0) or 0)
@@ -471,12 +464,12 @@ class MLSignalStrategy(bt.Strategy):
 
         close_price = float(self.data.close[0])
 
-        grade    = self._calc_grade(zone_quality, winner_proba)
+        grade = self._calc_grade(zone_quality, winner_proba)
         if GRADE_MULTIPLIERS.get(grade, 1) == 0:
             self._diag["grade_skip"] = self._diag.get("grade_skip", 0) + 1
             return
-        size     = self._calc_size(close_price, grade)
-        required = close_price * size
+        size      = self._calc_size(close_price, grade)
+        required  = close_price * size
         available = self.broker.getcash()
         if required > available * 0.99:
             self._skipped_margin += 1
@@ -507,7 +500,6 @@ class MLSignalStrategy(bt.Strategy):
         lookback_df["wick_upper"]  = wick_upper
         lookback_df["wick_lower"]  = wick_lower
 
-        # Raw feature row for zone-aligned SL/TP (features.py boundaries)
         raw_feat_series = row.get("raw")
 
         sl = calculate_stop_loss(
@@ -547,21 +539,26 @@ class MLSignalStrategy(bt.Strategy):
         else:
             self.sell(size=size)
 
-        self._in_trade          = True
         self._entries_submitted += 1
-        self._exit_pending      = False
-        self._sl                = float(sl)
-        self._tp                = float(tp)
-        self._side              = pred_label
-        self._entry_price       = float(close_price)
-        self._trail_active      = False
-        self._best_price        = None
 
         try:
             atr_val = float(lookback_df["candle_size"].rolling(14).mean().iloc[-1])
         except Exception:
             atr_val = None
-        self._entry_atr = atr_val if atr_val and atr_val > 0 else None
+
+        self._open_trades.append({
+            "sl":           float(sl),
+            "tp":           float(tp),
+            "side":         pred_label,
+            "entry_price":  float(close_price),
+            "size":         float(size),
+            "grade":        grade,
+            "trail_active": False,
+            "best_price":   None,
+            "entry_atr":    atr_val if atr_val and atr_val > 0 else None,
+            "be_locked":    False,
+            "exit_pending": False,
+        })
 
     @property
     def wins(self)                  -> int:  return self._wins

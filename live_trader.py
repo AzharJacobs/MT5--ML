@@ -52,17 +52,17 @@ TF_SECONDS = {
 
 # ── Timeframe string → MT5 timeframe constant ─────────────────────────────────
 TF_MT5 = {
-    "1min":  21,    # TIMEFRAME_M1
-    "2min":  22,    # TIMEFRAME_M2
-    "3min":  23,    # TIMEFRAME_M3
-    "4min":  24,    # TIMEFRAME_M4
-    "5min":  25,    # TIMEFRAME_M5
-    "10min": 26,    # TIMEFRAME_M10
-    "15min": 27,    # TIMEFRAME_M15
-    "30min": 28,    # TIMEFRAME_M30
-    "1H":    33,    # TIMEFRAME_H1
-    "4H":    34,    # TIMEFRAME_H4
-    "1D":    38,    # TIMEFRAME_D1
+    "1min":  1,      # TIMEFRAME_M1
+    "2min":  2,      # TIMEFRAME_M2
+    "3min":  3,      # TIMEFRAME_M3
+    "4min":  4,      # TIMEFRAME_M4
+    "5min":  5,      # TIMEFRAME_M5
+    "10min": 10,     # TIMEFRAME_M10
+    "15min": 15,     # TIMEFRAME_M15
+    "30min": 30,     # TIMEFRAME_M30
+    "1H":    16385,  # TIMEFRAME_H1
+    "4H":    16388,  # TIMEFRAME_H4
+    "1D":    16408,  # TIMEFRAME_D1
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -269,9 +269,8 @@ def evaluate_bar(
 
     row = feat_df.iloc[-1]
 
-    # Session gate — must be in a valid trading window
-    if float(row.get("in_session", 0) or 0) != 1.0:
-        return {**no_trade, "reason": "outside session"}
+    # No hard session gate — in_session is a model feature; model decides.
+    # (Matches backtest engine.py where session gate was removed.)
 
     # Direction from features
     in_demand = float(row.get("in_demand_zone", 0) or 0) == 1.0
@@ -378,16 +377,26 @@ class LiveTrader:
         tf_const = TF_MT5.get(self.timeframe)
         if tf_const is None:
             raise ValueError(f"Unknown timeframe: {self.timeframe}")
+        # Ensure symbol is visible in Market Watch
+        if not mt5.symbol_select(self.symbol, True):
+            logger.warning("symbol_select(%s) failed — symbol may not exist on this broker", self.symbol)
         rates = mt5.copy_rates_from_pos(self.symbol, tf_const, 0, LOOKBACK_BARS)
         if rates is None or len(rates) == 0:
             raise ConnectionError(
                 f"mt5.copy_rates_from_pos returned nothing for {self.symbol} {self.timeframe}. "
-                f"Is the symbol visible in Market Watch?"
+                f"Error: {mt5.last_error()}"
             )
         df = pd.DataFrame(rates)
         df["timestamp"] = pd.to_datetime(df["time"], unit="s")
         df.rename(columns={"tick_volume": "volume"}, inplace=True)
-        df["hour"] = df["timestamp"].dt.hour
+        df["hour"]  = df["timestamp"].dt.hour
+        df["month"] = df["timestamp"].dt.month
+        body_top    = df[["open", "close"]].max(axis=1)
+        body_bot    = df[["open", "close"]].min(axis=1)
+        df["candle_size"] = df["high"] - df["low"]
+        df["body_size"]   = (df["close"] - df["open"]).abs()
+        df["wick_upper"]  = df["high"] - body_top
+        df["wick_lower"]  = body_bot   - df["low"]
         df.drop(columns=["time"], inplace=True)
         return df.reset_index(drop=True)
 
