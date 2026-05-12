@@ -66,18 +66,20 @@ TF_MT5 = {
 }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-SYMBOL        = "XAUUSDm"
-LOOKBACK_BARS = 350     # need enough for warmup in build_features()
-RISK_PCT      = 1.0     # % of account balance risked per trade (when lot-size is 0)
-DEFAULT_LOTS  = 0.01    # fallback if account-based sizing fails
+SYMBOL                   = "XAUUSDm"
+LOOKBACK_BARS            = 350     # need enough for warmup in build_features()
+RISK_PCT                 = 1.0     # % of account balance risked per trade (when lot-size is 0)
+DEFAULT_LOTS             = 0.01    # fallback if account-based sizing fails
+MAX_CONCURRENT_POSITIONS = 2       # max simultaneous trades (same direction only)
 
 # ── Grade system (mirrors backtest engine.py exactly) ─────────────────────────
 GRADE_A_MIN_ZONE_QUALITY = 3.5
 GRADE_A_MIN_CONFIDENCE   = 0.42
 GRADE_B_MIN_ZONE_QUALITY = 3.0
 GRADE_B_MIN_CONFIDENCE   = 0.40
-# B=0 means skip; scale A multiplier as account grows (A=2x at $150, A=3x at $300+)
+# B=0 means skip; A=0.02 lots, C=0.01 lots (fixed sizing matching backtest)
 GRADE_MULTIPLIERS = {"A": 1, "B": 0, "C": 1}
+GRADE_LOTS        = {"A": 0.02, "C": 0.01}   # fixed lot sizes per grade
 
 logging.basicConfig(
     level=logging.INFO,
@@ -356,7 +358,8 @@ class LiveTrader:
         self.lot_size   = lot_size
         self.db         = None if mode == "mt5" else get_connection()
         self.bundle     = load_model_bundle()
-        self._ticket: Optional[int] = None   # open position ticket
+        # Each entry: {"ticket": int, "direction": str ("buy"|"sell")}
+        self._open_positions: list = []
 
         # Mirror training: 15min was trained without H16
         _tf_bp = self.bundle["metadata"].get("tf_build_params", {}).get(timeframe, {})
@@ -416,40 +419,51 @@ class LiveTrader:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df.iloc[::-1].reset_index(drop=True)   # chronological
 
-    def _is_position_open(self) -> bool:
+    def _sync_open_positions(self) -> None:
+        """Remove any positions that have been closed by SL/TP."""
         if self.mode == "paper":
-            return self._ticket is not None
-        # For MT5: check if our ticket is still open
-        if self._ticket is None:
-            return False
+            # PaperTrader tracks a single ticket; keep entries whose ticket is still open
+            still_open = []
+            for pos in self._open_positions:
+                if self.broker.is_position_open(pos["ticket"]):
+                    still_open.append(pos)
+                else:
+                    logger.info("Position ticket=%s closed (SL/TP hit)", pos["ticket"])
+            self._open_positions = still_open
+            return
+
         try:
             import MetaTrader5 as mt5
-            positions = mt5.positions_get(ticket=self._ticket)
-            if positions:
-                return True
-            # Ticket gone — position closed by SL/TP
-            logger.info("Position ticket=%d was closed (SL/TP hit)", self._ticket)
-            self._ticket = None
-            return False
-        except Exception:
-            return False
+            still_open = []
+            for pos in self._open_positions:
+                positions = mt5.positions_get(ticket=pos["ticket"])
+                if positions:
+                    still_open.append(pos)
+                else:
+                    logger.info("Position ticket=%d closed (SL/TP hit)", pos["ticket"])
+            self._open_positions = still_open
+        except Exception as e:
+            logger.warning("Could not sync positions: %s", e)
 
-    def _get_lots(self, entry: float, sl: float) -> float:
+    def _get_lots(self, grade: str) -> float:
+        """Fixed lot size by grade — matches backtest engine."""
         if self.lot_size > 0:
             return self.lot_size
-        sl_distance = abs(entry - sl)
-        if sl_distance <= 0:
-            return DEFAULT_LOTS
-        return calculate_lot_size(self.broker, self.symbol, sl_distance, self.risk_pct)
+        return GRADE_LOTS.get(grade, DEFAULT_LOTS)
 
     def run_once(self) -> None:
         """Evaluate one bar and place/skip order."""
         now = datetime.utcnow()
         logger.info("── Bar evaluation at %s UTC ──", now.strftime("%Y-%m-%d %H:%M"))
 
-        # Skip if position already open
-        if self._is_position_open():
-            logger.info("Position open (ticket=%s) — skipping entry", self._ticket)
+        # Sync open positions (remove any closed by SL/TP)
+        self._sync_open_positions()
+        open_count = len(self._open_positions)
+        logger.info("Open positions: %d / %d", open_count, MAX_CONCURRENT_POSITIONS)
+
+        if open_count >= MAX_CONCURRENT_POSITIONS:
+            tickets = [p["ticket"] for p in self._open_positions]
+            logger.info("Max positions reached (tickets=%s) — skipping entry", tickets)
             return
 
         # Fetch data
@@ -463,20 +477,33 @@ class LiveTrader:
             logger.warning("Only %d bars — need more warmup", len(bars))
             return
 
-        # Evaluate
+        # Evaluate signal
         sig = evaluate_bar(bars, self.bundle, self.timeframe, self.include_london_ny)
 
         if sig["signal"] == 0:
             logger.info("No signal: %s", sig["reason"])
             return
 
-        entry = float(bars.iloc[-1]["close"])
         direction_str = "buy" if sig["signal"] == 1 else "sell"
-        lots = self._get_lots(entry, sig["sl"])
+
+        # Directional consistency: only add trades in same direction as open positions
+        # (Backtrader netting + live MT5 netting don't support simultaneous long+short)
+        if self._open_positions:
+            existing_dir = self._open_positions[0]["direction"]
+            if direction_str != existing_dir:
+                logger.info(
+                    "Skipping entry — signal is %s but open positions are %s (directional lock)",
+                    direction_str, existing_dir,
+                )
+                return
+
+        entry = float(bars.iloc[-1]["close"])
+        grade = sig.get("grade", "C")
+        lots  = self._get_lots(grade)
 
         logger.info(
             "SIGNAL %s | Grade=%s entry=%.5f sl=%.5f tp=%.5f rr=%.2f prob=%.3f lots=%.2f",
-            direction_str.upper(), sig.get("grade", "?"),
+            direction_str.upper(), grade,
             entry, sig["sl"], sig["tp"], sig["rr"], sig["prob"], lots,
         )
 
@@ -486,12 +513,15 @@ class LiveTrader:
             volume    = lots,
             sl        = sig["sl"],
             tp        = sig["tp"],
-            comment   = f"lt_{self.timeframe}_{sig['prob']:.2f}",
+            comment   = f"lt_{self.timeframe}_{grade}_{sig['prob']:.2f}",
         )
 
         if ticket is not None:
-            self._ticket = ticket
-            logger.info("Order placed: ticket=%s", ticket)
+            self._open_positions.append({"ticket": ticket, "direction": direction_str})
+            logger.info(
+                "Order placed: ticket=%s | now %d/%d positions open",
+                ticket, len(self._open_positions), MAX_CONCURRENT_POSITIONS,
+            )
         else:
             logger.error("Order placement failed")
 

@@ -45,5 +45,8 @@ class PaperTrader(BrokerInterface):
             return True
         return False
 
+    def is_position_open(self, ticket: int) -> bool:
+        return ticket in self._positions
+
     def get_account_info(self) -> dict:
         return {"equity": self._equity, "open_positions": len(self._positions)}
