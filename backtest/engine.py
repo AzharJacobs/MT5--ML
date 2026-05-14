@@ -126,6 +126,8 @@ def _build_feature_matrix_for_timeframe(
     metadata_bundle: Dict[str, Any],
     include_london_ny: bool = True,
     impulse_atr_multiplier: float = 0.5,
+    h1_df: pd.DataFrame = None,
+    h4_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     from data.feature_engineer import build_features
 
@@ -138,7 +140,8 @@ def _build_feature_matrix_for_timeframe(
         raise ValueError("Saved feature_columns not found in model metadata. Retrain first.")
 
     data = df.copy()
-    data = build_features(data, include_london_ny=include_london_ny,
+    data = build_features(data, h1_df=h1_df, h4_df=h4_df,
+                          include_london_ny=include_london_ny,
                           impulse_atr_multiplier=impulse_atr_multiplier)
 
     if "direction" in data.columns:
@@ -449,16 +452,17 @@ class MLSignalStrategy(bt.Strategy):
             if pred_label != existing_side:
                 return
 
-        # ── Soft HTF trend filter ──────────────────────────────────────
+        # ── Hard HTF trend gate (mirrors live_trader.py) ──────────────
+        # Block counter-trend entries when 4H clearly opposes direction.
         if _raw is not None:
             try:
                 _htf = float(_raw.get("htf_4h_bias", 0) or 0)
-                if abs(_htf) > HTF_EXTREME_THRESHOLD:
-                    if winner_proba < float(self.p.confidence):
-                        if pred_label == "sell" and _htf > 0:
-                            return
-                        if pred_label == "buy" and _htf < 0:
-                            return
+                if pred_label == "buy"  and _htf < 0:
+                    self._diag["htf_blocked"] = self._diag.get("htf_blocked", 0) + 1
+                    return
+                if pred_label == "sell" and _htf > 0:
+                    self._diag["htf_blocked"] = self._diag.get("htf_blocked", 0) + 1
+                    return
             except Exception:
                 pass
 
@@ -614,6 +618,25 @@ def run_backtest(
     query += " ORDER BY timestamp ASC"
 
     df = db.fetch_dataframe(query, tuple(params))
+
+    # Load H1 and H4 for HTF trend context (same date range)
+    h1_df = h4_df = None
+    for htf, attr in [("1H", "h1_df"), ("4H", "h4_df")]:
+        htf_query  = "SELECT * FROM xauusd_ohlcv WHERE timeframe = %s"
+        htf_params = [htf]
+        if start_date:
+            htf_query  += " AND date >= %s"; htf_params.append(start_date)
+        if end_date:
+            htf_query  += " AND date <= %s"; htf_params.append(end_date)
+        htf_query += " ORDER BY timestamp ASC"
+        htf_df = db.fetch_dataframe(htf_query, tuple(htf_params))
+        if not htf_df.empty:
+            htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"])
+            if attr == "h1_df":
+                h1_df = htf_df
+            else:
+                h4_df = htf_df
+
     db.disconnect()
 
     if df.empty:
@@ -649,7 +672,8 @@ def run_backtest(
 
     X_scaled = _build_feature_matrix_for_timeframe(df, timeframe, metadata_bundle,
                                                     include_london_ny=include_london_ny,
-                                                    impulse_atr_multiplier=saved_impulse_atr)
+                                                    impulse_atr_multiplier=saved_impulse_atr,
+                                                    h1_df=h1_df, h4_df=h4_df)
 
     feature_cols = [c for c in X_scaled.columns if c not in {"timestamp", "close", "timeframe"}]
 
@@ -667,7 +691,8 @@ def run_backtest(
     # Overlay raw (unscaled) zone values and zone quality
     try:
         from data.feature_engineer import build_features as _bf
-        _raw_feat = _bf(df.copy(), include_london_ny=include_london_ny,
+        _raw_feat = _bf(df.copy(), h1_df=h1_df, h4_df=h4_df,
+                        include_london_ny=include_london_ny,
                         impulse_atr_multiplier=saved_impulse_atr)
 
         if "timestamp" in _raw_feat.columns:

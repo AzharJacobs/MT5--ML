@@ -80,7 +80,10 @@
       "Bash(awk '{print $1}')",
       "Bash(xargs cat)",
       "Bash(python -c \"from utils.trade_logger import TradeLogger, LOGS_DIR; print\\('LOGS_DIR:', LOGS_DIR\\); t = TradeLogger\\(\\); print\\('TradeLogger init OK'\\)\")",
-      "Bash(Remove-Item \"f:\\\\MT5- ML\\\\logs\\\\*\" -Force)"
+      "Bash(Remove-Item \"f:\\\\MT5- ML\\\\logs\\\\*\" -Force)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('backtest/engine.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -m models.trainer --timeframes 15min --start-date 2024-01-01 --end-date 2026-05-14)",
+      "Bash(python backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-14 --cash 5000 --no-pct-stake --stake 1.0 --no-london-ny)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

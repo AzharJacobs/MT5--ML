@@ -1,0 +1,3 @@
+bar_time,signal,reason,prob,grade,sl,tp,rr,zone_quality,htf_4h_bias,in_session,session_id,in_demand,in_supply,rule_good_session,rule_buy_score,rule_sell_score
+2026-05-14 18:45:00,NONE,"HTF trend gate: 4H bullish (bias=1.0), blocking sell",0.0,,,,,1.754,1.0,0,0,0,1,1,3.0,2.0
+2026-05-14 19:00:00,SELL,sell Grade=C zone_quality=1.26 prob=0.858 rr=1.87,0.8577,C,4678.2401,4648.3623,1.87,1.256,-1.0,0,0,0,1,0,0.0,3.0
