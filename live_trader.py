@@ -71,7 +71,7 @@ SYMBOL                   = "XAUUSDm"
 LOOKBACK_BARS            = 350     # need enough for warmup in build_features()
 RISK_PCT                 = 1.0     # % of account balance risked per trade (when lot-size is 0)
 DEFAULT_LOTS             = 0.01    # fallback if account-based sizing fails
-MAX_CONCURRENT_POSITIONS = 2       # max simultaneous trades (same direction only)
+MAX_CONCURRENT_POSITIONS = 1       # one trade at a time — safe for $50 account
 
 # ── Grade system (mirrors backtest engine.py exactly) ─────────────────────────
 GRADE_A_MIN_ZONE_QUALITY = 3.5
