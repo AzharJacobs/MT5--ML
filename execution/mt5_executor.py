@@ -85,3 +85,31 @@ class MT5Executor(BrokerInterface):
         import MetaTrader5 as mt5
         info = mt5.account_info()
         return info._asdict() if info else {}
+
+    def get_closed_deal_info(self, ticket: int) -> dict:
+        """
+        Fetch exit details for a position that has been closed (SL/TP/manual).
+        Returns dict with exit_price, pnl, close_reason, close_time — or {} on failure.
+        """
+        import MetaTrader5 as mt5
+        from datetime import datetime
+        deals = mt5.history_deals_get(position=ticket)
+        if not deals:
+            return {}
+        reason_map = {
+            mt5.DEAL_REASON_SL:     "SL",
+            mt5.DEAL_REASON_TP:     "TP",
+            mt5.DEAL_REASON_CLIENT: "manual",
+            mt5.DEAL_REASON_MOBILE: "manual",
+            mt5.DEAL_REASON_WEB:    "manual",
+            mt5.DEAL_REASON_EXPERT: "manual",
+        }
+        for deal in deals:
+            if deal.entry == mt5.DEAL_ENTRY_OUT:
+                return {
+                    "exit_price":   deal.price,
+                    "pnl":          deal.profit,
+                    "close_reason": reason_map.get(deal.reason, "unknown"),
+                    "close_time":   datetime.fromtimestamp(deal.time).strftime("%Y-%m-%d %H:%M:%S"),
+                }
+        return {}

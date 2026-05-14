@@ -42,6 +42,7 @@ except ImportError:
 from data.loader import get_connection
 from data.feature_engineer import build_features
 from models.trainer import MODEL_DIR, MODEL_FILE, METADATA_FILE
+from utils.trade_logger import TradeLogger
 
 # ── Timeframe → sleep seconds (wait for next candle close) ───────────────────
 TF_SECONDS = {
@@ -244,6 +245,8 @@ def evaluate_bar(
     bundle: dict,
     timeframe: str,
     include_london_ny: bool = True,
+    h1_df: pd.DataFrame = None,
+    h4_df: pd.DataFrame = None,
 ) -> dict:
     """
     Run model on the latest completed bar and return a signal dict.
@@ -258,10 +261,12 @@ def evaluate_bar(
           "reason":    str,
         }
     """
-    no_trade = {"signal": 0, "sl": None, "tp": None, "rr": None, "prob": 0.0, "grade": None, "reason": ""}
+    no_trade = {"signal": 0, "sl": None, "tp": None, "rr": None, "prob": 0.0, "grade": None, "reason": "", "feat_row": None}
 
     feat_df = build_features(
         latest_bars,
+        h1_df=h1_df,
+        h4_df=h4_df,
         impulse_atr_multiplier=bundle["tf_build_params"].get(
             timeframe, {}).get("impulse_atr_multiplier", 0.5),
         include_london_ny=include_london_ny,
@@ -270,6 +275,7 @@ def evaluate_bar(
         return {**no_trade, "reason": "build_features returned empty"}
 
     row = feat_df.iloc[-1]
+    no_trade["feat_row"] = row   # attach row even on early exits so caller can log it
 
     # No hard session gate — in_session is a model feature; model decides.
     # (Matches backtest engine.py where session gate was removed.)
@@ -283,6 +289,15 @@ def evaluate_bar(
     # Between-zones guard
     if float(row.get("between_zones", 0) or 0) == 1.0:
         return {**no_trade, "reason": "between zones"}
+
+    # Hard HTF trend gate — block counter-trend entries.
+    # htf_4h_bias: 1=bullish impulse, -1=bearish impulse, 0=neutral.
+    # We block when the 4H clearly opposes the zone direction.
+    htf_4h = float(row.get("htf_4h_bias", 0) or 0)
+    if in_demand and htf_4h < 0:
+        return {**no_trade, "reason": f"HTF trend gate: 4H bearish (bias={htf_4h:.1f}), blocking buy"}
+    if in_supply and htf_4h > 0:
+        return {**no_trade, "reason": f"HTF trend gate: 4H bullish (bias={htf_4h:.1f}), blocking sell"}
 
     # Build feature vector
     feature_columns = bundle["feature_columns"]
@@ -332,6 +347,7 @@ def evaluate_bar(
         "prob":      prob_win,
         "grade":     grade,
         "reason":    f"{'buy' if direction==1 else 'sell'} Grade={grade} zone_quality={zone_quality:.2f} prob={prob_win:.3f} rr={rr}",
+        "feat_row":  row,
     }
 
 
@@ -365,17 +381,32 @@ class LiveTrader:
         _tf_bp = self.bundle["metadata"].get("tf_build_params", {}).get(timeframe, {})
         self.include_london_ny = bool(_tf_bp.get("include_london_ny", timeframe != "15min"))
 
+        self.tlog = TradeLogger()
+
         logger.info(
             "LiveTrader | mode=%s tf=%s symbol=%s include_london_ny=%s",
             mode, timeframe, symbol, self.include_london_ny,
         )
 
-    def _fetch_bars(self) -> pd.DataFrame:
+        # Log session start — captures threshold and starting balance
+        acct = self.broker.get_account_info()
+        balance = float(acct.get("balance", 0.0))
+        self.tlog.log_session_start(
+            mode=mode,
+            timeframe=timeframe,
+            symbol=symbol,
+            threshold=self.bundle["threshold"],
+            balance=balance,
+        )
+
+    def _fetch_bars(self):
+        """Return (primary_df, h1_df, h4_df). HTF frames may be None in paper/db mode."""
         if self.mode == "mt5":
             return self._fetch_bars_from_mt5()
-        return self._fetch_bars_from_db()
+        primary = self._fetch_bars_from_db()
+        return primary, None, None
 
-    def _fetch_bars_from_mt5(self) -> pd.DataFrame:
+    def _fetch_bars_from_mt5(self):
         import MetaTrader5 as mt5
         tf_const = TF_MT5.get(self.timeframe)
         if tf_const is None:
@@ -401,7 +432,23 @@ class LiveTrader:
         df["wick_upper"]  = df["high"] - body_top
         df["wick_lower"]  = body_bot   - df["low"]
         df.drop(columns=["time"], inplace=True)
-        return df.reset_index(drop=True)
+        primary = df.reset_index(drop=True)
+
+        h1_df = self._fetch_htf_bars_mt5(mt5, TF_MT5["1H"],  n_bars=200)
+        h4_df = self._fetch_htf_bars_mt5(mt5, TF_MT5["4H"],  n_bars=100)
+        return primary, h1_df, h4_df
+
+    def _fetch_htf_bars_mt5(self, mt5, tf_const: int, n_bars: int) -> pd.DataFrame:
+        """Fetch H1 or H4 bars from MT5 for HTF trend context."""
+        rates = mt5.copy_rates_from_pos(self.symbol, tf_const, 0, n_bars)
+        if rates is None or len(rates) == 0:
+            logger.warning("Could not fetch HTF bars (tf=%d) — htf_4h_bias will be 0", tf_const)
+            return None
+        htf = pd.DataFrame(rates)
+        htf["timestamp"] = pd.to_datetime(htf["time"], unit="s")
+        htf.rename(columns={"tick_volume": "volume"}, inplace=True)
+        htf.drop(columns=["time"], inplace=True)
+        return htf.reset_index(drop=True)
 
     def _fetch_bars_from_db(self) -> pd.DataFrame:
         if not self.db.connect():
@@ -420,15 +467,23 @@ class LiveTrader:
         return df.iloc[::-1].reset_index(drop=True)   # chronological
 
     def _sync_open_positions(self) -> None:
-        """Remove any positions that have been closed by SL/TP."""
+        """Remove any positions that have been closed by SL/TP and log their outcome."""
         if self.mode == "paper":
-            # PaperTrader tracks a single ticket; keep entries whose ticket is still open
             still_open = []
             for pos in self._open_positions:
                 if self.broker.is_position_open(pos["ticket"]):
                     still_open.append(pos)
                 else:
                     logger.info("Position ticket=%s closed (SL/TP hit)", pos["ticket"])
+                    # Paper mode has no price simulation — log exit as unknown
+                    self.tlog.log_exit(
+                        ticket=pos["ticket"],
+                        close_time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        exit_price=0.0,
+                        pnl=0.0,
+                        close_reason="unknown (paper)",
+                        balance_after=0.0,
+                    )
             self._open_positions = still_open
             return
 
@@ -441,6 +496,16 @@ class LiveTrader:
                     still_open.append(pos)
                 else:
                     logger.info("Position ticket=%d closed (SL/TP hit)", pos["ticket"])
+                    deal = self.broker.get_closed_deal_info(pos["ticket"])
+                    acct = self.broker.get_account_info()
+                    self.tlog.log_exit(
+                        ticket=pos["ticket"],
+                        close_time=deal.get("close_time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")),
+                        exit_price=deal.get("exit_price", 0.0),
+                        pnl=deal.get("pnl", 0.0),
+                        close_reason=deal.get("close_reason", "unknown"),
+                        balance_after=float(acct.get("balance", 0.0)),
+                    )
             self._open_positions = still_open
         except Exception as e:
             logger.warning("Could not sync positions: %s", e)
@@ -468,7 +533,7 @@ class LiveTrader:
 
         # Fetch data
         try:
-            bars = self._fetch_bars()
+            bars, h1_df, h4_df = self._fetch_bars()
         except Exception as e:
             logger.error("Failed to fetch bars: %s", e)
             return
@@ -477,8 +542,17 @@ class LiveTrader:
             logger.warning("Only %d bars — need more warmup", len(bars))
             return
 
+        logger.info(
+            "HTF context: h1=%s bars  h4=%s bars",
+            len(h1_df) if h1_df is not None else "None",
+            len(h4_df) if h4_df is not None else "None",
+        )
+
         # Evaluate signal
-        sig = evaluate_bar(bars, self.bundle, self.timeframe, self.include_london_ny)
+        sig = evaluate_bar(bars, self.bundle, self.timeframe, self.include_london_ny, h1_df=h1_df, h4_df=h4_df)
+
+        bar_time = str(bars.iloc[-1].get("timestamp", now))
+        self.tlog.log_signal(bar_time, sig, sig.get("feat_row"))
 
         if sig["signal"] == 0:
             logger.info("No signal: %s", sig["reason"])
@@ -522,6 +596,22 @@ class LiveTrader:
                 "Order placed: ticket=%s | now %d/%d positions open",
                 ticket, len(self._open_positions), MAX_CONCURRENT_POSITIONS,
             )
+            acct = self.broker.get_account_info()
+            self.tlog.log_entry(
+                ticket=ticket,
+                bar_time=bar_time,
+                symbol=self.symbol,
+                direction=direction_str,
+                grade=grade,
+                entry_price=entry,
+                sl=sig["sl"],
+                tp=sig["tp"],
+                rr=sig["rr"],
+                lots=lots,
+                prob=sig["prob"],
+                balance_before=float(acct.get("balance", 0.0)),
+                feat_row=sig.get("feat_row"),
+            )
         else:
             logger.error("Order placement failed")
 
@@ -535,18 +625,20 @@ class LiveTrader:
             "Starting live trader | interval=%ds | Ctrl-C to stop", interval
         )
 
-        while True:
-            try:
-                self.run_once()
-            except KeyboardInterrupt:
-                logger.info("Stopped by user")
-                break
-            except Exception as e:
-                logger.error("Unhandled error in run_once: %s", e, exc_info=True)
+        try:
+            while True:
+                try:
+                    self.run_once()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    logger.error("Unhandled error in run_once: %s", e, exc_info=True)
 
-            # Sleep until next candle close
-            logger.info("Sleeping %ds until next bar...", interval)
-            time.sleep(interval)
+                logger.info("Sleeping %ds until next bar...", interval)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            logger.info("Stopped by user")
+            self.tlog.log_session_end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

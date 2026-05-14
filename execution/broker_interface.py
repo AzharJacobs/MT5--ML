@@ -29,5 +29,9 @@ class BrokerInterface(ABC):
     @abstractmethod
     def get_account_info(self) -> dict: ...
 
+    def get_closed_deal_info(self, ticket: int) -> dict:
+        """Optional: return exit details for a closed position. MT5 only."""
+        return {}
+
     @abstractmethod
     def disconnect(self) -> None: ...

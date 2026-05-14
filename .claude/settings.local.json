@@ -72,7 +72,15 @@
       "Bash(python train.py --timeframes 1H --start-date 2022-01-01 --end-date 2026-02-28 --model-dir experiments/runs/1H)",
       "Bash(git rm *)",
       "PowerShell(New-Item -ItemType Directory -Path \"f:\\\\MT5- ML\\\\rl\" -Force)",
-      "PowerShell(Get-ChildItem \"f:\\\\MT5- ML\" -Name | Where-Object { $_ -notmatch '\\\\.venv' })"
+      "PowerShell(Get-ChildItem \"f:\\\\MT5- ML\" -Name | Where-Object { $_ -notmatch '\\\\.venv' })",
+      "Bash(xargs ls -lh)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(awk '{print $5, $NF}')",
+      "Bash(xargs wc -c)",
+      "Bash(awk '{print $1}')",
+      "Bash(xargs cat)",
+      "Bash(python -c \"from utils.trade_logger import TradeLogger, LOGS_DIR; print\\('LOGS_DIR:', LOGS_DIR\\); t = TradeLogger\\(\\); print\\('TradeLogger init OK'\\)\")",
+      "Bash(Remove-Item \"f:\\\\MT5- ML\\\\logs\\\\*\" -Force)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
