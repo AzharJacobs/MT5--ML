@@ -44,6 +44,13 @@ from data.feature_engineer import build_features
 from models.trainer import MODEL_DIR, MODEL_FILE, METADATA_FILE
 from utils.trade_logger import TradeLogger
 
+# ── Optional RL shadow (loads only when --rl-shadow flag is passed) ───────────
+try:
+    from rl.shadow import RLShadow as _RLShadow
+    _RL_AVAILABLE = True
+except ImportError:
+    _RL_AVAILABLE = False
+
 # ── Timeframe → sleep seconds (wait for next candle close) ───────────────────
 TF_SECONDS = {
     "1min":  60,   "2min":  120,  "3min":  180,  "4min":  240,
@@ -365,6 +372,7 @@ class LiveTrader:
         symbol: str = SYMBOL,
         risk_pct: float = RISK_PCT,
         lot_size: float = 0.0,   # 0 = auto-calculate from risk_pct
+        enable_rl_shadow: bool = False,
     ):
         self.broker     = broker
         self.mode       = mode
@@ -374,6 +382,22 @@ class LiveTrader:
         self.lot_size   = lot_size
         self.db         = None if mode == "mt5" else get_connection()
         self.bundle     = load_model_bundle()
+
+        # Optional RL shadow observer (never executes orders)
+        self.rl_shadow = None
+        if enable_rl_shadow:
+            if not _RL_AVAILABLE:
+                logger.warning("--rl-shadow requested but rl.shadow import failed (check stable-baselines3)")
+            else:
+                try:
+                    self.rl_shadow = _RLShadow.load(
+                        feature_columns=self.bundle["feature_columns"],
+                        timeframe=timeframe,
+                        symbol=symbol,
+                    )
+                    logger.info("RL shadow loaded (%s)", "multi-TF" if self.rl_shadow.is_multi_tf else "single-TF")
+                except FileNotFoundError as exc:
+                    logger.warning("RL shadow disabled — no trained model found: %s", exc)
         # Each entry: {"ticket": int, "direction": str ("buy"|"sell")}
         self._open_positions: list = []
 
@@ -551,6 +575,21 @@ class LiveTrader:
         # Evaluate signal
         sig = evaluate_bar(bars, self.bundle, self.timeframe, self.include_london_ny, h1_df=h1_df, h4_df=h4_df)
 
+        # ── RL shadow: observe same bar, log what it would do (no execution) ──
+        if self.rl_shadow is not None:
+            feat_df = sig.get("feat_row")
+            # feat_row is a Series; wrap back to a 1-row DataFrame for the shadow
+            if feat_df is not None and not isinstance(feat_df, pd.DataFrame):
+                feat_df = pd.DataFrame([feat_df])
+            rl_sig = self.rl_shadow.observe(feat_df, ml_signal=sig)
+            rl_dir = {1: "BUY", -1: "SELL", 0: "hold"}.get(rl_sig["signal"], "hold")
+            logger.info(
+                "RL shadow: %s  sl=%.5f  tp=%.5f  rr=%s  (vpos=%d veq=%.2f)",
+                rl_dir,
+                rl_sig["sl"] or 0, rl_sig["tp"] or 0, rl_sig["rr"],
+                self.rl_shadow._position, self.rl_shadow._equity,
+            )
+
         bar_time = str(bars.iloc[-1].get("timestamp", now))
         self.tlog.log_signal(bar_time, sig, sig.get("feat_row"))
 
@@ -673,6 +712,8 @@ Examples:
     parser.add_argument("--risk-pct",   type=float, default=RISK_PCT,  help="% of balance to risk per trade (mt5 mode)")
     parser.add_argument("--lot-size",   type=float, default=0.0,        help="Fixed lot size (0 = auto from risk-pct)")
     parser.add_argument("--once",       action="store_true",            help="Evaluate one bar then exit (for testing)")
+    parser.add_argument("--rl-shadow",  action="store_true",
+                        help="Run the trained RL agent in shadow mode (logs signals, no execution)")
     args = parser.parse_args()
 
     if args.mode == "mt5":
@@ -697,12 +738,13 @@ Examples:
         broker.connect()
 
     trader = LiveTrader(
-        broker     = broker,
-        mode       = args.mode,
-        timeframe  = args.timeframe,
-        symbol     = args.symbol,
-        risk_pct   = args.risk_pct,
-        lot_size   = args.lot_size,
+        broker            = broker,
+        mode              = args.mode,
+        timeframe         = args.timeframe,
+        symbol            = args.symbol,
+        risk_pct          = args.risk_pct,
+        lot_size          = args.lot_size,
+        enable_rl_shadow  = args.rl_shadow,
     )
 
     if args.once:

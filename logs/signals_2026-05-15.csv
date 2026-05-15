@@ -1,0 +1,10 @@
+bar_time,signal,reason,prob,grade,sl,tp,rr,zone_quality,htf_4h_bias,in_session,session_id,in_demand,in_supply,rule_good_session,rule_buy_score,rule_sell_score
+2026-05-14 22:30:00,NONE,prob=0.273 < threshold=0.325,0.0,,,,,1.358,-1.0,0,0,0,1,0,0.0,3.0
+2026-05-14 22:45:00,NONE,between zones,0.0,,,,,1.444,-1.0,0,0,1,0,0,2.0,1.0
+2026-05-14 23:00:00,NONE,between zones,0.0,,,,,0.962,-1.0,0,0,1,1,0,1.0,2.0
+2026-05-14 23:15:00,NONE,SL/TP computation failed (missing zone levels or RR<1.5),0.0,,,,,1.467,-1.0,0,0,0,1,0,0.0,2.0
+2026-05-14 23:30:00,NONE,"HTF trend gate: 4H bearish (bias=-1.0), blocking buy",0.0,,,,,1.095,-1.0,0,0,1,1,0,1.0,4.0
+2026-05-14 23:45:00,NONE,"HTF trend gate: 4H bearish (bias=-1.0), blocking buy",0.0,,,,,1.457,-1.0,0,0,1,1,0,1.0,2.0
+2026-05-15 00:00:00,SELL,sell Grade=C zone_quality=1.34 prob=0.711 rr=1.86,0.7115,C,4661.8528,4622.6523,1.86,1.342,-1.0,0,0,0,1,0,0.0,2.0
+2026-05-15 00:30:00,SELL,sell Grade=C zone_quality=2.58 prob=0.896 rr=2.67,0.896,C,4636.1045,4590.9811,2.67,2.585,-1.0,0,0,0,1,0,0.0,4.0
+2026-05-15 05:15:00,SELL,sell Grade=C zone_quality=1.92 prob=0.883 rr=1.5,0.8831,C,4612.4343,4549.0511,1.5,1.921,-1.0,0,0,0,1,0,0.0,3.0
