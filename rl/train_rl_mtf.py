@@ -1,30 +1,42 @@
 """
-rl/train_rl_mtf.py — Train a PPO agent on multi-timeframe XAUUSD data.
+rl/train_rl_mtf.py — Train a RecurrentPPO (LSTM) agent on multi-timeframe XAUUSD data.
 
-Observation: concatenated feature vectors from 5min, 15min, 1H, 4H + position context.
-Primary decision clock: 15min bars.
-Secondary TFs (5min, 1H, 4H) are timestamp-aligned to the primary.
+Architecture:
+  - RecurrentPPO with LSTM policy (sb3-contrib)
+  - Observation: 4 TFs × 66 features (51 ML + 15 macro) + 3 position context = 267 dims
+  - The LSTM hidden state carries regime context across bars — this is what the
+    ML bot lacks. It learns "we've been making lower highs for 2 weeks, don't buy."
 
-Reward optimised for clean PnL, tight SL discipline, and risk-adjusted returns.
-See rl/environment_mtf.py for reward details.
+Macro features added (data/macro_features.py):
+  ADX, EMA regime, swing structure (HH/HL vs LH/LL), range position,
+  volatility regime — all the context the ML bot bolted on as external filters.
+
+Reward (fixed from original):
+  - No per-step cost (was trapping the agent)
+  - Symmetric SL/TP treatment (no double SL penalty)
+  - Overtrading penalty at episode end
+  - Calmar bonus for clean equity growth
+
+Install sb3-contrib before running:
+  pip install sb3-contrib
 
 Usage:
-  # First run — pull all TFs from PostgreSQL, build features, cache, then train
-  python rl/train_rl_mtf.py --start-date 2024-01-01 --end-date 2026-02-28
+  # First run — fetch from DB, build features, cache, train
+  python rl/train_rl_mtf.py --start-date 2024-01-01 --end-date 2026-04-30
 
-  # Subsequent runs — skip DB, use cached CSVs
+  # Subsequent runs — use cached CSVs
   python rl/train_rl_mtf.py --from-cache
 
-  # Resume training from last checkpoint
+  # Resume interrupted run
   python rl/train_rl_mtf.py --from-cache --resume
 
-  # Quick smoke-test (50 k steps)
+  # Quick smoke test
   python rl/train_rl_mtf.py --from-cache --steps 50000
 
 Output:
-  rl/models/best_model_mtf/   — best checkpoint (saved by EvalCallback)
-  rl/models/final_model_mtf   — model at end of full training run
-  rl/data/features_<TF>.csv   — per-TF cached feature CSVs
+  rl/models/best_model_mtf/    — best checkpoint (EvalCallback)
+  rl/models/final_model_mtf    — final model at end of run
+  rl/data/features_<TF>.csv    — cached feature CSVs
 """
 
 import os
@@ -38,7 +50,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.pipeline_config import REQUIRED_FEATURE_COLUMNS
+from config.pipeline_config import RL_FEATURE_COLUMNS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger("rl.train_mtf")
@@ -54,7 +66,6 @@ FINAL_MODEL = os.path.join(MODELS_DIR, "final_model_mtf")
 TIMEFRAMES = ["5min", "15min", "1H", "4H"]
 PRIMARY_TF = "15min"
 
-# Per-TF feature build params (mirrors data/pipeline.py TF_PARAMS)
 TF_BUILD_PARAMS = {
     "5min":  {"impulse_atr_multiplier": 0.5, "include_london_ny": True},
     "15min": {"impulse_atr_multiplier": 0.3, "include_london_ny": False},
@@ -64,9 +75,9 @@ TF_BUILD_PARAMS = {
 
 # ── Training hyperparameters ────────────────────────────────────────────────────
 TRAIN_SPLIT     = 0.80
-EPISODE_LENGTH  = 500
-TOTAL_STEPS     = 1_000_000   # MTF obs is richer; more steps for policy convergence
-EVAL_FREQ       = 20_000
+EPISODE_LENGTH  = 2000      # ~3 weeks at 15min — enough to see full trend cycles
+TOTAL_STEPS     = 5_000_000
+EVAL_FREQ       = 25_000
 N_EVAL_EPS      = 5
 INITIAL_BALANCE = 5_000.0
 
@@ -78,6 +89,7 @@ INITIAL_BALANCE = 5_000.0
 def _load_one_tf(timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
     from data.loader import get_connection
     from data.feature_engineer import build_features
+    from data.macro_features import add_macro_features
 
     db = get_connection()
     if not db.connect():
@@ -100,12 +112,18 @@ def _load_one_tf(timeframe: str, start_date: str, end_date: str) -> pd.DataFrame
         raise ValueError(f"No data returned for {timeframe} between {start_date} and {end_date}")
 
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    params = TF_BUILD_PARAMS.get(timeframe, {})
+    params  = TF_BUILD_PARAMS.get(timeframe, {})
     feat_df = build_features(
         df,
         impulse_atr_multiplier=params.get("impulse_atr_multiplier", 0.5),
         include_london_ny=params.get("include_london_ny", True),
     )
+    feat_df = add_macro_features(feat_df)
+
+    missing = [c for c in RL_FEATURE_COLUMNS if c not in feat_df.columns]
+    if missing:
+        raise ValueError(f"{timeframe}: missing RL feature columns after build: {missing}")
+
     logger.info("%s: %d bars, %d features", timeframe, len(feat_df), feat_df.shape[1])
     return feat_df
 
@@ -123,6 +141,8 @@ def save_cache(tf_dfs: dict):
 
 
 def load_from_cache() -> dict:
+    from data.macro_features import add_macro_features
+
     tf_dfs = {}
     for tf in TIMEFRAMES:
         path = os.path.join(DATA_DIR, f"features_{tf}.csv")
@@ -131,19 +151,27 @@ def load_from_cache() -> dict:
                 f"Cache missing for {tf}: {path}\n"
                 "Run without --from-cache first to build it from the DB."
             )
-        tf_dfs[tf] = pd.read_csv(path, parse_dates=["timestamp"])
+        df = pd.read_csv(path, parse_dates=["timestamp"])
+
+        # Add macro features if not already present (old cache from before this update)
+        from config.pipeline_config import RL_MACRO_FEATURE_COLUMNS
+        if any(c not in df.columns for c in RL_MACRO_FEATURE_COLUMNS):
+            logger.info("%s cache is missing macro features — recomputing...", tf)
+            df = add_macro_features(df)
+
+        tf_dfs[tf] = df
         logger.info("Loaded %s from cache: %d bars", tf, len(tf_dfs[tf]))
     return tf_dfs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Train / test split  (split by the primary TF date; other TFs split by that ts)
+#  Train / test split
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_data(tf_dfs: dict) -> tuple:
-    primary    = tf_dfs[PRIMARY_TF]
-    split_idx  = int(len(primary) * TRAIN_SPLIT)
-    split_ts   = primary.iloc[split_idx]["timestamp"]
+    primary   = tf_dfs[PRIMARY_TF]
+    split_idx = int(len(primary) * TRAIN_SPLIT)
+    split_ts  = primary.iloc[split_idx]["timestamp"]
 
     train_dfs, test_dfs = {}, {}
     for tf, df in tf_dfs.items():
@@ -157,11 +185,18 @@ def split_data(tf_dfs: dict) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PPO training
+#  RecurrentPPO training
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(train_dfs: dict, test_dfs: dict, resume: bool = False) -> object:
-    from stable_baselines3 import PPO
+    try:
+        from sb3_contrib import RecurrentPPO
+    except ImportError:
+        raise ImportError(
+            "sb3-contrib is required for RecurrentPPO.\n"
+            "Install with: pip install sb3-contrib"
+        )
+
     from stable_baselines3.common.vec_env import DummyVecEnv
     from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
     from stable_baselines3.common.monitor import Monitor
@@ -169,15 +204,23 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False) -> object:
 
     os.makedirs(MODELS_DIR, exist_ok=True)
 
-    missing = [c for c in REQUIRED_FEATURE_COLUMNS if c not in train_dfs[PRIMARY_TF].columns]
+    missing = [c for c in RL_FEATURE_COLUMNS if c not in train_dfs[PRIMARY_TF].columns]
     if missing:
         raise ValueError(f"Primary TF training data missing columns: {missing}")
+
+    n_features = len(RL_FEATURE_COLUMNS)
+    n_tfs      = len(TIMEFRAMES)
+    obs_dim    = n_tfs * n_features + 3
+    logger.info(
+        "Obs space: %d TFs × %d features + 3 context = %d dims",
+        n_tfs, n_features, obs_dim,
+    )
 
     def _make_env(tf_dfs):
         def _factory():
             env = XAUUSDMultiTFEnv(
                 tf_dfs          = tf_dfs,
-                feature_columns = REQUIRED_FEATURE_COLUMNS,
+                feature_columns = RL_FEATURE_COLUMNS,
                 primary_tf      = PRIMARY_TF,
                 initial_balance = INITIAL_BALANCE,
                 episode_length  = EPISODE_LENGTH,
@@ -198,40 +241,40 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False) -> object:
         verbose              = 1,
     )
     checkpoint_callback = CheckpointCallback(
-        save_freq   = 100_000,
+        save_freq   = 250_000,
         save_path   = os.path.join(MODELS_DIR, "checkpoints_mtf"),
-        name_prefix = "ppo_mtf_xauusd",
+        name_prefix = "rppo_mtf_xauusd",
         verbose     = 1,
     )
 
-    n_features = len(REQUIRED_FEATURE_COLUMNS)
-    n_tfs      = len(TIMEFRAMES)
-    obs_dim    = n_tfs * n_features + 3
-
     if resume and os.path.exists(FINAL_MODEL + ".zip"):
         logger.info("Resuming from %s", FINAL_MODEL)
-        model = PPO.load(FINAL_MODEL, env=train_env)
+        model = RecurrentPPO.load(FINAL_MODEL, env=train_env)
     else:
-        logger.info("New MTF PPO agent | obs_dim=%d | tfs=%s", obs_dim, TIMEFRAMES)
-        model = PPO(
-            policy          = "MlpPolicy",
-            env             = train_env,
-            learning_rate   = 2e-4,       # slightly lower than single-TF for richer obs
-            n_steps         = 2048,
-            batch_size      = 128,        # larger batch improves stability with 255-dim obs
-            n_epochs        = 10,
-            gamma           = 0.99,
-            gae_lambda      = 0.95,
-            clip_range      = 0.2,
-            ent_coef        = 0.005,      # less exploration needed — obs is information-rich
-            vf_coef         = 0.5,
-            max_grad_norm   = 0.5,
-            policy_kwargs   = {"net_arch": [256, 256]},   # two hidden layers for MTF obs
+        logger.info("New RecurrentPPO agent | obs_dim=%d | tfs=%s", obs_dim, TIMEFRAMES)
+        model = RecurrentPPO(
+            policy        = "MlpLstmPolicy",
+            env           = train_env,
+            learning_rate = 5e-5,        # stable: was 2e-4 which caused KL=0.17
+            n_steps       = 2048,
+            batch_size    = 128,
+            n_epochs      = 10,
+            gamma         = 0.995,       # longer horizon: was 0.99 (too short for 2000-bar eps)
+            gae_lambda    = 0.95,
+            clip_range    = 0.1,         # tighter: was 0.2 which caused clip_fraction=0.39
+            ent_coef      = 0.02,        # more exploration: was 0.005
+            vf_coef       = 0.5,
+            max_grad_norm = 0.5,
+            policy_kwargs = {
+                "lstm_hidden_size": 256,
+                "n_lstm_layers":    2,
+                "net_arch":         [256, 128],  # layers before/after LSTM
+            },
             verbose         = 1,
             tensorboard_log = os.path.join(MODELS_DIR, "tensorboard_mtf"),
         )
 
-    logger.info("Training MTF PPO for %d steps...", TOTAL_STEPS)
+    logger.info("Training RecurrentPPO for %d steps...", TOTAL_STEPS)
     start_time = datetime.now()
     model.learn(
         total_timesteps     = TOTAL_STEPS,
@@ -257,31 +300,40 @@ def evaluate(model, test_dfs: dict):
     logger.info("Running full test-set evaluation...")
     env = XAUUSDMultiTFEnv(
         tf_dfs          = test_dfs,
-        feature_columns = REQUIRED_FEATURE_COLUMNS,
+        feature_columns = RL_FEATURE_COLUMNS,
         primary_tf      = PRIMARY_TF,
         initial_balance = INITIAL_BALANCE,
-        episode_length  = len(test_dfs[PRIMARY_TF]),  # single episode = full test period
+        episode_length  = len(test_dfs[PRIMARY_TF]),
     )
 
-    obs, _ = env.reset(seed=42)
-    done   = False
+    obs, _     = env.reset(seed=42)
+    lstm_states = None
+    done        = False
+    episode_start = np.ones((1,), dtype=bool)
+
     while not done:
-        action, _ = model.predict(obs, deterministic=True)
+        action, lstm_states = model.predict(
+            obs,
+            state          = lstm_states,
+            episode_start  = episode_start,
+            deterministic  = True,
+        )
         obs, _, terminated, truncated, _ = env.step(int(action))
-        done = terminated or truncated
+        done          = terminated or truncated
+        episode_start = np.array([done])
 
     stats = env.summary()
-    print("\n" + "=" * 54)
-    print("RL MTF AGENT — TEST SET RESULTS")
-    print("=" * 54)
+    print("\n" + "=" * 58)
+    print("RECURRENT PPO — TEST SET RESULTS")
+    print("=" * 58)
     for k, v in stats.items():
         print(f"  {k:<26} {v}")
-    print("─" * 54)
+    print("─" * 58)
     print("ML bot reference (Jan–Apr 2026 backtest):")
     print("  win_rate                   0.692")
     print("  profit_factor              2.49")
     print("  max_drawdown               ~0.088")
-    print("=" * 54)
+    print("=" * 58)
     return stats
 
 
@@ -291,12 +343,12 @@ def evaluate(model, test_dfs: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train PPO RL agent on multi-timeframe XAUUSD data",
+        description="Train RecurrentPPO RL agent on multi-timeframe XAUUSD data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Full run from DB (first time)
-  python rl/train_rl_mtf.py --start-date 2024-01-01 --end-date 2026-02-28
+  python rl/train_rl_mtf.py --start-date 2024-01-01 --end-date 2026-04-30
 
   # Cached run (subsequent)
   python rl/train_rl_mtf.py --from-cache
@@ -308,11 +360,11 @@ Examples:
   python rl/train_rl_mtf.py --from-cache --steps 50000
         """,
     )
-    parser.add_argument("--start-date",  default="2024-01-01",  help="DB fetch start date")
-    parser.add_argument("--end-date",    default="2026-02-28",  help="DB fetch end date")
-    parser.add_argument("--from-cache",  action="store_true",   help="Load from rl/data/*.csv")
-    parser.add_argument("--resume",      action="store_true",   help="Resume from final_model_mtf.zip")
-    parser.add_argument("--steps",       type=int, default=TOTAL_STEPS, help="PPO timesteps")
+    parser.add_argument("--start-date", default="2024-01-01")
+    parser.add_argument("--end-date",   default="2026-04-30")
+    parser.add_argument("--from-cache", action="store_true")
+    parser.add_argument("--resume",     action="store_true")
+    parser.add_argument("--steps",      type=int, default=TOTAL_STEPS)
     args = parser.parse_args()
 
     global TOTAL_STEPS

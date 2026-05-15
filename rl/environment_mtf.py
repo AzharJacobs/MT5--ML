@@ -1,17 +1,19 @@
 """
-rl/environment_mtf.py — Multi-timeframe Gym environment for XAUUSD PPO training.
+rl/environment_mtf.py — Multi-timeframe Gym environment for XAUUSD RecurrentPPO training.
 
-Observation space: concatenated feature vectors from all supplied timeframes
+Observation: concatenated feature vectors from all supplied timeframes
 (default: 5min, 15min, 1H, 4H) + position context [position, unrealised_pnl, bars_held].
-Primary decision clock: 15min bars (or whichever is set as primary_tf).
-Secondary TFs are aligned to the primary by timestamp (latest bar <= primary bar ts).
+Primary decision clock: 15min bars. Secondary TFs are timestamp-aligned.
 
-Reward is optimised for:
-  - Clean realised PnL (no extra reward for paper gains)
-  - Tight SL discipline  (1+sl_extra_penalty multiplier on SL-hit losses)
-  - Risk-adjusted returns (bonus proportional to RR above min_rr on TP hits)
-  - Drawdown control     (heavy penalty above 5% equity drawdown)
-  - Activity incentive   (small per-step cost to prevent staying flat forever)
+Feature set: RL_FEATURE_COLUMNS (66 per TF = 51 ML features + 15 macro features).
+The macro features give the agent the regime awareness the ML bot lacks:
+ADX, EMA alignment, swing structure, range position.
+
+Reward design (fixed from original):
+  - Reward ONLY on trade close (no per-step cost that trapped the agent)
+  - Symmetric SL/TP treatment (no asymmetric penalty that caused overtrading)
+  - Calmar-based episode bonus to reward consistent equity growth
+  - Overtrading penalty at episode end (> MAX_TRADES_PER_EPISODE)
 """
 
 import numpy as np
@@ -19,6 +21,9 @@ import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional
+
+
+MAX_TRADES_PER_EPISODE = 15   # penalty kicks in above this
 
 
 class XAUUSDMultiTFEnv(gym.Env):
@@ -32,13 +37,12 @@ class XAUUSDMultiTFEnv(gym.Env):
         primary_tf: str         = "15min",
         initial_balance: float  = 5_000.0,
         lot_size: float         = 0.01,
-        contract_size: float    = 10.0,   # XAUUSDm: 10 oz per 0.01 lot
+        contract_size: float    = 10.0,
         sl_atr_buffer: float    = 0.5,
         min_rr: float           = 1.5,
-        drawdown_penalty: float = 3.0,    # multiplier when drawdown > 5%
-        sl_extra_penalty: float = 1.0,    # applied as (1 + sl_extra_penalty) on SL-hit pnl
-        rr_bonus_factor: float  = 0.25,   # reward bonus per unit of RR above min_rr on TP hit
-        episode_length: int     = 500,
+        drawdown_penalty: float = 2.0,
+        rr_bonus_factor: float  = 0.3,
+        episode_length: int     = 2000,
     ):
         super().__init__()
 
@@ -53,19 +57,17 @@ class XAUUSDMultiTFEnv(gym.Env):
         self.sl_atr_buffer    = sl_atr_buffer
         self.min_rr           = min_rr
         self.drawdown_penalty = drawdown_penalty
-        self.sl_extra_penalty = sl_extra_penalty
         self.rr_bonus_factor  = rr_bonus_factor
         self.episode_length   = episode_length
 
         self.primary_df    = tf_dfs[primary_tf].reset_index(drop=True)
-        # Secondary TFs: sorted for deterministic obs stacking
         self.secondary_tfs = sorted(tf for tf in tf_dfs if tf != primary_tf)
         self.secondary_dfs = {tf: tf_dfs[tf].reset_index(drop=True) for tf in self.secondary_tfs}
 
         self._aligned = self._precompute_alignment()
 
-        n_tfs  = 1 + len(self.secondary_tfs)
-        n_obs  = n_tfs * len(feature_columns) + 3   # +3 for position context
+        n_tfs = 1 + len(self.secondary_tfs)
+        n_obs = n_tfs * len(feature_columns) + 3   # +3 position context
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32
         )
@@ -78,10 +80,6 @@ class XAUUSDMultiTFEnv(gym.Env):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _precompute_alignment(self) -> dict:
-        """
-        For each primary bar i, find the most recent index in each secondary TF
-        where secondary_ts <= primary_ts[i].  O(n log n) via searchsorted.
-        """
         primary_ts = pd.to_datetime(self.primary_df["timestamp"]).values.astype(np.int64)
         aligned = {}
         for tf, df in self.secondary_dfs.items():
@@ -101,7 +99,7 @@ class XAUUSDMultiTFEnv(gym.Env):
         self.balance       = self.initial_balance
         self.equity        = self.initial_balance
         self.peak_equity   = self.initial_balance
-        self.position      = 0       # -1=short, 0=flat, 1=long
+        self.position      = 0
         self.entry_price   = 0.0
         self.entry_rr      = 0.0
         self.sl            = 0.0
@@ -140,11 +138,10 @@ class XAUUSDMultiTFEnv(gym.Env):
         return (price - self.entry_price) * self.position * self.lot_size * self.contract_size
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  SL / TP — mirrors live_trader.py compute_sl_tp exactly
+    #  SL / TP — mirrors live_trader.py exactly
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compute_sl_tp(self, row: pd.Series, direction: int):
-        """Returns (sl, tp, rr) using zone levels or (None, None, None) if unavailable."""
         close = float(row["close"])
         atr   = float(row.get("atr_14", 0) or 0)
         if atr <= 0:
@@ -158,7 +155,7 @@ class XAUUSDMultiTFEnv(gym.Env):
             except (TypeError, ValueError):
                 return np.nan
 
-        if direction == 1:   # buy
+        if direction == 1:
             d_bottom = _f("demand_zone_bottom")
             s_bottom = _f("supply_zone_bottom")
             if np.isnan(d_bottom):
@@ -170,8 +167,7 @@ class XAUUSDMultiTFEnv(gym.Env):
             tp = (close + (s_bottom - close)) if (not np.isnan(s_bottom) and s_bottom > close) \
                  else close + max(self.min_rr * risk, 3.0 * atr)
             rr = (tp - close) / risk
-
-        else:                # sell
+        else:
             s_top = _f("supply_zone_top")
             d_top = _f("demand_zone_top")
             if np.isnan(s_top):
@@ -190,7 +186,7 @@ class XAUUSDMultiTFEnv(gym.Env):
         return round(sl, 5), round(tp, 5), round(rr, 3)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  SL / TP hit detection (bar high/low)
+    #  SL / TP hit detection
     # ─────────────────────────────────────────────────────────────────────────
 
     def _check_sl_tp(self, row: pd.Series):
@@ -219,7 +215,7 @@ class XAUUSDMultiTFEnv(gym.Env):
         close = float(row["close"])
         reward = 0.0
 
-        # ── 1. Resolve SL/TP hit from previous bar ────────────────────────────
+        # ── 1. Resolve SL/TP hit ──────────────────────────────────────────────
         sl_hit, tp_hit = self._check_sl_tp(row)
         if sl_hit or tp_hit:
             exit_price = self.sl if sl_hit else self.tp
@@ -228,13 +224,13 @@ class XAUUSDMultiTFEnv(gym.Env):
             self.balance += pnl
             pnl_norm = pnl / self.initial_balance * 100
 
-            if sl_hit:
-                # Extra penalty on SL hit: (1 + sl_extra_penalty) × negative pnl
-                reward += pnl_norm * (1.0 + self.sl_extra_penalty)
-            else:
-                # TP hit: bonus for trades with RR above floor
+            if tp_hit:
+                # Bonus for trades with RR above the floor
                 rr_bonus = self.rr_bonus_factor * max(self.entry_rr - self.min_rr, 0.0)
-                reward   += pnl_norm * (1.0 + rr_bonus)
+                reward  += pnl_norm * (1.0 + rr_bonus)
+            else:
+                # SL hit: no extra multiplier — same scale as TP reward
+                reward += pnl_norm
 
             self.trade_history.append({
                 "pnl":  pnl,
@@ -272,17 +268,26 @@ class XAUUSDMultiTFEnv(gym.Env):
         if current_dd > 0.05:
             reward -= self.drawdown_penalty * (current_dd - 0.05) * 100
 
-        # ── 5. Per-step cost (discourages staying flat forever) ───────────────
-        reward -= 0.001
-
-        # ── 6. Advance ────────────────────────────────────────────────────────
+        # ── 5. Advance ────────────────────────────────────────────────────────
         self.current_step += 1
         steps_taken = self.current_step - self.episode_start
         terminated  = self.current_step >= len(self.primary_df) - 1
         truncated   = (
             steps_taken >= self.episode_length
-            or self.equity < self.initial_balance * 0.50   # -50% → end episode early
+            or self.equity < self.initial_balance * 0.50
         )
+
+        # ── 6. Episode-end penalties ──────────────────────────────────────────
+        if terminated or truncated:
+            n_trades = len(self.trade_history)
+            if n_trades > MAX_TRADES_PER_EPISODE:
+                reward -= 0.05 * (n_trades - MAX_TRADES_PER_EPISODE)
+
+            # Calmar bonus: reward clean equity growth relative to drawdown
+            total_pnl_pct = (self.equity - self.initial_balance) / self.initial_balance
+            if self.max_drawdown > 0 and total_pnl_pct > 0:
+                calmar = total_pnl_pct / self.max_drawdown
+                reward += min(calmar * 0.5, 5.0)
 
         info = {
             "balance":      self.balance,
@@ -303,7 +308,7 @@ class XAUUSDMultiTFEnv(gym.Env):
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Episode summary (call after episode ends)
+    #  Episode summary
     # ─────────────────────────────────────────────────────────────────────────
 
     def summary(self) -> dict:

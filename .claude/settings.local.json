@@ -87,7 +87,10 @@
       "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Force)",
       "Bash(Select-Object -Property FullName, PSIsContainer)",
       "Bash(Format-Table -AutoSize)",
-      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import stable_baselines3; print\\('sb3 version:', stable_baselines3.__version__\\)\")"
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import stable_baselines3; print\\('sb3 version:', stable_baselines3.__version__\\)\")",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\rl\\\\\" -Recurse -File | Select-Object -ExpandProperty FullName)",
+      "Bash(Remove-Item -Path \"f:\\\\MT5- ML\\\\rl\\\\environment.py\", \"f:\\\\MT5- ML\\\\rl\\\\environment_raw.py\", \"f:\\\\MT5- ML\\\\rl\\\\train_rl.py\", \"f:\\\\MT5- ML\\\\rl\\\\train_rl_raw.py\", \"f:\\\\MT5- ML\\\\rl\\\\test_env.py\" -Force)",
+      "PowerShell(Get-ChildItem \"f:\\\\MT5- ML\\\\rl\" -Recurse | Where-Object { !$_.PSIsContainer } | Select-Object FullName)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

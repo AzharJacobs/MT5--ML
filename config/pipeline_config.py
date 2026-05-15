@@ -46,6 +46,29 @@ SMOTE_RATIO = 0.4
 # data/feature_engineer.py imports this and re-exports it as FEATURE_COLUMNS
 # so all downstream callers continue to work unchanged.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# RL-only macro/regime features (added on top of REQUIRED_FEATURE_COLUMNS).
+# NOT used by the live trading bot — only imported by rl/train_rl_mtf.py.
+# See data/macro_features.py for definitions.
+# ---------------------------------------------------------------------------
+RL_MACRO_FEATURE_COLUMNS = [
+    "macro_trend_20",
+    "macro_trend_50",
+    "macro_bull_pct_20",
+    "macro_hh_hl",
+    "macro_lh_ll",
+    "macro_adx_14",
+    "macro_trending",
+    "macro_price_vs_ema50",
+    "macro_price_vs_ema200",
+    "macro_ema_alignment",
+    "macro_atr_ratio",
+    "macro_swing_high_dist",
+    "macro_swing_low_dist",
+    "macro_range_pos_50",
+    "macro_momentum_20",
+]
+
 REQUIRED_FEATURE_COLUMNS = [
     # ── Strategy rule features (primary signal) ──────────────────────────
     "rule_valid_buy_setup",
@@ -100,3 +123,6 @@ REQUIRED_FEATURE_COLUMNS = [
     # ── Session identity (1=London open, 2=NY open, 3=overlap, 0=off) ────
     "session_id",
 ]
+
+# Full RL feature set: ML features + macro regime context (66 per TF)
+RL_FEATURE_COLUMNS = REQUIRED_FEATURE_COLUMNS + RL_MACRO_FEATURE_COLUMNS
