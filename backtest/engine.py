@@ -68,8 +68,8 @@ RAW_ZONE_COLS = [
     "htf_demand_zone_top", "htf_demand_zone_bottom",
     "htf_supply_zone_top", "htf_supply_zone_bottom",
     "atr_14",
-    "htf_4h_bias",   # needed for hard HTF trend gate (unscaled: 1.0 / -1.0)
-    "htf_1h_bias",   # needed for hard HTF trend gate
+    "htf_4h_bias",   # HTF context fed to model (unscaled: 1.0 / -1.0)
+    "htf_1h_bias",   # HTF context fed to model
     "in_demand_zone", "in_supply_zone",  # direction source — model predicts winner/loser, not buy/sell
 ]
 
@@ -451,20 +451,6 @@ class MLSignalStrategy(bt.Strategy):
             existing_side = self._open_trades[0]["side"]
             if pred_label != existing_side:
                 return
-
-        # ── Hard HTF trend gate (mirrors live_trader.py) ──────────────
-        # Block counter-trend entries when 4H clearly opposes direction.
-        if _raw is not None:
-            try:
-                _htf = float(_raw.get("htf_4h_bias", 0) or 0)
-                if pred_label == "buy"  and _htf < 0:
-                    self._diag["htf_blocked"] = self._diag.get("htf_blocked", 0) + 1
-                    return
-                if pred_label == "sell" and _htf > 0:
-                    self._diag["htf_blocked"] = self._diag.get("htf_blocked", 0) + 1
-                    return
-            except Exception:
-                pass
 
         close_price = float(self.data.close[0])
 

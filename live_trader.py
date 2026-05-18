@@ -297,15 +297,6 @@ def evaluate_bar(
     if float(row.get("between_zones", 0) or 0) == 1.0:
         return {**no_trade, "reason": "between zones"}
 
-    # Hard HTF trend gate — block counter-trend entries.
-    # htf_4h_bias: 1=bullish impulse, -1=bearish impulse, 0=neutral.
-    # We block when the 4H clearly opposes the zone direction.
-    htf_4h = float(row.get("htf_4h_bias", 0) or 0)
-    if in_demand and htf_4h < 0:
-        return {**no_trade, "reason": f"HTF trend gate: 4H bearish (bias={htf_4h:.1f}), blocking buy"}
-    if in_supply and htf_4h > 0:
-        return {**no_trade, "reason": f"HTF trend gate: 4H bullish (bias={htf_4h:.1f}), blocking sell"}
-
     # Build feature vector
     feature_columns = bundle["feature_columns"]
     last_row = feat_df.iloc[[-1]].copy()
@@ -534,11 +525,20 @@ class LiveTrader:
         except Exception as e:
             logger.warning("Could not sync positions: %s", e)
 
-    def _get_lots(self, grade: str) -> float:
-        """Fixed lot size by grade — matches backtest engine."""
+    def _get_lots(self, grade: str, sl_distance: float = 0.0) -> float:
+        """Risk-based lot sizing — risks RISK_PCT% of balance per trade.
+        Grade A gets 1.5× the base risk allocation; Grade C gets 1.0×.
+        Falls back to fixed DEFAULT_LOTS if MT5 data is unavailable."""
         if self.lot_size > 0:
             return self.lot_size
-        return GRADE_LOTS.get(grade, DEFAULT_LOTS)
+        if sl_distance > 0:
+            grade_risk_multiplier = 1.5 if grade == "A" else 1.0
+            adjusted_risk_pct = self.risk_pct * grade_risk_multiplier
+            return calculate_lot_size(
+                self.broker, self.symbol, sl_distance,
+                adjusted_risk_pct, fallback_lots=DEFAULT_LOTS,
+            )
+        return DEFAULT_LOTS
 
     def run_once(self) -> None:
         """Evaluate one bar and place/skip order."""
@@ -612,7 +612,8 @@ class LiveTrader:
 
         entry = float(bars.iloc[-1]["close"])
         grade = sig.get("grade", "C")
-        lots  = self._get_lots(grade)
+        sl_distance = abs(entry - sig["sl"]) if sig.get("sl") else 0.0
+        lots  = self._get_lots(grade, sl_distance=sl_distance)
 
         logger.info(
             "SIGNAL %s | Grade=%s entry=%.5f sl=%.5f tp=%.5f rr=%.2f prob=%.3f lots=%.2f",
