@@ -32,3 +32,4 @@ bar_time,signal,reason,prob,grade,sl,tp,rr,zone_quality,htf_4h_bias,in_session,s
 2026-05-18 06:15:00,NONE,"HTF trend gate: 4H bearish (bias=-1.0), blocking buy",0.0,,,,,1.179,-1.0,0,0,1,1,0,1.0,2.0
 2026-05-18 06:30:00,NONE,"HTF trend gate: 4H bearish (bias=-1.0), blocking buy",0.0,,,,,1.633,-1.0,0,0,1,0,0,1.0,1.0
 2026-05-18 06:45:00,NONE,"HTF trend gate: 4H bearish (bias=-1.0), blocking buy",0.0,,,,,1.681,-1.0,0,0,1,1,0,1.0,2.0
+2026-05-18 07:00:00,BUY,buy Grade=C zone_quality=1.72 prob=0.377 rr=1.5,0.377,C,4519.1286,4586.5346,1.5,1.724,-1.0,0,0,1,0,0,1.0,1.0
