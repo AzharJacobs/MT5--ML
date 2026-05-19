@@ -223,6 +223,55 @@ def compute_ml_signals_rules(df: pd.DataFrame) -> pd.DataFrame:
 #  Cache loading (reuses train_rl_mtf.py cache)
 # ─────────────────────────────────────────────────────────────────────────────
 
+TF_BUILD_PARAMS = {
+    "5min":  {"impulse_atr_multiplier": 0.5, "include_london_ny": True},
+    "15min": {"impulse_atr_multiplier": 0.3, "include_london_ny": False},
+    "1H":    {"impulse_atr_multiplier": 0.5, "include_london_ny": True},
+    "4H":    {"impulse_atr_multiplier": 0.5, "include_london_ny": True},
+}
+
+
+def _build_from_raw(tf: str) -> pd.DataFrame:
+    """Build features_{tf}.csv from raw_{tf}.csv when features cache is missing."""
+    from data.feature_engineer import build_features
+    from data.macro_features import add_macro_features
+
+    raw_path = os.path.join(DATA_DIR, f"raw_{tf}.csv")
+    if not os.path.exists(raw_path):
+        raise FileNotFoundError(
+            f"Neither features_{tf}.csv nor raw_{tf}.csv found in {DATA_DIR}.\n"
+            "Run: python rl/train_rl_mtf.py --start-date 2024-01-01 --end-date 2026-04-30"
+        )
+
+    logger.info("%s: features cache missing — building from %s ...", tf, raw_path)
+    df = pd.read_csv(raw_path, parse_dates=["timestamp"])
+
+    # Derive columns required by build_features() that raw exports omit
+    if "year" not in df.columns:
+        df["year"] = df["timestamp"].dt.year
+    if "candle_size" not in df.columns:
+        df["candle_size"] = df["high"] - df["low"]
+    if "body_size" not in df.columns:
+        df["body_size"] = (df["close"] - df["open"]).abs()
+    if "wick_upper" not in df.columns:
+        df["wick_upper"] = df["high"] - df[["open", "close"]].max(axis=1)
+    if "wick_lower" not in df.columns:
+        df["wick_lower"] = df[["open", "close"]].min(axis=1) - df["low"]
+
+    params   = TF_BUILD_PARAMS.get(tf, {})
+    feat_df  = build_features(
+        df,
+        impulse_atr_multiplier=params.get("impulse_atr_multiplier", 0.5),
+        include_london_ny=params.get("include_london_ny", True),
+    )
+    feat_df  = add_macro_features(feat_df)
+
+    out_path = os.path.join(DATA_DIR, f"features_{tf}.csv")
+    feat_df.to_csv(out_path, index=False)
+    logger.info("%s: saved %d bars → %s", tf, len(feat_df), out_path)
+    return feat_df
+
+
 def load_from_cache() -> dict:
     from data.macro_features import add_macro_features
     from config.pipeline_config import RL_MACRO_FEATURE_COLUMNS
@@ -231,15 +280,12 @@ def load_from_cache() -> dict:
     for tf in TIMEFRAMES:
         path = os.path.join(DATA_DIR, f"features_{tf}.csv")
         if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Cache missing for {tf}: {path}\n"
-                "Build it first with:\n"
-                "  python rl/train_rl_mtf.py --start-date 2024-01-01 --end-date 2026-04-30"
-            )
-        df = pd.read_csv(path, parse_dates=["timestamp"])
-        if any(c not in df.columns for c in RL_MACRO_FEATURE_COLUMNS):
-            logger.info("%s: macro features missing from cache — recomputing...", tf)
-            df = add_macro_features(df)
+            df = _build_from_raw(tf)
+        else:
+            df = pd.read_csv(path, parse_dates=["timestamp"])
+            if any(c not in df.columns for c in RL_MACRO_FEATURE_COLUMNS):
+                logger.info("%s: macro features missing from cache — recomputing...", tf)
+                df = add_macro_features(df)
         tf_dfs[tf] = df
         logger.info("Loaded %-5s: %d bars", tf, len(df))
     return tf_dfs
