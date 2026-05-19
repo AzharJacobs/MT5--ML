@@ -710,7 +710,7 @@ Examples:
     parser.add_argument("--login",      type=int,         help="MT5 account login number")
     parser.add_argument("--password",                     help="MT5 account password")
     parser.add_argument("--server",                       help="MT5 broker server name")
-    parser.add_argument("--risk-pct",   type=float, default=RISK_PCT,  help="% of balance to risk per trade (mt5 mode)")
+    parser.add_argument("--risk-pct",   type=float, default=RISK_PCT,  help="%% of balance to risk per trade (mt5 mode)")
     parser.add_argument("--lot-size",   type=float, default=0.0,        help="Fixed lot size (0 = auto from risk-pct)")
     parser.add_argument("--once",       action="store_true",            help="Evaluate one bar then exit (for testing)")
     parser.add_argument("--rl-shadow",  action="store_true",
