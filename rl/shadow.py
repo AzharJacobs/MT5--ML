@@ -252,12 +252,14 @@ class RLShadow:
         ml_signal_dict: Optional[dict] = None,
     ) -> np.ndarray:
         fc = self.feature_columns
-        parts = [primary_row[fc].fillna(0).values.astype(np.float32)]
+        parts = [primary_row.reindex(fc, fill_value=0).fillna(0).values.astype(np.float32)]
 
         if self.is_multi_tf and secondary_rows:
             for tf in self.secondary_tfs:
                 if tf in secondary_rows:
-                    parts.append(secondary_rows[tf][fc].fillna(0).values.astype(np.float32))
+                    parts.append(
+                        secondary_rows[tf].reindex(fc, fill_value=0).fillna(0).values.astype(np.float32)
+                    )
                 else:
                     parts.append(np.zeros(len(fc), dtype=np.float32))
 
