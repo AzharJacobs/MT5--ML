@@ -93,7 +93,20 @@
       "PowerShell(Get-ChildItem \"f:\\\\MT5- ML\\\\rl\" -Recurse | Where-Object { !$_.PSIsContainer } | Select-Object FullName)",
       "Bash(Get-ChildItem \"F:\\\\MT5- ML\" -Filter \"*.py\" -Depth 0)",
       "Bash(Select-Object Name)",
-      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Filter \"*.py\" -Recurse -Exclude \".venv\")"
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Filter \"*.py\" -Recurse -Exclude \".venv\")",
+      "Bash(python -m backtest.engine --timeframe 1H --start-date 2026-01-01 --end-date 2026-03-31)",
+      "Bash(python -m backtest.engine --timeframe 15min --start-date 2026-01-01 --end-date 2026-03-31)",
+      "Bash(python -m models.trainer --timeframes 5min 15min --start-date 2024-01-01 --end-date 2026-04-30 --model-type catboost)",
+      "Bash(python -m backtest.engine --timeframe 15min --start-date 2026-01-01 --end-date 2026-03-31 --cash 1000 --confidence 0.450 --max-confidence 0.65 --min-zone-quality 1.5)",
+      "Bash(python -m backtest.engine --timeframe 15min --start-date 2026-01-01 --end-date 2026-03-31 --cash 1000 --confidence 0.450 --max-confidence 0.55 --min-zone-quality 1.5)",
+      "Bash(python -m backtest.engine --timeframe 15min --start-date 2025-01-01 --end-date 2026-03-31 --cash 1000 --confidence 0.450 --max-confidence 0.55 --min-zone-quality 1.5)",
+      "Bash(python -m backtest.engine --timeframe 15min --start-date 2025-01-01 --end-date 2026-03-31 --cash 50 --confidence 0.450 --max-confidence 0.55 --min-zone-quality 1.5)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Directory -ErrorAction SilentlyContinue)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"from sb3_contrib import RecurrentPPO; print\\('sb3-contrib OK'\\)\")",
+      "Bash(\".venv/Scripts/python.exe\" -c \"from sb3_contrib import RecurrentPPO; print\\('sb3-contrib OK'\\)\")",
+      "Bash(\".venv/Scripts/python.exe\" -m pip install sb3-contrib)",
+      "Bash(\".venv/Scripts/python.exe\" rl/test_env_mtf.py)",
+      "Bash(awk '{print $NF}')"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

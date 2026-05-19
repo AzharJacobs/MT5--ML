@@ -42,6 +42,8 @@ from typing import Dict, Any, List, Tuple, Optional
 from sklearn.metrics import (
     accuracy_score, classification_report, confusion_matrix, f1_score
 )
+from sklearn.linear_model import LogisticRegression as _PlattLR
+from models.calibration import _PlattWrapper
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 
 from data.pipeline import DataPreparator
@@ -74,11 +76,13 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s"
 )
 
+
+
 MODEL_DIR     = "experiments/runs"
 MODEL_FILE    = "gold_ml_model.joblib"
 METADATA_FILE = "model_metadata.joblib"
 
-SMOTE_RATIO = 0.4
+SMOTE_RATIO = 0.25
 
 
 class ModelTrainer:
@@ -297,6 +301,17 @@ class ModelTrainer:
             dist = y_split.value_counts().to_dict()
             print(f"  {split_name} labels: {dist}")
 
+        # Worn zone label downgrade breakdown
+        print(f"\n  WORN ZONE DOWNGRADE SUMMARY")
+        for split_name, raw in [("Train", raw_train), ("Test", raw_test)]:
+            if raw is not None and "worn_zone_downgrade" in raw.columns:
+                n_down  = int(raw["worn_zone_downgrade"].sum())
+                n_sigs  = int((raw["signal"] != 0).sum()) if "signal" in raw.columns else 0
+                n_tp    = int((raw.get("trade_outcome", pd.Series(0)) == 1).sum())
+                pct_tp  = n_down / max(n_tp, 1) * 100
+                print(f"    {split_name}: {n_down:,} TP hits demoted to 0 "
+                      f"({pct_tp:.1f}% of {n_tp:,} TP hits, from {n_sigs:,} total signals)")
+
         if tune and optuna is not None:
             logger.info("Running Optuna hyperparameter search...")
             best_params = self._tune(X_train, y_train, n_trials=tune_trials)
@@ -368,15 +383,7 @@ class ModelTrainer:
         elapsed = (datetime.now() - t0).total_seconds()
         print(f"  Training complete in {elapsed:.1f}s")
 
-        # Find optimal threshold BEFORE evaluate so report uses it
-        self.optimal_threshold = self._find_optimal_threshold(X_test_np, y_test_np)
-
-        results = self._evaluate(
-            X_train_np, y_train_np,
-            X_test_np,  y_test_np,
-            threshold=self.optimal_threshold,
-        )
-
+        # CV on the raw (pre-calibration) base model — _PlattWrapper has no fit()
         tscv = TimeSeriesSplit(n_splits=5)
         try:
             cv_scores = cross_val_score(
@@ -385,11 +392,33 @@ class ModelTrainer:
             )
             cv_label = "F1 (minority)"
         except Exception:
-            cv_scores = cross_val_score(
-                self.model, X_test_np, y_test_np,
-                cv=tscv, scoring="accuracy",
-            )
-            cv_label = "Accuracy"
+            try:
+                cv_scores = cross_val_score(
+                    self.model, X_test_np, y_test_np,
+                    cv=tscv, scoring="accuracy",
+                )
+                cv_label = "Accuracy"
+            except Exception:
+                cv_scores = np.array([float("nan")])
+                cv_label  = "N/A"
+
+        # Platt calibration: fit a 2-parameter sigmoid on raw probs vs true labels
+        # using the held-out test set. Maps raw probabilities to actual win rates
+        # so 0.65 prob ≈ genuine 65% confidence.
+        print(f"\n  Applying Platt calibration (sigmoid LR on test set)...")
+        _raw_probs = self.model.predict_proba(X_test_np)[:, 1].reshape(-1, 1)
+        _platt     = _PlattLR(C=1e10).fit(_raw_probs, y_test_np)
+        self.model = _PlattWrapper(self.model, _platt)
+        print(f"  Calibration applied — probabilities now reflect actual win rates")
+
+        # Find optimal threshold BEFORE evaluate so report uses it
+        self.optimal_threshold = self._find_optimal_threshold(X_test_np, y_test_np)
+
+        results = self._evaluate(
+            X_train_np, y_train_np,
+            X_test_np,  y_test_np,
+            threshold=self.optimal_threshold,
+        )
 
         results["cv_mean"] = float(cv_scores.mean())
         results["cv_std"]  = float(cv_scores.std())
@@ -486,9 +515,13 @@ class ModelTrainer:
             "confusion_matrix": cm.tolist(),
         }
 
-        if hasattr(self.model, "feature_importances_"):
+        # Feature importances — unwrap calibration wrapper if present
+        _fi_source = self.model
+        if not hasattr(_fi_source, "feature_importances_"):
+            _fi_source = getattr(_fi_source, "estimator", None)
+        if _fi_source is not None and hasattr(_fi_source, "feature_importances_"):
             feat_cols   = self.preparator.get_feature_columns()
-            importances = self.model.feature_importances_
+            importances = _fi_source.feature_importances_
             min_len = min(len(feat_cols), len(importances))
             fi = pd.DataFrame({
                 "feature":    feat_cols[:min_len],
@@ -498,6 +531,30 @@ class ModelTrainer:
             print(f"\n  Top 10 Features:")
             for _, row in fi.head(10).iterrows():
                 print(f"    {row['feature']:35s}: {row['importance']:.4f}")
+
+        # Calibration check: confirm sigmoid remapping worked correctly
+        # Good calibration: delta (actual_wr - mean_prob) should be near 0 per bucket
+        probas_cal = self.model.predict_proba(X_test)[:, 1]
+        cal_buckets = [
+            ("0.35-0.45", 0.35, 0.45),
+            ("0.45-0.55", 0.45, 0.55),
+            ("0.55-0.65", 0.55, 0.65),
+            ("0.65+",     0.65, 1.01),
+        ]
+        print(f"\n  CALIBRATION CHECK  (mean predicted prob vs actual win rate)")
+        print(f"  {'Bucket':<12} {'N':>6}  {'Mean Prob':>10}  {'Actual WR':>10}  {'Delta':>8}")
+        print(f"  {'-'*12} {'-'*6}  {'-'*10}  {'-'*10}  {'-'*8}")
+        for label, lo, hi in cal_buckets:
+            mask = (probas_cal >= lo) & (probas_cal < hi)
+            n = int(mask.sum())
+            if n == 0:
+                print(f"  {label:<12} {'0':>6}  {'--':>10}  {'--':>10}  {'--':>8}")
+            else:
+                mean_p = float(probas_cal[mask].mean())
+                act_wr = float(y_test[mask].mean())
+                delta  = act_wr - mean_p
+                print(f"  {label:<12} {n:>6,}  {mean_p:>10.3f}  {act_wr:>10.3f}  {delta:>+8.3f}")
+        print("  (delta near 0 = well-calibrated; large negative = model overconfident)")
 
         return results
 

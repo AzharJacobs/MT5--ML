@@ -91,14 +91,15 @@ def generate_labels(
     """
     df = df.copy().reset_index(drop=True)
 
-    df["signal"]           = 0       # -1=sell entry, 0=none, 1=buy entry
-    df["signal_direction"] = 0       # same as signal — kept for diagnostics only
-    df["signal_reason"]    = ""
-    df["trade_outcome"]    = 0       # 1=TP hit, -1=SL hit, 0=expired
-    df["label"]            = 0       # BINARY target: 1=winner, 0=loser
-    df["tp_price"]         = np.nan
-    df["sl_price"]         = np.nan
-    df["rr_ratio"]         = np.nan
+    df["signal"]              = 0       # -1=sell entry, 0=none, 1=buy entry
+    df["signal_direction"]    = 0       # same as signal — kept for diagnostics only
+    df["signal_reason"]       = ""
+    df["trade_outcome"]       = 0       # 1=TP hit, -1=SL hit, 0=expired
+    df["label"]               = 0       # BINARY target: 1=winner, 0=loser
+    df["tp_price"]            = np.nan
+    df["sl_price"]            = np.nan
+    df["rr_ratio"]            = np.nan
+    df["worn_zone_downgrade"] = 0       # 1 = TP hit but demoted to 0 due to worn zone + low RR
 
     use_htf = (timeframe in LTF_TIMEFRAMES) if timeframe else False
     n = len(df)
@@ -266,12 +267,19 @@ def generate_labels(
 
         df.at[i, "trade_outcome"] = outcome
 
-        # FIXED: binary label — 1=winner regardless of direction
-        # Old code: label = signal if outcome == 1 else 0
-        #   → sell wins became label=-1, invisible to XGBoost's {0,1} classes
-        #   → sell_wins=0 in training, model never learned sells
-        # New code: label = 1 if winner, 0 if loser — direction lives in features
-        df.at[i, "label"] = 1 if outcome == 1 else 0
+        # Binary label with worn-zone downgrade:
+        # If TP hit but zone has >2 touches and RR < 2.0, treat as loser.
+        # Worn zones are unreliable; model must learn to demand higher RR on them.
+        if outcome == 1:
+            _touches_col = "demand_zone_touches" if signal == 1 else "supply_zone_touches"
+            _touches = float(row.get(_touches_col, 0) or 0)
+            if _touches > 2 and rr < 2.0:
+                df.at[i, "label"]              = 0
+                df.at[i, "worn_zone_downgrade"] = 1
+            else:
+                df.at[i, "label"] = 1
+        else:
+            df.at[i, "label"] = 0
 
     _log_summary(df, timeframe)
     return df
@@ -294,9 +302,10 @@ def _log_summary(df: pd.DataFrame, timeframe: str = None) -> None:
     tp_hits   = (df["trade_outcome"] ==  1).sum()
     sl_hits   = (df["trade_outcome"] == -1).sum()
 
-    # Direction breakdown using signal_direction (not label)
     buy_wins  = ((df["label"] == 1) & (df["signal_direction"] ==  1)).sum()
     sell_wins = ((df["label"] == 1) & (df["signal_direction"] == -1)).sum()
+
+    worn_demotions = int(df.get("worn_zone_downgrade", pd.Series(0)).sum())
 
     win_rate = tp_hits / max(signals, 1) * 100
     tf_tag   = f"{timeframe} " if timeframe else ""
@@ -304,7 +313,8 @@ def _log_summary(df: pd.DataFrame, timeframe: str = None) -> None:
         f"{tf_tag}Labels | signals={signals} "
         f"(buys={buy_sigs} sells={sell_sigs}) | "
         f"winners={winners} (buy_wins={buy_wins} sell_wins={sell_wins}) | "
-        f"win_rate={win_rate:.1f}% TP={tp_hits} SL={sl_hits}"
+        f"win_rate={win_rate:.1f}% TP={tp_hits} SL={sl_hits} | "
+        f"worn_zone_demotions={worn_demotions}"
     )
 
 

@@ -1,0 +1,1 @@
+outcome_id,decision_timestamp,symbol,timeframe,rl_action_name,agreement,entry_price,sl,tp,rr,direction,exit_type,exit_price,pnl_usd,bars_to_outcome,market_did

@@ -100,8 +100,10 @@ def detect_zones(
     zone_cols = [
         "demand_zone_top", "demand_zone_bottom", "demand_zone_strength",
         "demand_zone_fresh", "demand_zone_touches", "demand_zone_consolidation",
+        "demand_zone_age_bars",
         "supply_zone_top", "supply_zone_bottom", "supply_zone_strength",
         "supply_zone_fresh", "supply_zone_touches", "supply_zone_consolidation",
+        "supply_zone_age_bars",
         "nearest_demand_dist_atr", "nearest_supply_dist_atr",
         "in_demand_zone", "in_supply_zone", "between_zones",
     ]
@@ -205,6 +207,7 @@ def detect_zones(
             df.at[i, "demand_zone_fresh"]         = float(active_demand["fresh"])
             df.at[i, "demand_zone_touches"]       = float(active_demand["touches"])
             df.at[i, "demand_zone_consolidation"] = float(active_demand.get("consolidation", 0.0))
+            df.at[i, "demand_zone_age_bars"]      = float(active_demand["age"])
 
             dist = (cur_close - active_demand["top"]) / cur_atr
             df.at[i, "nearest_demand_dist_atr"] = float(dist)
@@ -223,6 +226,7 @@ def detect_zones(
             df.at[i, "supply_zone_fresh"]         = float(active_supply["fresh"])
             df.at[i, "supply_zone_touches"]       = float(active_supply["touches"])
             df.at[i, "supply_zone_consolidation"] = float(active_supply.get("consolidation", 0.0))
+            df.at[i, "supply_zone_age_bars"]      = float(active_supply["age"])
 
             dist = (active_supply["bottom"] - cur_close) / cur_atr
             df.at[i, "nearest_supply_dist_atr"] = float(dist)
@@ -660,6 +664,16 @@ def build_features(
     df = add_htf_context(df, h1_df, h4_df)
 
     df = add_zone_quality(df)
+
+    # Freshness scores: continuous decay by zone touches and age
+    # 1.0 = brand-new untouched zone; approaches 0 as zone ages/gets retested
+    _d_touches = df["demand_zone_touches"].fillna(0) if "demand_zone_touches" in df.columns else pd.Series(0.0, index=df.index)
+    _s_touches = df["supply_zone_touches"].fillna(0) if "supply_zone_touches" in df.columns else pd.Series(0.0, index=df.index)
+    _d_age     = df["demand_zone_age_bars"].fillna(0) if "demand_zone_age_bars" in df.columns else pd.Series(0.0, index=df.index)
+    _s_age     = df["supply_zone_age_bars"].fillna(0) if "supply_zone_age_bars" in df.columns else pd.Series(0.0, index=df.index)
+    df["demand_freshness_score"] = 1.0 / (1 + _d_touches * 0.3 + _d_age * 0.01)
+    df["supply_freshness_score"] = 1.0 / (1 + _s_touches * 0.3 + _s_age * 0.01)
+
     df = add_strategy_rules(df)
 
     # in_session: 1 if bar falls in the trading session used for label generation.

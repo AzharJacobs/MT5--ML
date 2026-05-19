@@ -16,7 +16,7 @@ SESSION_HOUR_LONDON_NY = 16         # London/NY overlap (conditional per TF)
 # ---------------------------------------------------------------------------
 # Zone quality
 # ---------------------------------------------------------------------------
-MIN_ZONE_QUALITY = 2.0              # Validated threshold — good trade count without diluting quality
+MIN_ZONE_QUALITY = 1.5              # Lowered from 2.0 — captures more zone touches while still filtering noise
 
 # ---------------------------------------------------------------------------
 # HTF soft filter (normalised htf_4h_bias scale: -1 to +1)
@@ -89,11 +89,12 @@ REQUIRED_FEATURE_COLUMNS = [
     # ── Zone context (supporting) ─────────────────────────────────────────
     "in_demand_zone", "in_supply_zone", "between_zones",
     "demand_zone_strength", "demand_zone_fresh", "demand_zone_touches",
-    "demand_zone_consolidation",
+    "demand_zone_consolidation", "demand_zone_age_bars",
     "supply_zone_strength", "supply_zone_fresh", "supply_zone_touches",
-    "supply_zone_consolidation",
+    "supply_zone_consolidation", "supply_zone_age_bars",
     "nearest_demand_dist_atr", "nearest_supply_dist_atr",
     "demand_zone_quality", "supply_zone_quality", "active_zone_quality",
+    "demand_freshness_score", "supply_freshness_score",
 
     # ── Confirmation patterns ─────────────────────────────────────────────
     "bullish_engulfing", "bearish_engulfing",

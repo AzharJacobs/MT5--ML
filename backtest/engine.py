@@ -43,6 +43,7 @@ import backtrader as bt
 from data.loader import get_connection
 from data.pipeline import DataPreparator
 from models.trainer import ModelTrainer, MODEL_DIR
+from models.calibration import _PlattWrapper  # noqa: F401 — needed for joblib unpickling
 from strategy.base_strategy import calculate_stop_loss, calculate_take_profit
 from config.pipeline_config import MIN_ZONE_QUALITY, HTF_EXTREME_THRESHOLD, MIN_RR
 
@@ -56,9 +57,9 @@ MAX_CONCURRENT_POSITIONS = 2
 # Multipliers: flat 1x across A and C for $50 account safety.
 # Raise A multiplier as account grows (e.g. A=2 at $150, A=3 at $300+).
 GRADE_A_MIN_ZONE_QUALITY = 3.5
-GRADE_A_MIN_CONFIDENCE   = 0.42
+GRADE_A_MIN_CONFIDENCE   = 0.58
 GRADE_B_MIN_ZONE_QUALITY = 3.0
-GRADE_B_MIN_CONFIDENCE   = 0.40
+GRADE_B_MIN_CONFIDENCE   = 0.50
 GRADE_MULTIPLIERS = {"A": 1, "B": 0, "C": 1}   # B=0 = skip; scale A when account grows
 
 # Raw zone columns we need at execution time (unscaled, real price levels)
@@ -92,6 +93,8 @@ class BacktestResult:
     filtered_neutral: int
     filtered_bad_sltp: int
     filtered_low_rr: int
+    filtered_htf_filter: int = 0
+    filtered_risk_atr: int = 0
     # Extended P&L fields
     start_cash: float = 10000.0
     gross_profit: float = 0.0
@@ -113,6 +116,7 @@ class BacktestResult:
     grade_c_trades: int = 0
     grade_c_wins:   int = 0
     be_lock_count:  int = 0
+    trade_log: tuple = ()  # raw per-trade entries for breakdown analysis
 
 
 def _load_model_bundle(model_dir: str = MODEL_DIR) -> Tuple[Any, Dict[str, Any]]:
@@ -188,6 +192,7 @@ def _build_feature_matrix_for_timeframe(
 class MLSignalStrategy(bt.Strategy):
     params = dict(
         confidence=0.52,
+        max_confidence=1.0,       # upper cap — skip signals above this (overconfident bucket)
         stake=0.15,
         use_pct_stake=True,
         trail_trigger_pts=1500.0,
@@ -196,6 +201,7 @@ class MLSignalStrategy(bt.Strategy):
         include_london_ny=True,   # match signal_generator: False for 15min, True for 5min
         min_zone_quality=MIN_ZONE_QUALITY,
         breakeven_trigger_pts=0.0,  # >0: move SL to entry once profit reaches this level
+        timeframe="1H",           # used to select 15min-specific BE/trail parameters
     )
 
     def __init__(self):
@@ -226,6 +232,8 @@ class MLSignalStrategy(bt.Strategy):
             "neutral":      0,  # model predicted neutral/hold label
             "bad_sltp":     0,  # SL/TP geometrically invalid after calculation
             "low_rr":       0,  # R:R ratio below MIN_RR after geometry check
+            "htf_filter":   0,  # counter-trend signal rejected by HTF soft gate
+            "risk_atr":     0,  # SL distance < 0.5 ATR after zone-quality buffer
         }
 
         self.model          = getattr(self, "model", None)
@@ -260,23 +268,32 @@ class MLSignalStrategy(bt.Strategy):
 
         if matched_idx is not None:
             t = self._open_trades.pop(matched_idx)
-            side        = t["side"]
-            entry_price = t["entry_price"]
-            grade       = t["grade"]
-            size        = t["size"]
+            side         = t["side"]
+            entry_price  = t["entry_price"]
+            grade        = t["grade"]
+            size         = t["size"]
+            with_trend   = t.get("with_trend", True)
+            initial_risk = t.get("initial_risk", 0.0)
+            prob         = t.get("prob", 0.0)
         else:
-            side        = None
-            entry_price = 0.0
-            grade       = "C"
-            size        = 0.0
+            side         = None
+            entry_price  = 0.0
+            grade        = "C"
+            size         = 0.0
+            with_trend   = True
+            initial_risk = 0.0
+            prob         = 0.0
 
         self._trade_log.append({
-            "date":        self.data.datetime.datetime(0),
-            "side":        side,
-            "pnl":         float(trade.pnlcomm),
-            "entry_price": entry_price,
-            "size":        size,
-            "grade":       grade,
+            "date":         self.data.datetime.datetime(0),
+            "side":         side,
+            "pnl":          float(trade.pnlcomm),
+            "entry_price":  entry_price,
+            "size":         size,
+            "grade":        grade,
+            "with_trend":   with_trend,
+            "initial_risk": initial_risk,
+            "prob":         prob,
         })
 
         # Backtrader netting mode: 2 buys = 1 Trade object at double size.
@@ -286,12 +303,15 @@ class MLSignalStrategy(bt.Strategy):
             # Log any remaining orphaned entries with zero PnL
             for orphan in self._open_trades:
                 self._trade_log.append({
-                    "date":        self.data.datetime.datetime(0),
-                    "side":        orphan.get("side"),
-                    "pnl":         0.0,
-                    "entry_price": orphan.get("entry_price", 0.0),
-                    "size":        orphan.get("size", 0.0),
-                    "grade":       orphan.get("grade", "C"),
+                    "date":         self.data.datetime.datetime(0),
+                    "side":         orphan.get("side"),
+                    "pnl":          0.0,
+                    "entry_price":  orphan.get("entry_price", 0.0),
+                    "size":         orphan.get("size", 0.0),
+                    "grade":        orphan.get("grade", "C"),
+                    "with_trend":   orphan.get("with_trend", True),
+                    "initial_risk": orphan.get("initial_risk", 0.0),
+                    "prob":         orphan.get("prob", 0.0),
                 })
             self._open_trades.clear()
             self._any_exit_pending = False
@@ -339,46 +359,91 @@ class MLSignalStrategy(bt.Strategy):
                 side  = t["side"]
                 entry = t["entry_price"]
 
-                # Breakeven lock
-                be_trigger = float(self.p.breakeven_trigger_pts)
-                if be_trigger > 0 and not t["be_locked"]:
-                    if side == "buy" and (bar_high - entry) >= be_trigger:
-                        t["sl"] = entry
+                _ir  = t.get("initial_risk", 0.0)
+                _atr = t.get("entry_atr") or 0.0
+
+                # Timeframe-specific parameters
+                _is_15m      = (self.p.timeframe == "15min")
+                _be_r        = 0.8 if _is_15m else 1.0   # BE trigger: 0.8R on 15min, 1R otherwise
+                _trail_r     = 1.5                         # Trail trigger: 1.5R for all timeframes
+                _trail_dist  = 0.8 if _is_15m else 1.5    # Trail distance ATR: tighter on 15min
+
+                # Breakeven lock at _be_r × initial risk
+                if _ir > 0 and _atr > 0 and not t["be_locked"]:
+                    if side == "buy" and (bar_high - entry) >= _be_r * _ir:
+                        t["sl"] = entry + 0.1 * _atr
                         t["be_locked"] = True
                         self._be_lock_count += 1
-                    elif side == "sell" and (entry - bar_low) >= be_trigger:
-                        t["sl"] = entry
+                    elif side == "sell" and (entry - bar_low) >= _be_r * _ir:
+                        t["sl"] = entry - 0.1 * _atr
                         t["be_locked"] = True
                         self._be_lock_count += 1
+                else:
+                    # Fallback: params-based breakeven when no ATR/risk data
+                    be_trigger = float(self.p.breakeven_trigger_pts)
+                    if be_trigger > 0 and not t["be_locked"]:
+                        if side == "buy" and (bar_high - entry) >= be_trigger:
+                            t["sl"] = entry
+                            t["be_locked"] = True
+                            self._be_lock_count += 1
+                        elif side == "sell" and (entry - bar_low) >= be_trigger:
+                            t["sl"] = entry
+                            t["be_locked"] = True
+                            self._be_lock_count += 1
 
-                trail_dist = self._trail_dist_for(t)
-                trigger    = float(self.p.trail_trigger_pts)
-
-                if not t["be_locked"]:
+                # Trail at 1.5R, distance = _trail_dist × ATR
+                if _ir > 0 and _atr > 0:
                     if side == "buy":
-                        profit_pts = bar_high - entry
-                        if not t["trail_active"] and profit_pts >= trigger:
+                        if not t["trail_active"] and (bar_high - entry) >= _trail_r * _ir:
                             t["trail_active"] = True
                             t["best_price"]   = bar_high
                             self._trail_activations += 1
                         if t["trail_active"]:
                             if bar_high > t["best_price"]:
                                 t["best_price"] = bar_high
-                            new_sl = t["best_price"] - trail_dist
+                            new_sl = t["best_price"] - _trail_dist * _atr
                             if new_sl > t["sl"]:
                                 t["sl"] = new_sl
                     elif side == "sell":
-                        profit_pts = entry - bar_low
-                        if not t["trail_active"] and profit_pts >= trigger:
+                        if not t["trail_active"] and (entry - bar_low) >= _trail_r * _ir:
                             t["trail_active"] = True
                             t["best_price"]   = bar_low
                             self._trail_activations += 1
                         if t["trail_active"]:
                             if bar_low < t["best_price"]:
                                 t["best_price"] = bar_low
-                            new_sl = t["best_price"] + trail_dist
+                            new_sl = t["best_price"] + _trail_dist * _atr
                             if new_sl < t["sl"]:
                                 t["sl"] = new_sl
+                else:
+                    # Fallback: params-based trail when no ATR/risk data
+                    trail_dist = self._trail_dist_for(t)
+                    trigger    = float(self.p.trail_trigger_pts)
+                    if not t["be_locked"]:
+                        if side == "buy":
+                            profit_pts = bar_high - entry
+                            if not t["trail_active"] and profit_pts >= trigger:
+                                t["trail_active"] = True
+                                t["best_price"]   = bar_high
+                                self._trail_activations += 1
+                            if t["trail_active"]:
+                                if bar_high > t["best_price"]:
+                                    t["best_price"] = bar_high
+                                new_sl = t["best_price"] - trail_dist
+                                if new_sl > t["sl"]:
+                                    t["sl"] = new_sl
+                        elif side == "sell":
+                            profit_pts = entry - bar_low
+                            if not t["trail_active"] and profit_pts >= trigger:
+                                t["trail_active"] = True
+                                t["best_price"]   = bar_low
+                                self._trail_activations += 1
+                            if t["trail_active"]:
+                                if bar_low < t["best_price"]:
+                                    t["best_price"] = bar_low
+                                new_sl = t["best_price"] + trail_dist
+                                if new_sl < t["sl"]:
+                                    t["sl"] = new_sl
 
                 sl = t["sl"]
                 tp = t["tp"]
@@ -425,6 +490,9 @@ class MLSignalStrategy(bt.Strategy):
         if winner_proba < float(self.p.confidence):
             self._diag["confidence"] += 1
             return
+        if winner_proba > float(self.p.max_confidence):
+            self._diag["confidence"] += 1
+            return
 
         # ── Gate 4: direction from zone ────────────────────────────────
         if _raw is not None:
@@ -443,6 +511,19 @@ class MLSignalStrategy(bt.Strategy):
         else:
             self._diag["neutral"] += 1
             return
+
+        # ── HTF soft filter: counter-trend trades require higher confidence ─
+        htf_4h_bias = float(_raw.get("htf_4h_bias", 0.0)) if _raw is not None else 0.0
+        is_counter  = (pred_label == "buy" and htf_4h_bias < 0) or \
+                      (pred_label == "sell" and htf_4h_bias > 0)
+        if is_counter:
+            abs_bias = abs(htf_4h_bias)
+            if abs_bias > 0.8 and winner_proba < 0.70:
+                self._diag["htf_filter"] += 1
+                return
+            if 0.3 <= abs_bias <= 0.8 and winner_proba < float(self.p.confidence) + 0.05:
+                self._diag["htf_filter"] += 1
+                return
 
         # ── Directional consistency: only add trades in same direction ──
         # Backtrader uses a netting account — a sell against an open buy
@@ -515,6 +596,19 @@ class MLSignalStrategy(bt.Strategy):
                 self._diag["bad_sltp"] += 1
                 return
 
+        # ── SL buffer: enforce zone-quality-scaled minimum SL distance ──
+        atr_14 = float(_raw.get("atr_14", 0.0)) if _raw is not None else 0.0
+        if atr_14 > 0:
+            sl_buf_atr = 0.3 if zone_quality >= 3.5 else (0.5 if zone_quality >= 2.0 else 0.7)
+            min_sl_dist = sl_buf_atr * atr_14
+            if pred_label == "buy":
+                sl = min(float(sl), close_price - min_sl_dist)
+            else:
+                sl = max(float(sl), close_price + min_sl_dist)
+            if abs(close_price - float(sl)) / atr_14 < 0.5:
+                self._diag["risk_atr"] += 1
+                return
+
         # ── Gate 6: minimum risk-reward ratio ─────────────────────────
         sl_dist = abs(close_price - float(sl))
         tp_dist = abs(float(tp) - close_price)
@@ -531,10 +625,12 @@ class MLSignalStrategy(bt.Strategy):
 
         self._entries_submitted += 1
 
-        try:
-            atr_val = float(lookback_df["candle_size"].rolling(14).mean().iloc[-1])
-        except Exception:
-            atr_val = None
+        atr_val = atr_14 if atr_14 > 0 else None
+        if atr_val is None:
+            try:
+                atr_val = float(lookback_df["candle_size"].rolling(14).mean().iloc[-1])
+            except Exception:
+                pass
 
         self._open_trades.append({
             "sl":           float(sl),
@@ -548,6 +644,9 @@ class MLSignalStrategy(bt.Strategy):
             "entry_atr":    atr_val if atr_val and atr_val > 0 else None,
             "be_locked":    False,
             "exit_pending": False,
+            "initial_risk": abs(close_price - float(sl)),
+            "with_trend":   not is_counter,
+            "prob":         winner_proba,
         })
 
     @property
@@ -589,6 +688,7 @@ def run_backtest(
     model_dir:   str = MODEL_DIR,
     min_zone_quality: float = MIN_ZONE_QUALITY,
     breakeven_trigger_pts: float = 0.0,
+    max_confidence: float = 1.0,
 ) -> BacktestResult:
 
     db = get_connection()
@@ -734,6 +834,7 @@ def run_backtest(
     cerebro.addstrategy(
         MLSignalStrategy,
         confidence=float(confidence),
+        max_confidence=float(max_confidence),
         stake=float(stake),
         use_pct_stake=use_pct_stake,
         trail_trigger_pts=float(trail_trigger_pts),
@@ -742,6 +843,7 @@ def run_backtest(
         include_london_ny=bool(include_london_ny),
         min_zone_quality=float(min_zone_quality),
         breakeven_trigger_pts=float(breakeven_trigger_pts),
+        timeframe=timeframe,
     )
 
     start_value = cerebro.broker.getvalue()
@@ -809,6 +911,8 @@ def run_backtest(
         filtered_neutral=diag.get("neutral", 0),
         filtered_bad_sltp=diag.get("bad_sltp", 0),
         filtered_low_rr=diag.get("low_rr", 0),
+        filtered_htf_filter=diag.get("htf_filter", 0),
+        filtered_risk_atr=diag.get("risk_atr", 0),
         start_cash=float(start_value),
         gross_profit=round(gross_profit, 2),
         gross_loss=round(gross_loss, 2),
@@ -828,6 +932,7 @@ def run_backtest(
         grade_c_trades=len(grade_c_log),
         grade_c_wins=sum(1 for t in grade_c_log if t["pnl"] > 0),
         be_lock_count=be_locks,
+        trade_log=tuple(trade_log),
     )
 
 
@@ -842,6 +947,8 @@ def main() -> None:
     parser.add_argument("--pct-stake",          dest="use_pct_stake", action="store_true", default=True)
     parser.add_argument("--no-pct-stake",       dest="use_pct_stake", action="store_false")
     parser.add_argument("--confidence",         type=float, default=0.52)
+    parser.add_argument("--max-confidence",     type=float, default=1.0,
+                        help="Skip signals above this probability (overconfident cap)")
     parser.add_argument("--commission",         type=float, default=0.0)
     parser.add_argument("--trail-trigger-pts",  type=float, default=10.0)
     parser.add_argument("--trail-dist-atr",     type=float, default=1.0)
@@ -872,6 +979,7 @@ def main() -> None:
         model_dir=args.model_dir,
         min_zone_quality=args.min_zone_quality,
         breakeven_trigger_pts=args.breakeven_trigger_pts,
+        max_confidence=args.max_confidence,
     )
 
     W  = 62
@@ -910,9 +1018,8 @@ def main() -> None:
     print(f"    Avg per trade      : ${avg_trade:>+11,.4f}")
     print(f"    Trail activations  : {res.trail_activations:>8,}   "
           f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
-    if args.breakeven_trigger_pts > 0:
-        print(f"    Breakeven locks    : {res.be_lock_count:>8,}   "
-              f"(trigger={args.breakeven_trigger_pts:.0f}pts)")
+    print(f"    Breakeven locks    : {res.be_lock_count:>8,}   "
+          f"(1R ATR-based + params fallback)")
 
     # ── By direction ──────────────────────────────────────────────────
     buy_wr  = res.buy_wins  / res.buy_trades  * 100 if res.buy_trades  else 0
@@ -953,6 +1060,69 @@ def main() -> None:
             sign = "+" if ytotal >= 0 else ""
             print(f"    {year} TOTAL   {sign}${ytotal:>8,.2f}")
 
+    # ── Segment comparison table ──────────────────────────────────────
+    def _seg_stats(trades):
+        n = len(trades)
+        if n == 0:
+            return 0, 0, 0.0, 0.0, 0.0
+        wins      = sum(1 for t in trades if t["pnl"] > 0)
+        total_pnl = sum(t["pnl"] for t in trades)
+        rrs = [
+            t["pnl"] / (t["initial_risk"] * t["size"])
+            for t in trades
+            if t.get("initial_risk", 0.0) > 0 and t.get("size", 0.0) > 0
+        ]
+        avg_rr = float(np.mean(rrs)) if rrs else 0.0
+        return n, wins, wins / n * 100, avg_rr, total_pnl
+
+    tl = list(res.trade_log)
+    seg_a  = [t for t in tl if t.get("grade") == "A"]
+    seg_b  = [t for t in tl if t.get("grade") == "B"]
+    seg_c  = [t for t in tl if t.get("grade") == "C"]
+    seg_wt = [t for t in tl if t.get("with_trend", True)]
+    seg_ct = [t for t in tl if not t.get("with_trend", True)]
+
+    print(f"\n  SEGMENT COMPARISON")
+    print(f"  {'Segment':<16} {'Trades':>7}  {'WR%':>6}  {'Avg RR':>7}  {'Total PnL':>11}")
+    print(f"  {'-'*16} {'-'*7}  {'-'*6}  {'-'*7}  {'-'*11}")
+    for label, seg in [("Grade A", seg_a), ("Grade B", seg_b), ("Grade C", seg_c),
+                       ("-"*16, None),
+                       ("With-trend", seg_wt), ("Counter-trend", seg_ct)]:
+        if seg is None:
+            print(f"  {label}")
+            continue
+        n, w, wr, avg_rr, pnl = _seg_stats(seg)
+        if n == 0:
+            print(f"  {label:<16} {'0':>7}  {'  --':>6}  {'   --':>7}  {'         --':>11}")
+        else:
+            sign = "+" if pnl >= 0 else ""
+            print(f"  {label:<16} {n:>7,}  {wr:>5.1f}%  {avg_rr:>7.2f}  {sign}${pnl:>9,.2f}")
+
+    # ── Confidence bucket breakdown ───────────────────────────────────
+    def _conf_bucket(p):
+        if p >= 0.65: return "0.65+"
+        if p >= 0.55: return "0.55-0.65"
+        if p >= 0.45: return "0.45-0.55"
+        return "0.35-0.45"
+
+    buck_labels = ["0.35-0.45", "0.45-0.55", "0.55-0.65", "0.65+"]
+    buck = {b: [] for b in buck_labels}
+    for t in tl:
+        p = t.get("prob", 0.0)
+        if p and p > 0:
+            buck[_conf_bucket(p)].append(t)
+
+    print(f"\n  CONFIDENCE BUCKET BREAKDOWN")
+    print(f"  {'Bucket':<12} {'Trades':>7}  {'WR%':>6}  {'Avg RR':>7}  {'Total PnL':>11}")
+    print(f"  {'-'*12} {'-'*7}  {'-'*6}  {'-'*7}  {'-'*11}")
+    for label in buck_labels:
+        n, w, wr, avg_rr, pnl = _seg_stats(buck[label])
+        if n == 0:
+            print(f"  {label:<12} {'0':>7}  {'  --':>6}  {'   --':>7}  {'         --':>11}")
+        else:
+            sign = "+" if pnl >= 0 else ""
+            print(f"  {label:<12} {n:>7,}  {wr:>5.1f}%  {avg_rr:>7.2f}  {sign}${pnl:>9,.2f}")
+
     # ── Filter breakdown ──────────────────────────────────────────────
     print(f"\n  FILTER BREAKDOWN (bars rejected per gate)")
 
@@ -964,11 +1134,14 @@ def main() -> None:
         "neutral_prediction": res.filtered_neutral,
         "bad_sltp_geometry": res.filtered_bad_sltp,
         f"low_rr<{MIN_RR:.1f}":     res.filtered_low_rr,
+        "htf_soft_filter":   res.filtered_htf_filter,
+        "risk_atr<0.5":      res.filtered_risk_atr,
     }
     bars_total = (
         res.filtered_no_row + res.filtered_session + res.filtered_zone_quality +
         res.filtered_confidence + res.filtered_neutral + res.filtered_bad_sltp +
-        res.filtered_low_rr + res.entries_submitted
+        res.filtered_low_rr + res.filtered_htf_filter + res.filtered_risk_atr +
+        res.entries_submitted
     )
     print(f"  {'Gate':<26} {'Count':>8}  {'% of total':>10}")
     print(f"  {'-'*26} {'-'*8}  {'-'*10}")
@@ -987,6 +1160,8 @@ def main() -> None:
         "neutral_prediction": "more bars in both zones — check detect_zones() lookback",
         "bad_sltp_geometry":  "SL/TP calculation — check calculate_stop_loss/take_profit()",
         f"low_rr<{MIN_RR:.1f}":      f"zone spacing too tight — raise MIN_RR or lower MIN_ZONE_QUALITY",
+        "htf_soft_filter":    "most signals are counter-trend — check HTF bias alignment or lower confidence requirement",
+        "risk_atr<0.5":       "SL too close relative to ATR — zones may be too tight or ATR too large for this timeframe",
     }
     print()
     for gate_name, count in gate_counts.items():

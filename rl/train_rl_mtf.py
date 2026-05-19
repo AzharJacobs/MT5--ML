@@ -342,6 +342,8 @@ def evaluate(model, test_dfs: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    global TOTAL_STEPS
+
     parser = argparse.ArgumentParser(
         description="Train RecurrentPPO RL agent on multi-timeframe XAUUSD data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -367,7 +369,6 @@ Examples:
     parser.add_argument("--steps",      type=int, default=TOTAL_STEPS)
     args = parser.parse_args()
 
-    global TOTAL_STEPS
     TOTAL_STEPS = args.steps
 
     if args.from_cache:
