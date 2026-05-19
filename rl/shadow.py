@@ -212,6 +212,13 @@ class RLShadow:
         model = PPO.load(model_path)
         logger.info("Model loaded. Obs dim: %d", model.observation_space.shape[0])
 
+        # Multi-TF models are trained on RL_FEATURE_COLUMNS (81), not the ML
+        # bundle's feature list (68) — override to keep obs dims consistent
+        if is_mtf:
+            from config.pipeline_config import RL_FEATURE_COLUMNS as _RL_FC
+            feature_columns = list(_RL_FC)
+            logger.info("Multi-TF model: using RL_FEATURE_COLUMNS (%d features)", len(feature_columns))
+
         return cls(
             model           = model,
             feature_columns = feature_columns,
@@ -254,9 +261,10 @@ class RLShadow:
         fc = self.feature_columns
         parts = [primary_row.reindex(fc, fill_value=0).fillna(0).values.astype(np.float32)]
 
-        if self.is_multi_tf and secondary_rows:
+        if self.is_multi_tf:
+            # Always build one block per secondary TF; use zeros when not provided
             for tf in self.secondary_tfs:
-                if tf in secondary_rows:
+                if secondary_rows and tf in secondary_rows:
                     parts.append(
                         secondary_rows[tf].reindex(fc, fill_value=0).fillna(0).values.astype(np.float32)
                     )
