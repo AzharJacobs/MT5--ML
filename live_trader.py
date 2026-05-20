@@ -43,6 +43,7 @@ from data.loader import get_connection
 from data.feature_engineer import build_features
 from models.trainer import MODEL_DIR, MODEL_FILE, METADATA_FILE
 from utils.trade_logger import TradeLogger
+from utils.db_writer import write_market_context, utcnow as _db_utcnow
 
 # ── Optional RL shadow (loads only when --rl-shadow flag is passed) ───────────
 try:
@@ -449,9 +450,187 @@ class LiveTrader:
         df.drop(columns=["time"], inplace=True)
         primary = df.reset_index(drop=True)
 
-        h1_df = self._fetch_htf_bars_mt5(mt5, TF_MT5["1H"],  n_bars=200)
-        h4_df = self._fetch_htf_bars_mt5(mt5, TF_MT5["4H"],  n_bars=100)
+        # Fetch all 4 required timeframes for market_context
+        m5_df = (primary if self.timeframe == "5min"
+                 else self._fetch_htf_bars_mt5(mt5, TF_MT5["5min"],  n_bars=100))
+        m15_df = (primary if self.timeframe == "15min"
+                  else self._fetch_htf_bars_mt5(mt5, TF_MT5["15min"], n_bars=100))
+        h1_df  = (primary if self.timeframe == "1H"
+                  else self._fetch_htf_bars_mt5(mt5, TF_MT5["1H"],   n_bars=200))
+        h4_df  = (primary if self.timeframe == "4H"
+                  else self._fetch_htf_bars_mt5(mt5, TF_MT5["4H"],   n_bars=100))
+
+        # Store for secondary-TF feature building (used by RL shadow in run_once)
+        self._raw_tf_dfs = {"5min": m5_df, "15min": m15_df, "1H": h1_df, "4H": h4_df}
+
+        # Write latest bar of each timeframe into market_context (UTC TIMESTAMPTZ)
+        self._write_market_context_bars(self._raw_tf_dfs, h4_df=h4_df)
+
         return primary, h1_df, h4_df
+
+    def _write_market_context_bars(self, tf_dfs: dict, h4_df=None) -> None:
+        """Write the latest bar for each timeframe into market_context."""
+        import math
+
+        def _safe(val):
+            try:
+                f = float(val)
+                return None if (math.isnan(f) or math.isinf(f)) else f
+            except (TypeError, ValueError):
+                return None
+
+        def _atr(df: pd.DataFrame, period: int = 14) -> tuple:
+            """Return (current_atr, avg_atr, ratio) from last `period` bars."""
+            if df is None or len(df) < period + 1:
+                return None, None, None
+            hi = df["high"].values
+            lo = df["low"].values
+            cl = df["close"].values
+            tr = np.maximum(hi[1:] - lo[1:],
+                            np.maximum(np.abs(hi[1:] - cl[:-1]),
+                                       np.abs(lo[1:] - cl[:-1])))
+            if len(tr) < period:
+                return None, None, None
+            atr_series = np.convolve(tr, np.ones(period) / period, mode="valid")
+            current = float(atr_series[-1])
+            avg     = float(atr_series[-min(5, len(atr_series)):].mean())
+            ratio   = round(current / avg, 3) if avg > 0 else None
+            return round(current, 5), round(avg, 5), ratio
+
+        def _htf_bias_from_df(df: pd.DataFrame, n: int = 20) -> Optional[int]:
+            """Compute 4H trend bias: +1 bullish, -1 bearish, 0 neutral."""
+            if df is None or len(df) < n:
+                return None
+            closes = df["close"].values[-n:]
+            # Compare recent SMA(5) vs older SMA(5)
+            recent = float(closes[-5:].mean())
+            older  = float(closes[:5].mean())
+            diff   = recent - older
+            atr_est = float(np.mean(df["high"].values[-n:] - df["low"].values[-n:]))
+            if atr_est <= 0:
+                return 0
+            if diff > 0.5 * atr_est:
+                return 1
+            if diff < -0.5 * atr_est:
+                return -1
+            return 0
+
+        def _session(ts: pd.Timestamp) -> str:
+            """Forex session from UTC timestamp."""
+            h = ts.hour
+            # London/NY overlap: 12–16 UTC
+            if 12 <= h < 16:
+                return "Overlap"
+            # London: 07–16 UTC
+            if 7 <= h < 16:
+                return "London"
+            # NY: 12–21 UTC (non-overlap portion)
+            if 16 <= h < 21:
+                return "NY"
+            # Asian: 23–09 UTC
+            if h >= 23 or h < 9:
+                return "Asian"
+            return "Off"
+
+        # Compute 4H HTF bias once for all TF rows
+        _h4 = h4_df if h4_df is not None else tf_dfs.get("4H")
+        htf_bias_val = _htf_bias_from_df(_h4)
+        market_structure_val = (
+            "bullish" if htf_bias_val == 1 else
+            ("bearish" if htf_bias_val == -1 else
+             ("neutral" if htf_bias_val == 0 else None))
+        )
+
+        rows = []
+        for tf_name, df in tf_dfs.items():
+            if df is None or df.empty:
+                continue
+            last  = df.iloc[-1]
+            ts_raw = last.get("timestamp")
+            if ts_raw is None:
+                continue
+            ts = pd.to_datetime(ts_raw)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+
+            vol_cur  = _safe(last.get("volume"))
+            vol_avg  = _safe(df["volume"].tail(14).mean()) if "volume" in df.columns else None
+            vol_ratio = round(vol_cur / vol_avg, 3) if (vol_cur and vol_avg and vol_avg > 0) else None
+
+            atr_cur, atr_avg, atr_ratio = _atr(df)
+
+            body   = _safe(last.get("body_size",   abs(float(last["close"]) - float(last["open"]))))
+            candle = _safe(last.get("candle_size", float(last["high"]) - float(last["low"])))
+            body_ratio = round(body / candle, 4) if (body is not None and candle and candle > 0) else None
+
+            # Simple momentum: close vs close 5 bars ago
+            mom = None
+            if len(df) > 5:
+                try:
+                    mom = round(float(df["close"].iloc[-1]) / float(df["close"].iloc[-6]) - 1, 5)
+                except Exception:
+                    pass
+
+            rows.append({
+                "timestamp":        ts.to_pydatetime(),
+                "symbol":           self.symbol,
+                "timeframe":        tf_name,
+                "open":             _safe(last["open"]),
+                "high":             _safe(last["high"]),
+                "low":              _safe(last["low"]),
+                "close":            _safe(last["close"]),
+                "volume":           vol_cur,
+                "htf_bias":         htf_bias_val,
+                "market_structure": market_structure_val,
+                "session":          _session(ts),
+                "atr_current":      atr_cur,
+                "atr_average":      atr_avg,
+                "atr_ratio":        atr_ratio,
+                "volume_current":   vol_cur,
+                "volume_average":   vol_avg,
+                "volume_ratio":     vol_ratio,
+                "candle_body_ratio": body_ratio,
+                "momentum_score":   mom,
+                "mins_to_news":     None,
+                "news_impact":      None,
+            })
+
+        if rows:
+            write_market_context(rows)
+            logger.debug("market_context updated for %d timeframes", len(rows))
+
+    def _build_secondary_feat_dfs(self, h1_df, h4_df) -> dict:
+        """
+        Build feature DataFrames for every TF except the primary.
+        Used by the multi-TF RL shadow model so it gets real feature blocks
+        instead of zero-padded observations.
+        Returns {} in paper mode (h1_df/h4_df are None).
+        """
+        raw = getattr(self, "_raw_tf_dfs", {})
+        if not raw or h1_df is None:
+            return {}
+
+        from data.feature_engineer import build_features
+        secondary = {}
+        for tf, df in raw.items():
+            if tf == self.timeframe or df is None or df.empty:
+                continue
+            try:
+                # Pass h4_df for htf_4h_bias; skip h1 when building 4H features
+                _h1 = h1_df if tf not in ("1H", "4H") else None
+                _h4 = h4_df if tf != "4H" else None
+                feat = build_features(
+                    df,
+                    h1_df=_h1,
+                    h4_df=_h4,
+                    include_london_ny=self.include_london_ny,
+                )
+                if not feat.empty:
+                    secondary[tf] = feat
+                    logger.debug("Secondary TF %s features built: %d rows", tf, len(feat))
+            except Exception as exc:
+                logger.debug("Secondary TF %s feature build skipped: %s", tf, exc)
+        return secondary
 
     def _fetch_htf_bars_mt5(self, mt5, tf_const: int, n_bars: int) -> pd.DataFrame:
         """Fetch H1 or H4 bars from MT5 for HTF trend context."""
@@ -581,7 +760,11 @@ class LiveTrader:
             # feat_row is a Series; wrap back to a 1-row DataFrame for the shadow
             if feat_df is not None and not isinstance(feat_df, pd.DataFrame):
                 feat_df = pd.DataFrame([feat_df])
-            rl_sig = self.rl_shadow.observe(feat_df, ml_signal=sig)
+            # Build secondary TF feature DFs so multi-TF shadow gets real obs blocks
+            secondary_feat_dfs = None
+            if self.rl_shadow.is_multi_tf:
+                secondary_feat_dfs = self._build_secondary_feat_dfs(h1_df, h4_df) or None
+            rl_sig = self.rl_shadow.observe(feat_df, secondary_feat_dfs=secondary_feat_dfs, ml_signal=sig)
             rl_dir = {1: "BUY", -1: "SELL", 0: "hold"}.get(rl_sig["signal"], "hold")
             logger.info(
                 "RL shadow: %s  sl=%.5f  tp=%.5f  rr=%s  (vpos=%d veq=%.2f)",

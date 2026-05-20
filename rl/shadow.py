@@ -35,20 +35,50 @@ Usage in live_trader.py (already wired — no changes needed there):
 
 from __future__ import annotations
 
-import os
-import csv
 import logging
+import os
 import numpy as np
 import pandas as pd
-from datetime import date
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
+
+from utils.db_writer import write_rl_decision, update_rl_outcome
 
 logger = logging.getLogger("rl.shadow")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(_THIS_DIR, "models")
-LOGS_DIR   = os.path.join(os.path.dirname(_THIS_DIR), "logs")
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(val) -> datetime:
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(val))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return _utcnow()
+
+
+def _htf_bias_int(htf4h: float) -> Optional[int]:
+    if htf4h > 0.3:
+        return 1
+    if htf4h < -0.3:
+        return -1
+    return 0
+
+
+def _market_structure(htf4h: float) -> str:
+    if htf4h > 0.3:
+        return "bullish"
+    if htf4h < -0.3:
+        return "bearish"
+    return "neutral"
+
 
 _MODEL_CANDIDATES = [
     # (path, is_multi_tf, is_shadow_model)
@@ -60,45 +90,49 @@ _MODEL_CANDIDATES = [
     (os.path.join(MODELS_DIR, "final_model.zip"),                False, False),
 ]
 
-# ── Shadow decision log columns ───────────────────────────────────────────────
-_DECISION_COLS = [
-    # When / where
-    "timestamp", "symbol", "timeframe",
-    # ML bot signal
-    "ml_signal", "ml_direction", "ml_grade", "ml_prob",
-    "ml_sl", "ml_tp", "ml_rr",
-    # RL agent decision
-    "rl_action_id", "rl_action_name", "rl_direction",
-    "rl_sl", "rl_tp", "rl_rr",
-    # Comparison
-    "agreement",    # "AGREE" | "SKIP" | "OVERRIDE" | "ROTATE"
-    "reason",       # human-readable explanation
-    # Context
-    "htf_4h_bias", "htf_1h_bias", "zone_quality",
-    "atr_ratio", "volume_ratio", "momentum_5",
-    "in_session", "in_demand_zone", "in_supply_zone",
-    # Virtual account state
-    "virtual_position", "virtual_equity", "virtual_bars_in_trade",
-    "virtual_stall_count", "virtual_n_trades",
-    "bar_close",
-    # Market outcome (filled in deferred)
-    "outcome_id",       # links to rl_outcomes log
-]
-
-# ── Outcome log columns ───────────────────────────────────────────────────────
-_OUTCOME_COLS = [
-    "outcome_id", "decision_timestamp", "symbol", "timeframe",
-    "rl_action_name", "agreement",
-    "entry_price", "sl", "tp", "rr", "direction",
-    "exit_type",     # "TP" | "SL" | "timeout" | "rotate_exit" | "conservative_tp"
-    "exit_price", "pnl_usd", "bars_to_outcome",
-    "market_did",    # "won" | "lost" | "stalled" | "unknown"
-]
 
 _ACTION_NAMES = {0: "agree", 1: "skip", 2: "rotate"}
 
 # Timeout (bars) before we write an unresolved outcome as "unknown"
 OUTCOME_TIMEOUT = 60
+
+# 1 pip in price units for XAU/USD (0.10 = standard broker convention)
+PIP_SIZE = 0.10
+
+
+def _to_pips(price_diff: float) -> float:
+    """Convert a raw price difference to pips (rounds to 1 decimal)."""
+    return round(abs(price_diff) / PIP_SIZE, 1)
+
+
+def _signed_pips(price_diff: float, direction: int) -> float:
+    """Signed pips: positive = in direction's favour."""
+    return round(price_diff * direction / PIP_SIZE, 1)
+
+
+def _session_name(row: "pd.Series") -> str:
+    """Derive session label from feature row (prefers explicit columns, falls back to timestamp)."""
+    london = float(row.get("london_session", row.get("in_london", 0)) or 0) > 0.5
+    ny     = float(row.get("ny_session",     row.get("in_newyork", row.get("in_ny", 0))) or 0) > 0.5
+    asian  = float(row.get("asian_session",  row.get("in_asian", 0)) or 0) > 0.5
+    if london and ny:
+        return "Overlap"
+    if london:
+        return "London"
+    if ny:
+        return "NY"
+    if asian:
+        return "Asian"
+    # Fallback: derive from in_session flag
+    if float(row.get("in_session", 0) or 0) > 0.5:
+        return "Session"
+    return "Off"
+
+# Bars-per-hour by timeframe — used to compute 1H/4H/24H price-snapshot offsets
+_TF_BARS_PER_HOUR = {
+    "1min": 60, "5min": 12, "15min": 4, "30min": 2,
+    "1H": 1, "4H": 0.25, "1D": 0.042,
+}
 
 # HTF thresholds for generating reasons
 COUNTER_HTF_THRESHOLD  = 0.5
@@ -127,6 +161,7 @@ class RLShadow:
         is_multi_tf: bool       = False,
         is_shadow_model: bool   = False,
         secondary_tfs: list     = None,
+        pip_size: float         = PIP_SIZE,
     ):
         self.model           = model
         self.feature_columns = feature_columns
@@ -140,6 +175,13 @@ class RLShadow:
         self.is_multi_tf     = is_multi_tf
         self.is_shadow_model = is_shadow_model
         self.secondary_tfs   = sorted(secondary_tfs or ["5min", "1H", "4H"])
+        self.pip_size        = pip_size
+
+        # Price-snapshot bar offsets (how many bars = 1H / 4H / 24H for this TF)
+        _bph = _TF_BARS_PER_HOUR.get(timeframe, 4)
+        self._bars_1h  = max(1, round(_bph))
+        self._bars_4h  = max(1, round(_bph * 4))
+        self._bars_24h = max(1, round(_bph * 24))
 
         # Virtual RL position (never executed)
         self._position      = 0        # -1 / 0 / +1
@@ -149,10 +191,13 @@ class RLShadow:
         self._tp            = 0.0
         self._bars_in_trade = 0
         self._stall_count   = 0
-        self._hi_in_trade   = 0.0
-        self._lo_in_trade   = float("inf")
-        self._max_favorable = 0.0
-        self._trade_quality = 0.0
+        self._hi_in_trade       = 0.0
+        self._lo_in_trade       = float("inf")
+        self._max_favorable     = 0.0
+        self._trade_quality     = 0.0
+        self._peak_pnl_usd      = 0.0   # best USD PnL reached in current trade
+        self._trough_pnl_usd    = 0.0   # worst USD PnL reached in current trade
+        self._retraced_past_entry = False  # price crossed entry in wrong direction
         self._balance       = float(initial_balance)
         self._equity        = float(initial_balance)
         self._trade_history: list = []
@@ -161,15 +206,9 @@ class RLShadow:
         self._ml_ventry = 0.0
 
         # Pending outcome queue for deferred market-did tracking
+        # Each entry keeps "db_id" (rl_shadow row id) for later UPDATE
         self._pending_outcomes: List[Dict[str, Any]] = []
         self._outcome_counter = 0
-
-        # Log handles
-        self._decision_file   = None
-        self._decision_writer = None
-        self._outcome_file    = None
-        self._outcome_writer  = None
-        self._init_logs()
 
     # ── Constructor from saved model ─────────────────────────────────────────
 
@@ -228,27 +267,10 @@ class RLShadow:
             **kwargs,
         )
 
-    # ── CSV log initialisation ────────────────────────────────────────────────
+    # ── DB log initialisation (no-op — engine is created lazily in db_writer) ──
 
     def _init_logs(self) -> None:
-        os.makedirs(LOGS_DIR, exist_ok=True)
-        today = date.today().isoformat()
-
-        # Decision log
-        dec_path = os.path.join(LOGS_DIR, f"rl_shadow_{today}.csv")
-        dec_exists = os.path.exists(dec_path)
-        self._decision_file   = open(dec_path, "a", newline="", encoding="utf-8")
-        self._decision_writer = csv.DictWriter(self._decision_file, fieldnames=_DECISION_COLS)
-        if not dec_exists:
-            self._decision_writer.writeheader()
-
-        # Outcome log
-        out_path = os.path.join(LOGS_DIR, f"rl_outcomes_{today}.csv")
-        out_exists = os.path.exists(out_path)
-        self._outcome_file   = open(out_path, "a", newline="", encoding="utf-8")
-        self._outcome_writer = csv.DictWriter(self._outcome_file, fieldnames=_OUTCOME_COLS)
-        if not out_exists:
-            self._outcome_writer.writeheader()
+        pass
 
     # ── Observation builder ──────────────────────────────────────────────────
 
@@ -423,6 +445,20 @@ class RLShadow:
         fav = (hi - self._entry_price) if self._position == 1 else (self._entry_price - lo)
         self._max_favorable = max(self._max_favorable, max(fav, 0.0))
 
+        # Track peak and trough PnL using bar high/low for accuracy
+        bar_best  = hi if self._position == 1 else lo
+        bar_worst = lo if self._position == 1 else hi
+        pnl_best  = (bar_best  - self._entry_price) * self._position * self.lot_size * self.contract_size
+        pnl_worst = (bar_worst - self._entry_price) * self._position * self.lot_size * self.contract_size
+        self._peak_pnl_usd   = max(self._peak_pnl_usd,   pnl_best)
+        self._trough_pnl_usd = min(self._trough_pnl_usd, pnl_worst)
+
+        # Flag if price crossed entry in the wrong direction
+        if not self._retraced_past_entry:
+            retraced = (lo < self._entry_price) if self._position == 1 else (hi > self._entry_price)
+            if retraced:
+                self._retraced_past_entry = True
+
         sl_hit, tp_hit = self._check_sl_tp_hit(row)
         if not (sl_hit or tp_hit):
             return None
@@ -438,11 +474,14 @@ class RLShadow:
             "direction":  self._position,
         }
         self._trade_history.append(close_event)
-        self._position      = 0
-        self._bars_in_trade = 0
-        self._entry_rr      = 0.0
-        self._stall_count   = 0
-        self._max_favorable = 0.0
+        self._position              = 0
+        self._bars_in_trade         = 0
+        self._entry_rr              = 0.0
+        self._stall_count           = 0
+        self._max_favorable         = 0.0
+        self._peak_pnl_usd          = 0.0
+        self._trough_pnl_usd        = 0.0
+        self._retraced_past_entry   = False
         return close_event
 
     def _open_virtual_position(self, row: pd.Series, direction: int) -> bool:
@@ -450,17 +489,20 @@ class RLShadow:
         sl, tp, rr = self._compute_sl_tp(row, direction)
         if sl is None:
             return False
-        self._position      = direction
-        self._entry_price   = close
-        self._sl            = sl
-        self._tp            = tp
-        self._entry_rr      = rr or 0.0
-        self._bars_in_trade = 0
-        self._stall_count   = 0
-        self._max_favorable = 0.0
-        self._hi_in_trade   = float(row.get("high", close) or close)
-        self._lo_in_trade   = float(row.get("low",  close) or close)
-        self._trade_quality = float(row.get("active_zone_quality", 0) or 0)
+        self._position              = direction
+        self._entry_price           = close
+        self._sl                    = sl
+        self._tp                    = tp
+        self._entry_rr              = rr or 0.0
+        self._bars_in_trade         = 0
+        self._stall_count           = 0
+        self._max_favorable         = 0.0
+        self._peak_pnl_usd          = 0.0
+        self._trough_pnl_usd        = 0.0
+        self._retraced_past_entry   = False
+        self._hi_in_trade           = float(row.get("high", close) or close)
+        self._lo_in_trade           = float(row.get("low",  close) or close)
+        self._trade_quality         = float(row.get("active_zone_quality", 0) or 0)
         if self._ml_vpos == 0:
             self._ml_vpos   = direction
             self._ml_ventry = close
@@ -470,20 +512,24 @@ class RLShadow:
 
     def _enqueue_outcome(
         self,
-        outcome_id: int,
+        outcome_id:  int,
         action_name: str,
-        agreement: str,
-        direction: int,
-        entry: float,
-        sl: Optional[float],
-        tp: Optional[float],
-        rr: Optional[float],
+        agreement:   str,
+        direction:   int,
+        entry:       float,
+        sl:          Optional[float],
+        tp:          Optional[float],
+        rr:          Optional[float],
         decision_ts: str,
+        db_id:       Optional[int]   = None,   # rl_shadow row id for UPDATE on resolve
+        ml_sl:       Optional[float] = None,
+        ml_tp:       Optional[float] = None,
     ) -> None:
         if sl is None:
             return
         self._pending_outcomes.append({
             "outcome_id":         outcome_id,
+            "db_id":              db_id,           # rl_shadow row id
             "decision_timestamp": decision_ts,
             "rl_action_name":     action_name,
             "agreement":          agreement,
@@ -492,46 +538,110 @@ class RLShadow:
             "sl":                 sl,
             "tp":                 tp,
             "rr":                 rr or 0.0,
+            "ml_sl":              ml_sl,
+            "ml_tp":              ml_tp,
             "age":                0,
+            "price_1h_later":     None,
+            "price_4h_later":     None,
+            "price_24h_later":    None,
+            "mfe_price":          0.0,
+            "mae_price":          0.0,
+            "ml_resolved":        False,
+            "ml_exit_price":      None,
         })
 
     def _resolve_pending_outcomes(self, row: pd.Series) -> None:
-        hi = float(row.get("high", 0) or 0)
-        lo = float(row.get("low",  0) or 0)
+        hi    = float(row.get("high",  0) or 0)
+        lo    = float(row.get("low",   0) or 0)
+        close = float(row.get("close", 0) or 0)
         still_pending = []
 
         for p in self._pending_outcomes:
             p["age"] += 1
-            pos = p["direction"]
+
+            # Fill price snapshots at fixed bar offsets regardless of trade state
+            if p["price_1h_later"]  is None and p["age"] >= self._bars_1h:
+                p["price_1h_later"]  = round(close, 5)
+            if p["price_4h_later"]  is None and p["age"] >= self._bars_4h:
+                p["price_4h_later"]  = round(close, 5)
+            if p["price_24h_later"] is None and p["age"] >= self._bars_24h:
+                p["price_24h_later"] = round(close, 5)
+
+            pos    = p["direction"]
+
+            # Update MFE / MAE using bar high/low for accuracy
+            if pos == 1:    # long
+                p["mfe_price"] = max(p["mfe_price"], max(hi - p["entry_price"], 0.0))
+                p["mae_price"] = max(p["mae_price"], max(p["entry_price"] - lo, 0.0))
+            else:           # short
+                p["mfe_price"] = max(p["mfe_price"], max(p["entry_price"] - lo, 0.0))
+                p["mae_price"] = max(p["mae_price"], max(hi - p["entry_price"], 0.0))
             sl_hit = (lo <= p["sl"]) if pos == 1 else (hi >= p["sl"])
             tp_hit = (hi >= p["tp"]) if pos == 1 else (lo <= p["tp"])
 
+            # Track ML SL/TP hit independently for comparison PnL
+            if not p["ml_resolved"] and p["ml_sl"] is not None and p["ml_tp"] is not None:
+                ml_sl_hit = (lo <= p["ml_sl"]) if pos == 1 else (hi >= p["ml_sl"])
+                ml_tp_hit = (hi >= p["ml_tp"]) if pos == 1 else (lo <= p["ml_tp"])
+                if ml_tp_hit or ml_sl_hit:
+                    p["ml_exit_price"] = p["ml_tp"] if ml_tp_hit else p["ml_sl"]
+                    p["ml_resolved"]   = True
+                elif p["age"] >= OUTCOME_TIMEOUT:
+                    p["ml_exit_price"] = close
+                    p["ml_resolved"]   = True
+
             if tp_hit or sl_hit or p["age"] >= OUTCOME_TIMEOUT:
                 exit_type  = "TP" if tp_hit else ("SL" if sl_hit else "timeout")
-                exit_price = p["tp"] if tp_hit else (p["sl"] if sl_hit else
-                             float(row.get("close", 0) or 0))
-                pnl = (exit_price - p["entry_price"]) * pos \
-                      * self.lot_size * self.contract_size
-                market_did = ("won" if tp_hit else ("lost" if sl_hit else "stalled"))
+                exit_price = p["tp"] if tp_hit else (p["sl"] if sl_hit else close)
+                pnl        = (exit_price - p["entry_price"]) * pos \
+                             * self.lot_size * self.contract_size
+                pnl_pips   = _signed_pips(exit_price - p["entry_price"], pos)
+                market_did = "won" if tp_hit else ("lost" if sl_hit else "stalled")
 
-                self._write_outcome({
-                    "outcome_id":         p["outcome_id"],
-                    "decision_timestamp": p["decision_timestamp"],
-                    "symbol":             self.symbol,
-                    "timeframe":          self.timeframe,
-                    "rl_action_name":     p["rl_action_name"],
-                    "agreement":          p["agreement"],
-                    "entry_price":        round(p["entry_price"], 5),
-                    "sl":                 round(p["sl"], 5),
-                    "tp":                 round(p["tp"], 5),
-                    "rr":                 p["rr"],
-                    "direction":          "buy" if pos == 1 else "sell",
-                    "exit_type":          exit_type,
-                    "exit_price":         round(exit_price, 5),
-                    "pnl_usd":            round(pnl, 2),
-                    "bars_to_outcome":    p["age"],
-                    "market_did":         market_did,
-                })
+                # ML counterfactual PnL
+                ml_exit = p["ml_exit_price"] if p["ml_exit_price"] is not None else close
+                if p["ml_sl"] is not None:
+                    ml_pnl      = (ml_exit - p["entry_price"]) * pos \
+                                  * self.lot_size * self.contract_size
+                    ml_pnl_pips = _signed_pips(ml_exit - p["entry_price"], pos)
+                else:
+                    ml_pnl      = ""
+                    ml_pnl_pips = ""
+
+                rl_vs_ml = round(pnl - ml_pnl, 2) if ml_pnl != "" else ""
+
+                # RL was right if: agreed+won, OR skipped+lost
+                agreement = p["agreement"]
+                if agreement in ("AGREE", "ROTATE", "OVERRIDE"):
+                    rl_was_right = 1 if tp_hit else (0 if sl_hit else "")
+                elif agreement == "SKIP":
+                    rl_was_right = 1 if sl_hit else (0 if tp_hit else "")
+                else:
+                    rl_was_right = ""
+
+                if p.get("db_id") is not None:
+                    mfe_usd = round(p["mfe_price"] * self.lot_size * self.contract_size, 2)
+                    mae_usd = round(p["mae_price"] * self.lot_size * self.contract_size, 2)
+                    rl_hyp  = round(pnl, 2)
+                    ml_act  = round(ml_pnl, 2) if ml_pnl != "" else None
+                    pnl_diff = round(rl_hyp - ml_act, 2) if ml_act is not None else None
+                    _rl_correct: Optional[bool] = None
+                    if rl_was_right == 1:
+                        _rl_correct = True
+                    elif rl_was_right == 0:
+                        _rl_correct = False
+                    update_rl_outcome(
+                        row_id              = p["db_id"],
+                        price_1h_later      = p["price_1h_later"],
+                        price_4h_later      = p["price_4h_later"],
+                        price_24h_later     = p["price_24h_later"],
+                        max_favourable      = mfe_usd,
+                        max_adverse         = mae_usd,
+                        ml_actual_pnl       = ml_act,
+                        rl_hypothetical_pnl = rl_hyp,
+                        pnl_difference      = pnl_diff,
+                        rl_was_correct      = _rl_correct,
+                    )
             else:
                 still_pending.append(p)
 
@@ -643,57 +753,56 @@ class RLShadow:
             return "OVERRIDE"
         return "AGREE"
 
-    # ── CSV writers ───────────────────────────────────────────────────────────
+    # ── DB writer ─────────────────────────────────────────────────────────────
 
     def _write_decision(self, row: pd.Series, rl_sig: dict, ml_sig: dict,
-                        agreement: str, reason: str, outcome_id: int) -> None:
-        if self._decision_writer is None:
-            return
-        ml = ml_sig or {}
-        ts  = str(row.get("timestamp", ""))
-        self._decision_writer.writerow({
-            "timestamp":          ts,
-            "symbol":             self.symbol,
-            "timeframe":          self.timeframe,
-            "ml_signal":          ml.get("signal", 0),
-            "ml_direction":       {1: "buy", -1: "sell", 0: ""}.get(int(ml.get("signal", 0) or 0), ""),
-            "ml_grade":           ml.get("grade", ""),
-            "ml_prob":            round(float(ml.get("prob", 0) or 0), 4),
-            "ml_sl":              ml.get("sl") or "",
-            "ml_tp":              ml.get("tp") or "",
-            "ml_rr":              ml.get("rr") or "",
-            "rl_action_id":       rl_sig.get("action", 0),
-            "rl_action_name":     _ACTION_NAMES.get(rl_sig.get("action", 0), "?"),
-            "rl_direction":       {1: "buy", -1: "sell", 0: ""}.get(rl_sig.get("signal", 0), ""),
-            "rl_sl":              rl_sig.get("sl") or "",
-            "rl_tp":              rl_sig.get("tp") or "",
-            "rl_rr":              rl_sig.get("rr") or "",
-            "agreement":          agreement,
-            "reason":             reason,
-            "htf_4h_bias":        round(float(row.get("htf_4h_bias", 0) or 0), 3),
-            "htf_1h_bias":        round(float(row.get("htf_1h_bias", 0) or 0), 3),
-            "zone_quality":       round(float(row.get("active_zone_quality", 0) or 0), 2),
-            "atr_ratio":          round(float(row.get("macro_atr_ratio", 1.0) or 1.0), 3),
-            "volume_ratio":       round(float(row.get("volume_ratio", 1.0) or 1.0), 3),
-            "momentum_5":         round(float(row.get("momentum_5", 0) or 0), 4),
-            "in_session":         int(float(row.get("in_session", 0) or 0)),
-            "in_demand_zone":     int(float(row.get("in_demand_zone", 0) or 0)),
-            "in_supply_zone":     int(float(row.get("in_supply_zone", 0) or 0)),
-            "virtual_position":   self._position,
-            "virtual_equity":     round(self._equity, 2),
-            "virtual_bars_in_trade": self._bars_in_trade,
-            "virtual_stall_count": self._stall_count,
-            "virtual_n_trades":   len(self._trade_history),
-            "bar_close":          round(float(row.get("close", 0) or 0), 5),
-            "outcome_id":         outcome_id if outcome_id >= 0 else "",
-        })
-        self._decision_file.flush()
+                        agreement: str, reason: str, outcome_id: int,
+                        rl_confidence: Optional[float] = None) -> Optional[int]:
+        """INSERT rl_shadow row via SQLAlchemy. Returns DB id for outcome tracking."""
+        ml    = ml_sig or {}
+        ts    = _parse_ts(row.get("timestamp", ""))
+        close = float(row.get("close", 0) or 0)
+        ml_dir = int(ml.get("signal", 0) or 0)
+        htf4h  = float(row.get("htf_4h_bias", 0) or 0)
 
-    def _write_outcome(self, rec: dict) -> None:
-        if self._outcome_writer is None:
-            return
-        self._outcome_writer.writerow(rec)
-        self._outcome_file.flush()
+        better_avail = (rl_sig.get("action") == 2 and self._position != 0
+                        and self._position != rl_sig.get("signal", 0))
+        body   = abs(float(row.get("body_size", 0) or 0))
+        candle = max(float(row.get("candle_size", 1e-9) or 1e-9), 1e-9)
+
+        return write_rl_decision(
+            timestamp               = ts,
+            symbol                  = self.symbol,
+            ml_signal               = ml_dir,
+            ml_confidence           = round(float(ml.get("prob", 0) or 0), 4),
+            ml_entry_price          = close if ml_dir != 0 else None,
+            ml_sl_price             = ml.get("sl"),
+            ml_tp_price             = ml.get("tp"),
+            ml_rr_ratio             = ml.get("rr"),
+            ml_triggered_rule       = str(ml.get("rule", ml.get("reason", "")) or ""),
+            ml_triggered_tf         = str(ml.get("trigger_tf", ml.get("timeframe", self.timeframe)) or ""),
+            htf_bias                = _htf_bias_int(htf4h),
+            market_structure        = _market_structure(htf4h),
+            session                 = _session_name(row),
+            momentum_score          = round(float(row.get("momentum_5", 0) or 0), 4),
+            atr_ratio               = round(float(row.get("macro_atr_ratio", 1.0) or 1.0), 3),
+            volume_ratio            = round(float(row.get("volume_ratio", 1.0) or 1.0), 3),
+            candle_body_ratio       = round(body / candle, 4),
+            in_trade                = (self._position != 0),
+            trade_duration          = self._bars_in_trade,
+            unrealised_pnl          = round(self._unrealized_pnl(close), 2),
+            is_stalling             = (self._stall_count >= STALL_BARS),
+            better_setup_available  = better_avail,
+            better_setup_direction  = rl_sig.get("signal") if better_avail else None,
+            better_setup_quality    = float(row.get("active_zone_quality", 0) or 0),
+            rl_decision             = int(rl_sig.get("action", 0)),
+            rl_confidence           = rl_confidence,
+            rl_reason               = reason,
+            rl_suggested_entry      = close if rl_sig.get("signal", 0) != 0 else None,
+            rl_suggested_sl         = rl_sig.get("sl"),
+            rl_suggested_tp         = rl_sig.get("tp"),
+            rl_recommended_rotation = (rl_sig.get("action") == 2),
+        )
 
     # ── Console shadow summary ────────────────────────────────────────────────
 
@@ -804,6 +913,17 @@ class RLShadow:
         obs    = self._build_obs(row, secondary_rows, ml_sig)
         action = int(self.model.predict(obs, deterministic=True)[0])
 
+        # Extract action probability as confidence score
+        rl_confidence = None
+        try:
+            import torch
+            obs_t = torch.as_tensor(obs.reshape(1, -1), device=self.model.device)
+            with torch.no_grad():
+                dist = self.model.policy.get_distribution(obs_t)
+                rl_confidence = round(float(dist.distribution.probs[0, action].cpu()), 4)
+        except Exception:
+            pass
+
         # Determine RL signal direction and SL/TP
         close      = float(row.get("close", 0) or 0)
         rl_signal  = 0
@@ -868,6 +988,12 @@ class RLShadow:
 
         # Assign outcome_id for tracking what market does after this decision
         outcome_id = -1
+        _ml_sl = ml_sig.get("sl")
+        _ml_tp = ml_sig.get("tp")
+        _ml_rr = ml_sig.get("rr")
+        _ml_sl_f = float(_ml_sl) if _ml_sl is not None else None
+        _ml_tp_f = float(_ml_tp) if _ml_tp is not None else None
+
         if rl_signal != 0 and sl is not None:
             self._outcome_counter += 1
             outcome_id = self._outcome_counter
@@ -881,13 +1007,12 @@ class RLShadow:
                 tp          = tp,
                 rr          = rr,
                 decision_ts = ts,
+                ml_sl       = _ml_sl_f,
+                ml_tp       = _ml_tp_f,
             )
         elif action == 1 and ml_dir != 0:
-            # Also track skipped signals (using ML SL/TP) to see what would have happened
-            ml_sl  = ml_sig.get("sl")
-            ml_tp  = ml_sig.get("tp")
-            ml_rr  = ml_sig.get("rr")
-            if ml_sl is not None:
+            # Track skipped signals using ML SL/TP to see what would have happened
+            if _ml_sl_f is not None:
                 self._outcome_counter += 1
                 outcome_id = self._outcome_counter
                 self._enqueue_outcome(
@@ -896,15 +1021,23 @@ class RLShadow:
                     agreement   = "SKIP",
                     direction   = ml_dir,
                     entry       = close,
-                    sl          = float(ml_sl),
-                    tp          = float(ml_tp),
-                    rr          = float(ml_rr) if ml_rr else None,
+                    sl          = _ml_sl_f,
+                    tp          = _ml_tp_f,
+                    rr          = float(_ml_rr) if _ml_rr else None,
                     decision_ts = ts,
+                    ml_sl       = _ml_sl_f,
+                    ml_tp       = _ml_tp_f,
                 )
 
-        # Write decision log
+        # Write decision row to DB; returned id is used to UPDATE outcome later
         rl_result = {"action": action, "signal": rl_signal, "sl": sl, "tp": tp, "rr": rr}
-        self._write_decision(row, rl_result, ml_sig, agreement, reason, outcome_id)
+        db_row_id = self._write_decision(row, rl_result, ml_sig, agreement, reason, outcome_id, rl_confidence)
+
+        # Back-fill db_id into the pending outcome we just enqueued (last item)
+        if db_row_id is not None and self._pending_outcomes:
+            last = self._pending_outcomes[-1]
+            if last.get("outcome_id") == outcome_id and last.get("db_id") is None:
+                last["db_id"] = db_row_id
 
         # Console output
         self._log_console_summary(ts, ml_sig, action, rl_signal, agreement, reason, sl, tp, rr)
@@ -932,10 +1065,4 @@ class RLShadow:
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        for f in (self._decision_file, self._outcome_file):
-            if f:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-        self._decision_file = self._outcome_file = None
+        pass  # DB connections managed by SQLAlchemy engine pool — no handles to close

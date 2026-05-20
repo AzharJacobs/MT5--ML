@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import os
 import sys
-import glob
 import shutil
 import logging
 import argparse
@@ -48,7 +47,6 @@ logger = logging.getLogger("rl.retrain")
 RL_DIR      = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR  = os.path.join(RL_DIR, "models")
 DATA_DIR    = os.path.join(RL_DIR, "data")
-LOGS_DIR    = os.path.join(os.path.dirname(RL_DIR), "logs")
 SHADOW_DIR  = os.path.join(MODELS_DIR, "shadow_model")
 FINAL_MODEL = os.path.join(MODELS_DIR, "final_shadow_model")
 
@@ -63,103 +61,106 @@ MIN_OUTCOMES_DEFAULT = 50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  1. Load and join outcome + shadow logs
+#  1. Load shadow + outcome data from rl_shadow DB table
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_outcome_logs() -> pd.DataFrame:
-    """Load all rl_outcomes_*.csv files from logs/."""
-    files = sorted(glob.glob(os.path.join(LOGS_DIR, "rl_outcomes_*.csv")))
-    if not files:
-        raise FileNotFoundError(
-            f"No rl_outcomes_*.csv files found in {LOGS_DIR}\n"
-            "Run the live bot with --rl-shadow first to accumulate outcome data."
+def _get_rl_engine():
+    """SQLAlchemy engine for the RL/ML database (creator bypasses URL encoding of '/')."""
+    import os, psycopg2
+    from sqlalchemy import create_engine
+    from dotenv import load_dotenv
+    load_dotenv()
+    host     = os.getenv("RL_DB_HOST",     os.getenv("DB_HOST",     "localhost"))
+    port     = int(os.getenv("RL_DB_PORT", os.getenv("DB_PORT",     "5432")))
+    database = os.getenv("RL_DB_NAME",     "RL/ML")
+    user     = os.getenv("RL_DB_USER",     os.getenv("DB_USER",     "postgres"))
+    password = os.getenv("RL_DB_PASSWORD", os.getenv("DB_PASSWORD", ""))
+
+    def _creator():
+        return psycopg2.connect(host=host, port=port, dbname=database,
+                                user=user, password=password)
+
+    return create_engine("postgresql+psycopg2://", creator=_creator, pool_pre_ping=True)
+
+
+def load_shadow_data() -> pd.DataFrame:
+    """
+    Load all rows from rl_shadow table.
+    Outcomes are resolved rows where rl_was_correct IS NOT NULL.
+    """
+    engine = _get_rl_engine()
+    with engine.connect() as conn:
+        df = pd.read_sql(
+            "SELECT * FROM rl_shadow ORDER BY timestamp",
+            conn,
         )
-    dfs = []
-    for f in files:
-        df = pd.read_csv(f, parse_dates=["decision_timestamp"])
-        dfs.append(df)
-        logger.info("Loaded outcomes: %s (%d rows)", os.path.basename(f), len(df))
-    outcomes = pd.concat(dfs, ignore_index=True)
-    outcomes = outcomes.dropna(subset=["market_did"])
-    outcomes = outcomes[outcomes["market_did"] != "unknown"]
-    logger.info("Total resolved outcomes: %d", len(outcomes))
-    return outcomes
+    logger.info("Loaded %d rl_shadow rows from DB", len(df))
+    if df.empty:
+        raise FileNotFoundError(
+            "No rows in rl_shadow table.\n"
+            "Run the live bot with --rl-shadow first to accumulate shadow data."
+        )
+    return df
 
 
-def load_shadow_logs() -> pd.DataFrame:
-    """Load all rl_shadow_*.csv files from logs/."""
-    files = sorted(glob.glob(os.path.join(LOGS_DIR, "rl_shadow_*.csv")))
-    if not files:
-        raise FileNotFoundError(f"No rl_shadow_*.csv files in {LOGS_DIR}")
-    dfs = []
-    for f in files:
-        df = pd.read_csv(f, parse_dates=["timestamp"])
-        dfs.append(df)
-    shadow = pd.concat(dfs, ignore_index=True)
-    logger.info("Total shadow log rows: %d", len(shadow))
-    return shadow
-
-
-def build_labeled_dataset(outcomes: pd.DataFrame, shadow: pd.DataFrame) -> pd.DataFrame:
+def build_labeled_dataset(shadow: pd.DataFrame) -> pd.DataFrame:
     """
-    Join outcomes → shadow log and derive what the correct action was.
+    Derive correct_action from resolved outcome data already in rl_shadow rows.
 
-    correct_action:
-      SKIP that hit SL  → agent should have SKIPPED (1) ✓ if agent did skip
-      SKIP that hit TP  → agent should have AGREED  (0) ✓ if agent did agree
-      AGREE that hit TP → agent was right to AGREE  (0)
-      AGREE that hit SL → agent should have SKIPPED (1)
-      stalled           → agent should have ROTATED  (2) if bars_to_outcome > 20
+    rl_was_correct (bool from DB) tells us if the agent was right.
+    We also re-derive correct_action for replay training:
+      rl_hypothetical_pnl > 0  → market went in RL direction (agree was right = 0)
+      rl_hypothetical_pnl < 0  → market went against RL     (skip was right  = 1)
+      stalled (pnl ≈ 0, long duration) → rotate was right   = 2
     """
-    merged = outcomes.merge(
-        shadow[["outcome_id", "timestamp", "rl_action_name", "rl_action_id",
-                "htf_4h_bias", "htf_1h_bias", "zone_quality", "atr_ratio",
-                "volume_ratio", "momentum_5", "ml_signal", "ml_prob",
-                "ml_grade", "bar_close"]],
-        on="outcome_id",
-        how="inner",
-    )
+    # Only rows with resolved outcomes
+    resolved = shadow[shadow["rl_was_correct"].notna()].copy()
+    if resolved.empty:
+        logger.warning("No resolved outcome rows found in rl_shadow.")
+        return resolved
+
+    # Map rl_decision int (0=agree,1=skip,2=rotate) back to name for compatibility
+    action_map = {0: "agree", 1: "skip", 2: "rotate"}
+    resolved["rl_action_name"] = resolved["rl_decision"].map(action_map).fillna("agree")
 
     def _correct_action(row) -> int:
-        """Derive the action the agent should have taken given the real outcome."""
-        market_did      = row["market_did"]          # "won" | "lost" | "stalled"
-        agent_action    = row["rl_action_name"]       # "agree" | "skip" | "rotate"
-        bars_to_outcome = row.get("bars_to_outcome", 0) or 0
+        pnl  = row.get("rl_hypothetical_pnl") or 0.0
+        dur  = row.get("trade_duration") or 0
+        if pnl > 0:
+            return 0   # agree
+        if pnl < 0:
+            return 1   # skip
+        if dur >= 20:
+            return 2   # rotate
+        return 1       # stalled short → skip
 
-        if market_did == "won":
-            return 0  # should have agreed (taken the trade)
-        if market_did == "lost":
-            return 1  # should have skipped
-        if market_did == "stalled" and bars_to_outcome >= 20:
-            return 2  # should have rotated out
-        return 1  # stalled short → skip was fine
-
-    merged["correct_action"] = merged.apply(_correct_action, axis=1)
-    merged["was_correct"] = (
-        merged["rl_action_name"].map({"agree": 0, "skip": 1, "rotate": 2})
-        == merged["correct_action"]
+    resolved["correct_action"] = resolved.apply(_correct_action, axis=1)
+    resolved["was_correct"]    = (
+        resolved["rl_decision"] == resolved["correct_action"]
     )
 
-    total    = len(merged)
-    correct  = merged["was_correct"].sum()
+    total   = len(resolved)
+    correct = resolved["was_correct"].sum()
     logger.info(
         "Labeled dataset: %d decisions | accuracy=%.1f%% | "
         "correct_skip=%d  correct_agree=%d  correct_rotate=%d",
-        total,
-        100 * correct / max(total, 1),
-        (merged["correct_action"] == 1).sum(),
-        (merged["correct_action"] == 0).sum(),
-        (merged["correct_action"] == 2).sum(),
+        total, 100 * correct / max(total, 1),
+        (resolved["correct_action"] == 1).sum(),
+        (resolved["correct_action"] == 0).sum(),
+        (resolved["correct_action"] == 2).sum(),
     )
 
-    wrong = merged[~merged["was_correct"]]
+    wrong = resolved[~resolved["was_correct"]]
     if len(wrong) > 0:
         logger.info(
             "Wrong decisions breakdown: %s",
-            wrong.groupby(["rl_action_name", "market_did"]).size().to_dict(),
+            wrong.groupby(["rl_action_name",
+                           resolved.loc[wrong.index, "rl_hypothetical_pnl"].apply(
+                               lambda x: "lost" if (x or 0) < 0 else "stalled"
+                           )]).size().to_dict(),
         )
 
-    return merged
+    return resolved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,16 +226,24 @@ class LiveReplayEnv:
         primary_ts = pd.to_datetime(primary_df["timestamp"])
 
         for _, row in real_outcomes.iterrows():
-            ts = pd.to_datetime(row["decision_timestamp"])
+            # rl_shadow table uses "timestamp" (not "decision_timestamp")
+            ts = pd.to_datetime(row["timestamp"])
             # snap to nearest 15min bar in the feature cache
             diffs = (primary_ts - ts).abs()
             nearest_pos = diffs.idxmin()
             if diffs[nearest_pos].total_seconds() < 3600:  # within 1hr
+                # Derive market_did from rl_hypothetical_pnl (no "market_did" column in DB)
+                hyp_pnl = float(row.get("rl_hypothetical_pnl") or 0.0)
+                if hyp_pnl > 0:
+                    market_did = "won"
+                elif hyp_pnl < 0:
+                    market_did = "lost"
+                else:
+                    market_did = "stalled"
                 self._real_idx[primary_ts[nearest_pos]] = {
-                    "market_did":      row["market_did"],
-                    "exit_type":       row.get("exit_type", ""),
-                    "pnl_usd":         row.get("pnl_usd", 0.0),
-                    "bars_to_outcome": row.get("bars_to_outcome", 0),
+                    "market_did":      market_did,
+                    "pnl_usd":         hyp_pnl,
+                    "bars_to_outcome": int(row.get("trade_duration") or 0),
                     "correct_action":  int(row["correct_action"]),
                 }
 
@@ -256,14 +265,14 @@ class LiveReplayEnv:
 
         original_evaluate = inner._evaluate_pending_skips.__func__  # unbound
 
-        def patched_evaluate(env_self) -> float:
+        def patched_evaluate(env_self, row: "pd.Series") -> float:
             """Use real outcome if available; fall back to price simulation."""
             current_ts = pd.to_datetime(
                 env_self.primary_df.iloc[env_self.current_step].get("timestamp", "")
             )
             real = real_idx.get(current_ts)
             if real is None:
-                return original_evaluate(env_self)
+                return original_evaluate(env_self, row)
 
             # Inject real outcome into each pending skip
             reward = 0.0
@@ -424,20 +433,23 @@ def retrain(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_report(labeled: pd.DataFrame):
+    if labeled.empty:
+        print("\nNo resolved outcome data yet — run more live shadow sessions first.")
+        return
     total   = len(labeled)
     correct = labeled["was_correct"].sum()
-    won     = (labeled["market_did"] == "won").sum()
-    lost    = (labeled["market_did"] == "lost").sum()
-    stalled = (labeled["market_did"] == "stalled").sum()
 
-    skipped_losers = ((labeled["rl_action_name"] == "skip") &
-                      (labeled["market_did"] == "lost")).sum()
-    skipped_winners = ((labeled["rl_action_name"] == "skip") &
-                       (labeled["market_did"] == "won")).sum()
-    agreed_winners  = ((labeled["rl_action_name"] == "agree") &
-                       (labeled["market_did"] == "won")).sum()
-    agreed_losers   = ((labeled["rl_action_name"] == "agree") &
-                       (labeled["market_did"] == "lost")).sum()
+    # Derive market direction from rl_hypothetical_pnl
+    pnl_col = labeled.get("rl_hypothetical_pnl", pd.Series(dtype=float)) \
+        if "rl_hypothetical_pnl" not in labeled.columns else labeled["rl_hypothetical_pnl"]
+    won     = (pnl_col > 0).sum()
+    lost    = (pnl_col < 0).sum()
+    stalled = ((pnl_col == 0) | pnl_col.isna()).sum()
+
+    skipped_losers  = ((labeled["rl_action_name"] == "skip")  & (pnl_col < 0)).sum()
+    skipped_winners = ((labeled["rl_action_name"] == "skip")  & (pnl_col > 0)).sum()
+    agreed_winners  = ((labeled["rl_action_name"] == "agree") & (pnl_col > 0)).sum()
+    agreed_losers   = ((labeled["rl_action_name"] == "agree") & (pnl_col < 0)).sum()
 
     print("\n" + "=" * 60)
     print("SHADOW AGENT — LIVE OUTCOME ANALYSIS")
@@ -494,12 +506,11 @@ Examples:
                         help="Print outcome report then exit — no training")
     args = parser.parse_args()
 
-    # ── 1. Load logs ──────────────────────────────────────────────────────────
-    outcomes = load_outcome_logs()
-    shadow   = load_shadow_logs()
+    # ── 1. Load shadow data from DB ───────────────────────────────────────────
+    shadow = load_shadow_data()
 
-    # ── 2. Join + label ───────────────────────────────────────────────────────
-    labeled  = build_labeled_dataset(outcomes, shadow)
+    # ── 2. Label from resolved outcomes ──────────────────────────────────────
+    labeled = build_labeled_dataset(shadow)
     print_report(labeled)
 
     if len(labeled) < args.min_outcomes:

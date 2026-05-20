@@ -106,7 +106,12 @@
       "Bash(\".venv/Scripts/python.exe\" -c \"from sb3_contrib import RecurrentPPO; print\\('sb3-contrib OK'\\)\")",
       "Bash(\".venv/Scripts/python.exe\" -m pip install sb3-contrib)",
       "Bash(\".venv/Scripts/python.exe\" rl/test_env_mtf.py)",
-      "Bash(awk '{print $NF}')"
+      "Bash(awk '{print $NF}')",
+      "Bash(python -c \"import rl.shadow; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe test_db.py)",
+      "Bash(python scripts/import_logs_to_db.py)",
+      "Bash(python scripts/test_live_flow.py)",
+      "Bash(python -X utf8 scripts/test_live_flow.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

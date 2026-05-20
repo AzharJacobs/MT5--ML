@@ -1,226 +1,276 @@
 """
-trade_logger.py — Persistent trade and signal logging for the live trader.
+trade_logger.py — Persistent signal and trade logging to the RL/ML PostgreSQL database.
 
-Writes two CSV files per trading day under logs/:
-  logs/trades_YYYY-MM-DD.csv   One row per completed trade (entry + exit context)
-  logs/signals_YYYY-MM-DD.csv  One row per bar evaluation (every outcome, including no-trades)
+Writes every bar evaluation (signal + trade state) to the ml_performance table.
+All timestamps are UTC.  No CSV or flat-file output.
 
-Also appends all entries to logs/live_trader.log in human-readable form.
+Table: ml_performance
+  signal          SMALLINT   — 1=buy, -1=sell, 0=no trade
+  confidence      FLOAT      — ML win probability
+  triggered_rule  TEXT       — reason / rule description
+  triggered_tf    VARCHAR    — timeframe that fired the signal
+  entry_price     FLOAT      — filled once order is placed
+  sl_price        FLOAT      — stop-loss price
+  tp_price        FLOAT      — take-profit price
+  sl_distance_pips FLOAT     — SL distance in pips
+  tp_distance_pips FLOAT     — TP distance in pips
+  rr_ratio        FLOAT      — risk/reward ratio
+  exit_price      FLOAT      — filled on close
+  exit_reason     VARCHAR    — "SL" | "TP" | "manual" | "unknown"
+  actual_pnl_usd  FLOAT      — realised PnL in USD
+  actual_pnl_pips FLOAT      — realised PnL in pips
+  outcome         VARCHAR    — "win" | "loss" | "breakeven"
+  closed_at       TIMESTAMPTZ — UTC close time
+  trade_duration  INT        — bars held
+  is_stalling     BOOL
 
-Usage in live_trader.py:
-    from utils.trade_logger import TradeLogger
-    tlog = TradeLogger()
-    tlog.log_signal(bar_time, sig, feat_row)
-    tlog.log_entry(ticket, bar_time, ...)
+Usage:
+    tlog = TradeLogger(symbol="XAUUSDm", timeframe="15min")
+    tlog.log_signal(bar_time, sig, feat_row)       # every bar
+    tlog.log_entry(ticket, bar_time, ...)           # on order fill
     tlog.log_exit(ticket, close_time, exit_price, pnl, close_reason, balance_after)
 """
 
-import os
-import csv
+from __future__ import annotations
+
 import logging
-from datetime import datetime, date
+from datetime import datetime, timezone
 from typing import Optional
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+from utils.db_writer import (
+    write_ml_signal,
+    update_ml_entry,
+    update_ml_exit,
+    utcnow,
+)
 
-# CSV columns — order matters for readability when opening in Excel/pandas
-TRADE_FIELDS = [
-    "ticket", "symbol", "direction", "grade",
-    "open_time", "close_time",
-    "entry_price", "exit_price",
-    "sl", "tp", "rr",
-    "lots", "pnl", "outcome", "close_reason",
-    "prob", "zone_quality", "htf_4h_bias",
-    "in_session", "session_id",
-    "rule_good_session", "rule_buy_score", "rule_sell_score",
-    "balance_before", "balance_after",
-]
+logger = logging.getLogger("trade_logger")
 
-SIGNAL_FIELDS = [
-    "bar_time", "signal", "reason",
-    "prob", "grade", "sl", "tp", "rr",
-    "zone_quality", "htf_4h_bias", "in_session", "session_id",
-    "in_demand", "in_supply",
-    "rule_good_session", "rule_buy_score", "rule_sell_score",
-]
+# 1 pip for XAU/USD (standard Exness convention: 0.10)
+_PIP = 0.10
 
 
-def _safe_float(val, default=None, ndigits: int = 4):
+def _to_pips(price_diff: float) -> Optional[float]:
     try:
-        v = float(val)
-        return round(v, ndigits) if v == v else default  # nan check
+        return round(abs(float(price_diff)) / _PIP, 1)
     except (TypeError, ValueError):
-        return default
+        return None
 
 
-def _safe_int(val, default=0):
+def _safe_float(val, ndigits: int = 5) -> Optional[float]:
     try:
-        return int(float(val))
+        f = float(val)
+        import math
+        return round(f, ndigits) if not (math.isnan(f) or math.isinf(f)) else None
     except (TypeError, ValueError):
-        return default
+        return None
+
+
+def _parse_ts(bar_time) -> datetime:
+    """Convert bar_time string/datetime to UTC-aware datetime."""
+    if isinstance(bar_time, datetime):
+        if bar_time.tzinfo is None:
+            return bar_time.replace(tzinfo=timezone.utc)
+        return bar_time
+    try:
+        dt = datetime.fromisoformat(str(bar_time))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return utcnow()
 
 
 class TradeLogger:
 
-    def __init__(self):
-        os.makedirs(LOGS_DIR, exist_ok=True)
-        self._open_trades: dict = {}   # ticket -> entry row dict
+    def __init__(self, symbol: str = "XAUUSDm", timeframe: str = "15min"):
+        self.symbol    = symbol
+        self.timeframe = timeframe
 
-        # File handler for human-readable log (appends across restarts)
-        self._flog = logging.getLogger("trade_file_log")
-        if not self._flog.handlers:
-            fh = logging.FileHandler(
-                os.path.join(LOGS_DIR, "live_trader.log"), encoding="utf-8"
-            )
-            fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-            self._flog.addHandler(fh)
-            self._flog.setLevel(logging.INFO)
-            self._flog.propagate = False
+        # ticket → {"db_id": int, "open_time": datetime, "entry_price": float,
+        #            "bars_open": int}
+        self._open_trades: dict = {}
 
-    # ── Internal helpers ────────────────────────────────────────────────────
+        # DB id of the most recently logged signal row (used by log_entry on same bar)
+        self._last_signal_id: Optional[int] = None
+        self._last_signal_ts: Optional[datetime] = None
 
-    def _trade_csv(self) -> str:
-        return os.path.join(LOGS_DIR, f"trades_{date.today()}.csv")
+        logger.info("TradeLogger ready  symbol=%s  tf=%s", symbol, timeframe)
 
-    def _signal_csv(self) -> str:
-        return os.path.join(LOGS_DIR, f"signals_{date.today()}.csv")
+    # ── Public API ─────────────────────────────────────────────────────────────
 
-    def _append_csv(self, path: str, fields: list, row: dict):
-        write_header = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            if write_header:
-                writer.writeheader()
-            writer.writerow({k: (row.get(k, "") if row.get(k) is not None else "") for k in fields})
-
-    def _extract_rule_cols(self, row) -> dict:
-        """Pull the key diagnostic columns from a feature row (pd.Series or dict)."""
-        if row is None:
-            return {}
-        return {
-            "zone_quality":       _safe_float(row.get("active_zone_quality", 0), 0, 3),
-            "htf_4h_bias":        _safe_float(row.get("htf_4h_bias", 0), 0, 1),
-            "in_session":         _safe_int(row.get("in_session", 0)),
-            "session_id":         _safe_int(row.get("session_id", 0)),
-            "in_demand":          _safe_int(row.get("in_demand_zone", 0)),
-            "in_supply":          _safe_int(row.get("in_supply_zone", 0)),
-            "rule_good_session":  _safe_int(row.get("rule_good_session", 0)),
-            "rule_buy_score":     _safe_float(row.get("rule_buy_score", 0), 0, 1),
-            "rule_sell_score":    _safe_float(row.get("rule_sell_score", 0), 0, 1),
-        }
-
-    # ── Public API ──────────────────────────────────────────────────────────
-
-    def log_signal(self, bar_time, sig: dict, feat_row=None):
+    def log_signal(self, bar_time, sig: dict, feat_row=None) -> None:
         """
         Log every bar evaluation — including no-trade bars.
-        Call this after evaluate_bar() regardless of outcome.
-        feat_row: the pd.Series feature row (feat_df.iloc[-1]) for the bar.
+        Call after evaluate_bar() regardless of outcome.
         """
-        signal_val = sig.get("signal", 0)
-        direction_str = {1: "BUY", -1: "SELL", 0: "NONE"}.get(signal_val, "NONE")
-        data = {
-            "bar_time": bar_time,
-            "signal":   direction_str,
-            "reason":   sig.get("reason", ""),
-            "prob":     _safe_float(sig.get("prob", 0.0), 0, 4),
-            "grade":    sig.get("grade") or "",
-            "sl":       _safe_float(sig.get("sl")),
-            "tp":       _safe_float(sig.get("tp")),
-            "rr":       _safe_float(sig.get("rr")),
-        }
-        data.update(self._extract_rule_cols(feat_row))
-        self._append_csv(self._signal_csv(), SIGNAL_FIELDS, data)
+        signal_int = int(sig.get("signal", 0) or 0)
+        sl_v  = _safe_float(sig.get("sl"))
+        tp_v  = _safe_float(sig.get("tp"))
+        close = _safe_float(feat_row.get("close") if feat_row is not None else None)
+
+        sl_pips = _to_pips(close - sl_v) if (close and sl_v and signal_int == 1)  else (
+                  _to_pips(sl_v - close) if (close and sl_v and signal_int == -1) else None)
+        tp_pips = _to_pips(tp_v - close) if (close and tp_v and signal_int == 1)  else (
+                  _to_pips(close - tp_v) if (close and tp_v and signal_int == -1) else None)
+
+        ts = _parse_ts(bar_time)
+
+        db_id = write_ml_signal(
+            timestamp        = ts,
+            symbol           = self.symbol,
+            signal           = signal_int,
+            confidence       = _safe_float(sig.get("prob", 0.0)) or 0.0,
+            triggered_rule   = str(sig.get("reason", "") or ""),
+            triggered_tf     = self.timeframe,
+            sl_price         = sl_v,
+            tp_price         = tp_v,
+            sl_distance_pips = sl_pips,
+            tp_distance_pips = tp_pips,
+            rr_ratio         = _safe_float(sig.get("rr")),
+        )
+        self._last_signal_id = db_id
+        self._last_signal_ts = ts
+
+        logger.info(
+            "SIGNAL  %-5s  signal=%-3s  prob=%.3f  grade=%s  reason=%s",
+            self.timeframe,
+            {1: "BUY", -1: "SELL", 0: "NONE"}.get(signal_int, "NONE"),
+            float(sig.get("prob", 0) or 0),
+            sig.get("grade") or "–",
+            (sig.get("reason") or "")[:80],
+        )
 
     def log_entry(
         self,
         ticket,
         bar_time,
-        symbol: str,
-        direction: str,
-        grade: str,
-        entry_price: float,
-        sl: float,
-        tp: float,
-        rr: float,
-        lots: float,
-        prob: float,
+        symbol:         str,
+        direction:      str,
+        grade:          str,
+        entry_price:    float,
+        sl:             float,
+        tp:             float,
+        rr:             float,
+        lots:           float,
+        prob:           float,
         balance_before: float,
-        feat_row=None,
-    ):
+        feat_row        = None,
+    ) -> None:
         """
-        Log a trade entry. Stored in memory until log_exit() completes the row.
-        feat_row: the pd.Series feature row so we capture what the model saw.
+        Record a trade entry.  Updates the most recent signal row with entry_price
+        and stores the DB id for later exit update.
         """
-        entry = {
-            "ticket":        ticket,
-            "symbol":        symbol,
-            "direction":     direction,
-            "grade":         grade,
-            "open_time":     bar_time,
-            "entry_price":   round(float(entry_price), 5),
-            "sl":            round(float(sl), 5),
-            "tp":            round(float(tp), 5),
-            "rr":            round(float(rr), 2),
-            "lots":          round(float(lots), 2),
-            "prob":          round(float(prob), 4),
-            "balance_before": round(float(balance_before), 2),
+        ts = _parse_ts(bar_time)
+        db_id = self._last_signal_id
+
+        # If there's a matching signal row on the same bar, update it
+        if db_id is not None:
+            update_ml_entry(row_id=db_id, entry_price=float(entry_price))
+        else:
+            # Edge case: log_entry without prior log_signal (shouldn't happen)
+            db_id = write_ml_signal(
+                timestamp        = ts,
+                symbol           = symbol,
+                signal           = 1 if direction == "buy" else -1,
+                confidence       = float(prob),
+                triggered_rule   = f"entry ticket={ticket}",
+                triggered_tf     = self.timeframe,
+                sl_price         = _safe_float(sl),
+                tp_price         = _safe_float(tp),
+                sl_distance_pips = _to_pips(abs(float(entry_price) - float(sl))),
+                tp_distance_pips = _to_pips(abs(float(tp) - float(entry_price))),
+                rr_ratio         = _safe_float(rr),
+            )
+            if db_id:
+                update_ml_entry(row_id=db_id, entry_price=float(entry_price))
+
+        self._open_trades[ticket] = {
+            "db_id":       db_id,
+            "open_time":   ts,
+            "entry_price": float(entry_price),
+            "direction":   1 if direction == "buy" else -1,
+            "bars_open":   0,
         }
-        entry.update(self._extract_rule_cols(feat_row))
+        self._last_signal_id = None   # consumed
 
-        self._open_trades[ticket] = entry
-
-        self._flog.info(
-            "ENTRY  ticket=%-8s %-4s %-8s Grade=%s  entry=%.5f  SL=%.5f  TP=%.5f  "
-            "RR=%.2f  prob=%.3f  lots=%.2f  zone_q=%.2f  in_sess=%s  good_sess=%s",
-            ticket, direction.upper(), symbol, grade,
-            entry_price, sl, tp, rr, prob, lots,
-            entry.get("zone_quality", 0),
-            entry.get("in_session", "?"),
-            entry.get("rule_good_session", "?"),
+        logger.info(
+            "ENTRY   ticket=%-8s  %-4s  entry=%.5f  SL=%.5f  TP=%.5f  "
+            "RR=%.2f  prob=%.3f  grade=%s  lots=%.2f",
+            ticket, direction.upper(),
+            entry_price, sl, tp, rr, prob, grade, lots,
         )
 
     def log_exit(
         self,
         ticket,
         close_time,
-        exit_price: float,
-        pnl: float,
-        close_reason: str,          # "SL" | "TP" | "manual" | "unknown"
+        exit_price:    float,
+        pnl:           float,
+        close_reason:  str,
         balance_after: float,
-    ):
+    ) -> None:
         """
-        Complete a trade record with exit data and write to the trades CSV.
+        Complete a trade record with exit data.
         Must be called after log_entry() for the same ticket.
         """
-        entry = self._open_trades.pop(ticket, {})
+        trade = self._open_trades.pop(ticket, {})
+        if not trade:
+            logger.warning("log_exit: no open trade found for ticket=%s", ticket)
+            return
+
+        db_id      = trade.get("db_id")
+        open_time  = trade.get("open_time")
+        entry_px   = trade.get("entry_price", 0.0)
+        direction  = trade.get("direction", 1)
+
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "breakeven")
+        pnl_pips = _safe_float(
+            (float(exit_price) - float(entry_px)) * direction / _PIP
+        )
+        closed_at = _parse_ts(close_time)
 
-        row = {
-            **entry,
-            "close_time":   close_time,
-            "exit_price":   round(float(exit_price), 5),
-            "pnl":          round(float(pnl), 2),
-            "outcome":      outcome,
-            "close_reason": close_reason,
-            "balance_after": round(float(balance_after), 2),
-        }
-        self._append_csv(self._trade_csv(), TRADE_FIELDS, row)
+        trade_duration: Optional[int] = None
+        if open_time and closed_at:
+            try:
+                # Map timeframe label → bar size in minutes
+                _TF_MIN = {
+                    "1min": 1, "2min": 2, "3min": 3, "4min": 4,
+                    "5min": 5, "10min": 10, "15min": 15, "30min": 30,
+                    "1H": 60, "4H": 240, "1D": 1440,
+                }
+                bar_mins = _TF_MIN.get(self.timeframe, 15)
+                delta_secs = (closed_at - open_time).total_seconds()
+                trade_duration = max(1, int(delta_secs // 60 // bar_mins))
+            except Exception:
+                pass
 
-        self._flog.info(
-            "EXIT   ticket=%-8s %-4s  exit=%.5f  pnl=%+.2f  %-9s via %-7s  balance=%.2f",
-            ticket,
-            entry.get("direction", "?").upper(),
-            exit_price, pnl,
-            outcome.upper(), close_reason,
-            balance_after,
+        if db_id is not None:
+            update_ml_exit(
+                row_id           = db_id,
+                exit_price       = float(exit_price),
+                exit_reason      = close_reason,
+                actual_pnl_usd   = float(pnl),
+                actual_pnl_pips  = pnl_pips or 0.0,
+                outcome          = outcome,
+                closed_at        = closed_at,
+                trade_duration   = trade_duration,
+            )
+
+        logger.info(
+            "EXIT    ticket=%-8s  exit=%.5f  pnl=%+.2f  %-9s via %-7s  balance=%.2f",
+            ticket, exit_price, pnl, outcome.upper(), close_reason, balance_after,
         )
 
-    def log_session_start(self, mode: str, timeframe: str, symbol: str, threshold: float, balance: float):
-        self._flog.info(
+    def log_session_start(
+        self, mode: str, timeframe: str, symbol: str, threshold: float, balance: float
+    ) -> None:
+        self.symbol    = symbol
+        self.timeframe = timeframe
+        logger.info(
             "═══ SESSION START  mode=%s  tf=%s  symbol=%s  threshold=%.3f  balance=%.2f ═══",
             mode, timeframe, symbol, threshold, balance,
         )
 
-    def log_session_end(self):
-        self._flog.info("═══ SESSION END ═══")
+    def log_session_end(self) -> None:
+        logger.info("═══ SESSION END ═══")
