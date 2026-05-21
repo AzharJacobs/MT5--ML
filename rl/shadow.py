@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
@@ -98,6 +100,14 @@ OUTCOME_TIMEOUT = 60
 
 # 1 pip in price units for XAU/USD (0.10 = standard broker convention)
 PIP_SIZE = 0.10
+
+# Auto-retrain: trigger fine-tuning after this many new resolved outcomes
+RETRAIN_EVERY_N_OUTCOMES = 50
+RETRAIN_STEPS            = 50_000   # quick fine-tune (~5-10 min)
+
+# Where retrain_shadow.py always saves its output (watched for hot-reload)
+_RETRAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "retrain_shadow.py")
+_RETRAIN_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "final_shadow_model.zip")
 
 
 def _to_pips(price_diff: float) -> float:
@@ -209,6 +219,15 @@ class RLShadow:
         # Each entry keeps "db_id" (rl_shadow row id) for later UPDATE
         self._pending_outcomes: List[Dict[str, Any]] = []
         self._outcome_counter = 0
+
+        # Auto-retrain tracking
+        self._resolved_since_retrain: int     = 0
+        self._retrain_proc: Optional[subprocess.Popen] = None
+        # Seed with current mtime so an existing file doesn't trigger reload on first bar
+        self._retrain_output_mtime: Optional[float] = (
+            os.path.getmtime(_RETRAIN_OUTPUT)
+            if os.path.exists(_RETRAIN_OUTPUT) else None
+        )
 
     # ── Constructor from saved model ─────────────────────────────────────────
 
@@ -366,11 +385,24 @@ class RLShadow:
 
     # ── SL/TP computation ────────────────────────────────────────────────────
 
+    # SL ATR buffer per session: Asian is noisier so we stand further back;
+    # Overlap is the cleanest session so we can sit tighter.
+    _SESSION_SL_BUFFER = {
+        "Asian":   0.80,   # wider — more whipsaw, avoid noise SL hits
+        "Off":     0.80,   # same as Asian (pre/post session behaves similarly)
+        "London":  0.50,   # default
+        "NY":      0.50,   # default
+        "Overlap": 0.45,   # tightest — highest liquidity, cleanest moves
+    }
+
     def _compute_sl_tp(self, row: pd.Series, direction: int) -> Tuple:
         close = float(row.get("close", 0) or 0)
         atr   = float(row.get("atr_14", 0) or 0)
         if atr <= 0:
             return None, None, None
+
+        session    = _session_name(row)
+        atr_buffer = self._SESSION_SL_BUFFER.get(session, self.sl_atr_buffer)
 
         def _f(k: str) -> float:
             v = row.get(k, np.nan)
@@ -385,7 +417,7 @@ class RLShadow:
             s_bot = _f("supply_zone_bottom")
             if np.isnan(d_bot):
                 return None, None, None
-            sl   = d_bot - self.sl_atr_buffer * atr
+            sl   = d_bot - atr_buffer * atr
             risk = close - sl
             if risk <= 0:
                 return None, None, None
@@ -397,7 +429,7 @@ class RLShadow:
             d_top = _f("demand_zone_top")
             if np.isnan(s_top):
                 return None, None, None
-            sl   = s_top + self.sl_atr_buffer * atr
+            sl   = s_top + atr_buffer * atr
             risk = sl - close
             if risk <= 0:
                 return None, None, None
@@ -642,10 +674,66 @@ class RLShadow:
                         pnl_difference      = pnl_diff,
                         rl_was_correct      = _rl_correct,
                     )
+                    self._resolved_since_retrain += 1
             else:
                 still_pending.append(p)
 
         self._pending_outcomes = still_pending
+
+    # ── Auto-retrain helpers ─────────────────────────────────────────────────
+
+    def _reload_model_if_updated(self) -> None:
+        """Hot-swap model weights when retrain_shadow.py has saved a new file."""
+        if not os.path.exists(_RETRAIN_OUTPUT):
+            return
+        try:
+            mtime = os.path.getmtime(_RETRAIN_OUTPUT)
+            if self._retrain_output_mtime is None:
+                self._retrain_output_mtime = mtime
+                return
+            if mtime == self._retrain_output_mtime:
+                return
+            from stable_baselines3 import PPO
+            self.model = PPO.load(_RETRAIN_OUTPUT)
+            self._retrain_output_mtime = mtime
+            self._resolved_since_retrain = 0
+            logger.info("RL model hot-reloaded from retrain output")
+        except Exception as e:
+            logger.warning("Model hot-reload failed: %s", e)
+
+    def _maybe_trigger_retrain(self) -> None:
+        """Spawn retrain_shadow.py in background when enough outcomes accumulate."""
+        # If a retrain is running, check if it finished
+        if self._retrain_proc is not None:
+            rc = self._retrain_proc.poll()
+            if rc is None:
+                return   # still running
+            logger.info("Background retrain finished (exit=%d) — hot-reload pending", rc)
+            self._retrain_proc = None
+            return       # _reload_model_if_updated() will pick it up next bar
+
+        if self._resolved_since_retrain < RETRAIN_EVERY_N_OUTCOMES:
+            return
+        if not os.path.exists(_RETRAIN_SCRIPT):
+            return
+
+        logger.info(
+            "Auto-triggering retrain (%d new resolved outcomes) — "
+            "shadow inference continues with current model",
+            self._resolved_since_retrain,
+        )
+        try:
+            self._retrain_proc = subprocess.Popen(
+                [sys.executable, _RETRAIN_SCRIPT,
+                 "--steps",        str(RETRAIN_STEPS),
+                 "--no-eval",
+                 "--min-outcomes", "10"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Retrain subprocess started (pid=%d)", self._retrain_proc.pid)
+        except Exception as e:
+            logger.warning("Failed to start retrain subprocess: %s", e)
 
     # ── Human-readable reason generation ─────────────────────────────────────
 
@@ -887,6 +975,10 @@ class RLShadow:
         row = feat_df.iloc[-1]
         ts  = str(row.get("timestamp", ""))
 
+        # Hot-reload model if retrain finished; trigger retrain if enough outcomes
+        self._reload_model_if_updated()
+        self._maybe_trigger_retrain()
+
         # Resolve pending outcome tracking
         self._resolve_pending_outcomes(row)
 
@@ -917,12 +1009,29 @@ class RLShadow:
         rl_confidence = None
         try:
             import torch
-            obs_t = torch.as_tensor(obs.reshape(1, -1), device=self.model.device)
+            policy = self.model.policy
+            device = policy.device
+            obs_t = torch.as_tensor(obs.reshape(1, -1), dtype=torch.float32).to(device)
             with torch.no_grad():
-                dist = self.model.policy.get_distribution(obs_t)
-                rl_confidence = round(float(dist.distribution.probs[0, action].cpu()), 4)
-        except Exception:
-            pass
+                if hasattr(policy, "lstm_actor"):
+                    # RecurrentPPO: get_distribution requires LSTM states —
+                    # pass zero state to match model.predict(obs) with no state arg
+                    n_layers = policy.lstm_actor.num_layers
+                    hidden   = policy.lstm_actor.hidden_size
+                    zero     = torch.zeros(n_layers, 1, hidden, device=device)
+                    episode_starts = torch.ones(1, device=device)
+                    features = policy.extract_features(obs_t)
+                    pi_feat  = features[0] if isinstance(features, tuple) else features
+                    latent_pi, _ = policy._process_sequence(
+                        pi_feat, (zero, zero.clone()), episode_starts, policy.lstm_actor
+                    )
+                    latent_pi = policy.mlp_extractor.forward_actor(latent_pi)
+                    dist = policy._get_action_dist_from_latent(latent_pi)
+                else:
+                    dist = policy.get_distribution(obs_t)
+                rl_confidence = round(float(dist.distribution.probs[0, action].item()), 4)
+        except Exception as _e:
+            logger.debug("rl_confidence extraction failed: %s", _e)
 
         # Determine RL signal direction and SL/TP
         close      = float(row.get("close", 0) or 0)
