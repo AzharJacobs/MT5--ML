@@ -112,7 +112,12 @@
       "Bash(python scripts/import_logs_to_db.py)",
       "Bash(python scripts/test_live_flow.py)",
       "Bash(python -X utf8 scripts/test_live_flow.py)",
-      "Bash(python -X utf8 -c ' *)"
+      "Bash(python -X utf8 -c ' *)",
+      "Bash(Get-Content \"f:\\\\MT5- ML\\\\logs\\\\live_trader.log\" -Tail 80)",
+      "PowerShell(Import-Csv \"f:\\\\MT5- ML\\\\logs\\\\rl_shadow_2026-05-20.csv\")",
+      "PowerShell(Import-Csv \"f:\\\\MT5- ML\\\\logs\\\\rl_outcomes_2026-05-20.csv\")",
+      "PowerShell(Import-Csv \"f:\\\\MT5- ML\\\\logs\\\\signals_2026-05-20.csv\")",
+      "PowerShell(Get-WmiObject Win32_Process -Filter \"Name='python.exe'\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
