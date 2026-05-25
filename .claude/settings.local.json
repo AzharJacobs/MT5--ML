@@ -117,7 +117,14 @@
       "PowerShell(Import-Csv \"f:\\\\MT5- ML\\\\logs\\\\rl_shadow_2026-05-20.csv\")",
       "PowerShell(Import-Csv \"f:\\\\MT5- ML\\\\logs\\\\rl_outcomes_2026-05-20.csv\")",
       "PowerShell(Import-Csv \"f:\\\\MT5- ML\\\\logs\\\\signals_2026-05-20.csv\")",
-      "PowerShell(Get-WmiObject Win32_Process -Filter \"Name='python.exe'\")"
+      "PowerShell(Get-WmiObject Win32_Process -Filter \"Name='python.exe'\")",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5-Collector\" -Recurse -File)",
+      "Bash(python collectors/xauusd_price_collector.py --full)",
+      "Bash(python xauusd_main.py)",
+      "Bash(ping -n 20 127.0.0.1)",
+      "Bash(python -c \"import sys; print\\(sys.path\\)\")",
+      "Bash(python scripts/run_pipeline.py --help)",
+      "PowerShell($env:PGPASSWORD = '@thraaParker2003!'; psql -h localhost -U postgres -d ustech_ohlcv -c \"\\\\dt\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
