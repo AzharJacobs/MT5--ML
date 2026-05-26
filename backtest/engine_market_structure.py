@@ -32,14 +32,12 @@ from backtest.chart_market_structure import plot_trades
 # 200 bars × 15 min = 50 hours (~2 trading days). Configurable via --max_bars.
 MAX_FORWARD_BARS = 350
 
-# Profit lock: once price reaches LOCK_TRIGGER_PCT of the TP distance,
-# move SL to LOCK_SL_PCT of the TP distance (locks in partial profit).
-LOCK_TRIGGER_PCT = 0.45   # price must reach 45% of TP distance to trigger
-LOCK_SL_PCT      = 0.40   # SL moves to lock in 40% of TP distance as profit
-
-# After a trade closes/expires from a zone, block re-entry into the same zone
-# for this many 15M bars (96 bars = 24 hours). Prevents hammering the same setup.
-ZONE_COOLDOWN_BARS = 96
+# Zone re-entry cooldown — outcome-based (15M bars).
+# Win: zone consumed, block for the rest of the sim.
+# Loss: short retry window (48 bars = 12 h). Expired: no cooldown.
+COOLDOWN_WIN     = 9999
+COOLDOWN_LOSS    = 48
+COOLDOWN_EXPIRED = 0
 
 # XAUUSD: 1 lot = 100 oz, so each $1 price move = $100 P&L per lot.
 XAUUSD_CONTRACT = 100.0
@@ -53,6 +51,12 @@ RISK_PCT = 0.01
 SYMBOL_CONFIG = {
     "xauusd": ("XAUUSD",      "xauusd_ohlcv", 100.0),  # 1 lot = 100 oz, $1/oz = $100/lot
     "ustech": ("ustech_ohlcv","ustech_ohlcv",   1.0),  # 1 lot = 1 unit, $1/pt = $1/lot
+}
+
+# Default spread in points per symbol (applied to entry: buy+spread, sell-spread).
+SYMBOL_SPREAD = {
+    "xauusd": 0.0,   # SL buffer already covers it
+    "ustech": 2.0,   # typical 2-point spread
 }
 
 
@@ -101,6 +105,7 @@ def run_backtest(
     max_forward_bars: int = MAX_FORWARD_BARS,
     sl_atr_mult: float = 0.0,
     symbol: str = "xauusd",
+    spread: Optional[float] = None,
     save_path: Optional[str] = None,
     chart: bool = False,
 ) -> dict:
@@ -114,13 +119,14 @@ def run_backtest(
         raise ValueError(f"Unknown symbol '{symbol}'. Choose from: {list(SYMBOL_CONFIG)}")
 
     db_name, table, contract_size = SYMBOL_CONFIG[sym]
+    eff_spread = spread if spread is not None else SYMBOL_SPREAD.get(sym, 0.0)
 
     # Connect to the correct database for this symbol
     db = get_connection()
     db.database = db_name
     db.connect()
 
-    print(f"\nSymbol: {sym.upper()}  |  DB: {db_name}  |  Table: {table}  |  Contract: ${contract_size}/pt/lot")
+    print(f"\nSymbol: {sym.upper()}  |  DB: {db_name}  |  Table: {table}  |  Contract: ${contract_size}/pt/lot  |  Spread: {eff_spread} pts")
     print(f"Loading 15M data  {start} → {end} ...")
     df_15m = _load_ohlcv(db, table, "15min", start, end)
     print(f"Loading 4H  data  {start} → {end} ...")
@@ -153,9 +159,13 @@ def run_backtest(
         "4H zone invalidated":      0,
         "zone not tapped recently": 0,
         "no 15M BOS":               0,
+        "15M bias conflicts":       0,
+        "15M post-BOS broken":      0,
         "no 15M swing for SL":      0,
         "SL geometry invalid":      0,
         "TP geometry invalid":      0,
+        "SL too tight":             0,
+        "15M BOS stale":            0,
         "RR too low":               0,
         "zone cooldown":            0,
         "other neutral":            0,
@@ -163,14 +173,18 @@ def run_backtest(
 
     def _bucket(reason: str) -> str:
         r = reason.lower()
-        if "bias neutral"        in r: return "4H bias neutral"
-        if "invalidated"         in r: return "4H zone invalidated"
-        if "not tapped"          in r: return "zone not tapped recently"
-        if "15m" in r and "bos"  in r: return "no 15M BOS"
+        if "bias neutral"            in r: return "4H bias neutral"
+        if "invalidated"             in r: return "4H zone invalidated"
+        if "not tapped"              in r: return "zone not tapped recently"
+        if "15m" in r and "bos"  in r and "stale"    in r: return "15M BOS stale"
+        if "15m" in r and "bos"  in r and "broken"   in r: return "15M post-BOS broken"
+        if "15m" in r and "bos"  in r:                     return "no 15M BOS"
+        if "conflicts"               in r: return "15M bias conflicts"
         if "swing" in r and "sl" in r: return "no 15M swing for SL"
-        if "sl at or"            in r: return "SL geometry invalid"
-        if "tp at or"            in r: return "TP geometry invalid"
-        if "rr"                  in r: return "RR too low"
+        if "sl at or"                in r: return "SL geometry invalid"
+        if "tp at or"                in r: return "TP geometry invalid"
+        if "sl too tight"            in r: return "SL too tight"
+        if "rr"                      in r: return "RR too low"
         return "other neutral"
 
     for i in range(warmup, n - max_forward_bars):
@@ -200,11 +214,32 @@ def run_backtest(
                 filters["zone cooldown"] += 1
                 continue
 
-        entry  = float(df_15m["close"].iloc[i])
+        # Entry = open of the next bar (realistic fill after signal bar closes)
+        entry  = float(df_15m["open"].iloc[i + 1])
         sl     = sig["sl"]
         tp     = sig["tp"]
         side   = sig["signal"]
         reason = sig["reason"]
+
+        # Apply spread cost (buy pays ask, sell receives bid)
+        if eff_spread > 0:
+            entry = entry + eff_spread if side == "buy" else entry - eff_spread
+
+        # Re-validate geometry at actual entry (next-bar open may differ from signal close)
+        if side == "buy":
+            if sl >= entry:
+                filters["SL geometry invalid"] += 1
+                continue
+            if tp <= entry:
+                filters["TP geometry invalid"] += 1
+                continue
+        else:
+            if sl <= entry:
+                filters["SL geometry invalid"] += 1
+                continue
+            if tp >= entry:
+                filters["TP geometry invalid"] += 1
+                continue
 
         # ATR-based SL override: replaces 15M swing SL with entry ± N×ATR
         if sl_atr_mult > 0:
@@ -229,42 +264,25 @@ def run_backtest(
         exit_bar       = i + max_forward_bars
         max_favourable = 0.0
         max_adverse    = 0.0
-        active_sl      = sl          # may be updated by profit lock
-        lock_triggered = False
-
-        tp_dist = abs(tp - entry)
-        lock_trigger_price = (entry + LOCK_TRIGGER_PCT * tp_dist) if side == "buy" \
-                             else (entry - LOCK_TRIGGER_PCT * tp_dist)
-        locked_sl_price    = (entry + LOCK_SL_PCT * tp_dist) if side == "buy" \
-                             else (entry - LOCK_SL_PCT * tp_dist)
 
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
             fl = float(df_15m["low"].iloc[j])
 
-            # Profit lock: trigger once, never move SL back
-            if not lock_triggered:
-                if side == "buy" and fh >= lock_trigger_price:
-                    active_sl      = locked_sl_price
-                    lock_triggered = True
-                elif side == "sell" and fl <= lock_trigger_price:
-                    active_sl      = locked_sl_price
-                    lock_triggered = True
-
             if side == "buy":
                 max_favourable = max(max_favourable, fh - entry)
                 max_adverse    = max(max_adverse,    entry - fl)
                 if fh >= tp:
-                    outcome = 1;  exit_price = tp;       exit_bar = j; break
-                if fl <= active_sl:
-                    outcome = -1; exit_price = active_sl; exit_bar = j; break
+                    outcome = 1;  exit_price = tp;  exit_bar = j; break
+                if fl <= sl:
+                    outcome = -1; exit_price = sl;  exit_bar = j; break
             else:
                 max_favourable = max(max_favourable, entry - fl)
                 max_adverse    = max(max_adverse,    fh - entry)
                 if fl <= tp:
-                    outcome = 1;  exit_price = tp;       exit_bar = j; break
-                if fh >= active_sl:
-                    outcome = -1; exit_price = active_sl; exit_bar = j; break
+                    outcome = 1;  exit_price = tp;  exit_bar = j; break
+                if fh >= sl:
+                    outcome = -1; exit_price = sl;  exit_bar = j; break
 
         # ---- P&L ----
         if outcome != 0:
@@ -279,10 +297,17 @@ def run_backtest(
         equity_curve.append(equity)
         skip_until = i + max_forward_bars
 
-        # Block re-entry into the same zone for ZONE_COOLDOWN_BARS after this trade closes
+        # Outcome-based zone cooldown: win=consumed, loss=short retry, expired=none
         if zone is not None:
             zone_key = (round(zone[0], 1), round(zone[1], 1))
-            zone_cooldown[zone_key] = i + max_forward_bars + ZONE_COOLDOWN_BARS
+            if outcome == 1:
+                cooldown = COOLDOWN_WIN
+            elif outcome == -1:
+                cooldown = COOLDOWN_LOSS
+            else:
+                cooldown = COOLDOWN_EXPIRED
+            if cooldown > 0:
+                zone_cooldown[zone_key] = exit_bar + cooldown
 
         exit_ts = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
         trades.append({
@@ -299,7 +324,7 @@ def run_backtest(
             "equity":        round(equity, 2),
             "max_favour":    round(max_favourable, 2),
             "max_adverse":   round(max_adverse, 2),
-            "lock_hit":      lock_triggered,             # True = profit lock triggered
+            "playbook":      sig.get("playbook", "A"),
             "reason":        reason,
         })
 
@@ -315,9 +340,8 @@ def run_backtest(
     sl_hits    = int((df_t["outcome"] == -1).sum())
     expired    = int((df_t["outcome"] ==  0).sum())
     win_rate   = tp_hits / max(total, 1) * 100
-
-    winners = df_t[df_t["pnl"] > 0]
-    losers  = df_t[df_t["pnl"] < 0]
+    winners    = df_t[df_t["pnl"] > 0]
+    losers     = df_t[df_t["pnl"] < 0]
 
     eq_s       = pd.Series(equity_curve)
     max_dd_pct = round(((eq_s - eq_s.cummax()) / eq_s.cummax()).min() * 100, 2)
@@ -346,7 +370,7 @@ def run_backtest(
         "largest_win_$":    f"${df_t['pnl'].max():.2f}",
         "largest_loss_$":   f"${df_t['pnl'].min():.2f}",
         "max_drawdown_%":   f"{max_dd_pct:.2f}",
-        "profit_lock":      f"trigger@{int(LOCK_TRIGGER_PCT*100)}% → lock@{int(LOCK_SL_PCT*100)}%",
+        "spread_pts":       eff_spread,
         "sl_mode":          f"ATR×{sl_atr_mult}" if sl_atr_mult > 0 else "15M swing",
         "min_rr_filter":    min_rr,
         "max_hold_bars":    max_forward_bars,
@@ -367,12 +391,16 @@ def run_backtest(
     print(f"  {'signals fired':<30} {total:>7,}")
     print(f"{'─'*45}\n")
 
-    # Full trade log with first-move diagnostics
-    lock_saves = int(df_t[(df_t["lock_hit"]) & (df_t["pnl"] > 0) & (df_t["outcome"] == -1)].shape[0])
+    # Trade logs separated by playbook
     cols = ["date", "side", "entry", "sl", "tp", "exit", "pnl", "outcome",
-            "max_favour", "max_adverse", "lock_hit"]
-    print(f"All trades  (lock_hit=True means profit lock triggered on that trade):")
-    print(df_t[cols].to_string(index=False))
+            "max_favour", "max_adverse"]
+    for pb in sorted(df_t["playbook"].unique()):
+        pb_df   = df_t[df_t["playbook"] == pb]
+        pb_wins = int((pb_df["outcome"] == 1).sum())
+        pb_loss = int((pb_df["outcome"] == -1).sum())
+        pb_exp  = int((pb_df["outcome"] == 0).sum())
+        print(f"\nPlaybook {pb}  ({len(pb_df)} trades  |  {pb_wins}W / {pb_loss}L / {pb_exp}E):")
+        print(pb_df[cols].to_string(index=False))
     print()
 
     if save_path:
@@ -405,6 +433,8 @@ def main() -> None:
     parser.add_argument("--sl_atr",   type=float, default=0.0,
                         help="ATR multiplier for SL (e.g. 1.5 = SL at 1.5×ATR from entry). "
                              "0 = use 15M swing low/high (default)")
+    parser.add_argument("--spread",   type=float, default=None,
+                        help="Spread in points applied at entry (default: 0 for xauusd, 2 for ustech)")
     parser.add_argument("--save",     default=None,
                         help="Optional path to save JSON report (e.g. results/ms_backtest.json)")
     parser.add_argument("--chart",    action="store_true",
@@ -419,6 +449,7 @@ def main() -> None:
         max_forward_bars=args.max_bars,
         sl_atr_mult=args.sl_atr,
         symbol=args.symbol,
+        spread=args.spread,
         save_path=args.save,
         chart=args.chart,
     )

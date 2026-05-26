@@ -21,12 +21,16 @@ from plotly.subplots import make_subplots
 import pandas as pd
 
 
-_WIN     = "#00e676"   # green
-_LOSS    = "#f44336"   # red
-_EXPIRED = "#9e9e9e"   # grey
-_TP_LINE = "rgba(0,230,118,0.65)"
-_SL_LINE = "rgba(244,67,54,0.65)"
-_EQ_LINE = "#2196f3"
+_WIN        = "#00e676"              # green
+_LOSS       = "#f44336"              # red
+_EXPIRED    = "#9e9e9e"              # grey
+_TP_LINE    = "rgba(0,230,118,0.65)"
+_SL_LINE    = "rgba(244,67,54,0.65)"
+_EQ_LINE    = "#2196f3"
+_STRONG_SW  = "rgba(255,152,0,0.85)"   # amber  — 4H strong swing level
+_WEAK_SW    = "rgba(33,150,243,0.85)"  # blue   — 4H weak swing level
+_ZONE_FILL  = "rgba(255,152,0,0.07)"   # faint amber fill for 4H zone box
+_ZONE_EDGE  = "rgba(255,152,0,0.40)"   # amber border for 4H zone box
 
 
 def plot_trades(
@@ -92,35 +96,50 @@ def plot_trades(
         row=2, col=1,
     )
 
-    # ── Entry markers ────────────────────────────────────────────────────────
-    groups = {
-        "Win"    : ([t for t in trades if t["outcome"] ==  1], _WIN,     "triangle-up",   8),
-        "Loss"   : ([t for t in trades if t["outcome"] == -1], _LOSS,    "triangle-down", 8),
-        "Expired": ([t for t in trades if t["outcome"] ==  0], _EXPIRED, "circle",        6),
+    # ── Entry markers — grouped by playbook × outcome ────────────────────────
+    # Playbook A: triangle / circle shapes (original visual language)
+    # Playbook C: diamond / square shapes  (counter-trend, distinct at a glance)
+    _PB_SHAPES = {
+        ("A",  1): ("triangle-up",   8),
+        ("A", -1): ("triangle-down", 8),
+        ("A",  0): ("circle",        6),
+        ("C",  1): ("diamond",       9),
+        ("C", -1): ("diamond",       8),
+        ("C",  0): ("square",        7),
     }
+    _OUTCOME_COLOR = { 1: _WIN,  -1: _LOSS,  0: _EXPIRED}
+    _OUTCOME_LABEL = { 1: "Win", -1: "Loss", 0: "Exp"}
+    # Playbook C gets a thicker border so it reads differently when overlapping A
+    _PB_BORDER = {"A": ("white", 0.8), "C": ("white", 1.8)}
 
-    for label, (group, color, symbol, size) in groups.items():
-        if not group:
-            continue
-        y_markers = []
-        for t in group:
-            offset = abs(t["entry"] - t["sl"]) * 0.15
-            y_markers.append(
-                t["entry"] - offset if t["side"] == "buy" else t["entry"] + offset
-            )
-        fig.add_trace(
-            go.Scatter(
-                x=[t["date"] for t in group],
-                y=y_markers,
-                mode="markers",
-                name=label,
-                marker=dict(
-                    symbol=symbol, size=size, color=color,
-                    line=dict(color="white", width=0.8),
+    for pb in ["A", "C"]:
+        for outcome in [1, -1, 0]:
+            group = [t for t in trades
+                     if t.get("playbook", "A") == pb and t["outcome"] == outcome]
+            if not group:
+                continue
+            symbol, size   = _PB_SHAPES[(pb, outcome)]
+            color          = _OUTCOME_COLOR[outcome]
+            bcol, bw       = _PB_BORDER[pb]
+            y_markers = []
+            for t in group:
+                offset = abs(t["entry"] - t["sl"]) * 0.15
+                y_markers.append(
+                    t["entry"] - offset if t["side"] == "buy" else t["entry"] + offset
+                )
+            fig.add_trace(
+                go.Scatter(
+                    x=[t["date"] for t in group],
+                    y=y_markers,
+                    mode="markers",
+                    name=f"{pb}-{_OUTCOME_LABEL[outcome]}",
+                    marker=dict(
+                        symbol=symbol, size=size, color=color,
+                        line=dict(color=bcol, width=bw),
+                    ),
                 ),
-            ),
-            row=1, col=1,
-        )
+                row=1, col=1,
+            )
 
     # ── Exit crosses ─────────────────────────────────────────────────────────
     exit_colors = [
@@ -142,21 +161,71 @@ def plot_trades(
         row=1, col=1,
     )
 
-    # ── SL / TP dotted lines (shapes) ────────────────────────────────────────
-    shapes = []
+    # ── 4H structure overlay: zone box + strong/weak swing lines ─────────────
+    # Drawn per trade for the trade's duration; zone renders below candles,
+    # swing lines render above.  struct_shapes is merged before sl_tp_shapes
+    # so that SL/TP lines always appear on top.
+    struct_shapes = []
     for t in trades:
+        struct = t.get("structure", {})
+        zone   = struct.get("zone")
+        strong = struct.get("strong_swing")
+        weak   = struct.get("weak_swing")
         x0, x1 = str(t["date"]), str(t["exit_date"])
 
-        shapes.append(dict(
+        if zone is not None:
+            struct_shapes.append(dict(
+                type="rect", xref="x", yref="y",
+                x0=x0, x1=x1, y0=zone[0], y1=zone[1],
+                fillcolor=_ZONE_FILL,
+                line=dict(color=_ZONE_EDGE, width=0.8, dash="dot"),
+                layer="below",
+            ))
+        if strong is not None:
+            struct_shapes.append(dict(
+                type="line", xref="x", yref="y",
+                x0=x0, x1=x1, y0=strong, y1=strong,
+                line=dict(color=_STRONG_SW, width=1.2, dash="dashdot"),
+            ))
+        if weak is not None:
+            struct_shapes.append(dict(
+                type="line", xref="x", yref="y",
+                x0=x0, x1=x1, y0=weak, y1=weak,
+                line=dict(color=_WEAK_SW, width=1.2, dash="dashdot"),
+            ))
+
+    # ── SL / TP dotted lines (shapes) ────────────────────────────────────────
+    sl_tp_shapes = []
+    for t in trades:
+        x0, x1 = str(t["date"]), str(t["exit_date"])
+        sl_tp_shapes.append(dict(
             type="line", xref="x", yref="y",
             x0=x0, x1=x1, y0=t["tp"], y1=t["tp"],
             line=dict(color=_TP_LINE, width=1.2, dash="dot"),
         ))
-        shapes.append(dict(
+        sl_tp_shapes.append(dict(
             type="line", xref="x", yref="y",
             x0=x0, x1=x1, y0=t["sl"], y1=t["sl"],
             line=dict(color=_SL_LINE, width=1.2, dash="dot"),
         ))
+
+    shapes = struct_shapes + sl_tp_shapes
+
+    # ── Legend entries for structure colours (dummy traces — shapes have none) ─
+    for leg_name, leg_color, leg_dash in [
+        ("Strong Swing", _STRONG_SW, "dashdot"),
+        ("Weak Swing",   _WEAK_SW,   "dashdot"),
+        ("4H Zone",      _ZONE_EDGE, "dot"),
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None], mode="lines",
+                name=leg_name,
+                line=dict(color=leg_color, width=1.8, dash=leg_dash),
+                showlegend=True,
+            ),
+            row=1, col=1,
+        )
 
     # ── Layout ───────────────────────────────────────────────────────────────
     fig.update_layout(

@@ -124,7 +124,11 @@
       "Bash(ping -n 20 127.0.0.1)",
       "Bash(python -c \"import sys; print\\(sys.path\\)\")",
       "Bash(python scripts/run_pipeline.py --help)",
-      "PowerShell($env:PGPASSWORD = '@thraaParker2003!'; psql -h localhost -U postgres -d ustech_ohlcv -c \"\\\\dt\")"
+      "PowerShell($env:PGPASSWORD = '@thraaParker2003!'; psql -h localhost -U postgres -d ustech_ohlcv -c \"\\\\dt\")",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2026-01-01 --end 2026-12-31 --symbol ustech)",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2025-01-01 --end 2025-12-31 --symbol ustech)",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2025-01-01 --end 2025-12-31 --symbol ustech --max_bars 600)",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2025-01-01 --end 2025-12-31 --max_bars 600)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
