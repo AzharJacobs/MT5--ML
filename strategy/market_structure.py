@@ -9,7 +9,7 @@ Playbook A — Trend Continuation:
   2. BOS only valid on candle CLOSE beyond prior swing (no wicks)
   3. Strong Swing Low = candle with the lowest LOW before the impulse (bullish)
      Strong Swing High = candle with the highest HIGH before the impulse (bearish)
-  4. Zone = body (open/close range) of the Strong Swing origin candle only
+  4. Zone = body range (open/close, no wicks) from Strong Swing candle to BOS candle
   5. Zone active until price closes back through Strong Swing point
   6. Zone tapped when price retraces into the zone
   7. 15M BOS in same direction while zone is tapped = entry signal
@@ -39,6 +39,7 @@ from typing import Optional, Tuple
 # ---------------------------------------------------------------------------
 
 SWING_LOOKBACK   = 3     # bars each side to confirm a swing point (window = 2*n+1)
+ZONE_WIDE        = False  # False = origin candle body only (tighter, better backtest results)
 H4_BARS          = 150   # needs 4+ swings × 21 bars each → 84 bars minimum; 150 gives headroom
 M15_BARS         = 60    # how many 15M bars to load for execution analysis
 ZONE_VISIT_BARS  = 20    # how many recent 15M bars to check for zone tap
@@ -151,15 +152,21 @@ def calc_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
 # Zone definition helper
 # ---------------------------------------------------------------------------
 
-def detect_zone(df: pd.DataFrame, origin_idx: int) -> Tuple[float, float]:
+def detect_zone(df: pd.DataFrame, origin_idx: int, bos_idx: int, wide: bool = True) -> Tuple[float, float]:
     """
-    Zone = body (open/close range) of the origin candle only.
-    The origin candle is the single bar that forms the Strong Swing point.
+    wide=True  (default): full body range across the impulse (origin → BOS) — PDF spec.
+    wide=False           : body of the origin candle only — legacy single-candle mode.
     """
-    row = df.iloc[origin_idx]
-    lo = float(min(row["open"], row["close"]))
-    hi = float(max(row["open"], row["close"]))
-    return (lo, hi)
+    if wide:
+        segment = df.iloc[origin_idx: bos_idx + 1]
+        bodies_lo = segment[["open", "close"]].min(axis=1)
+        bodies_hi = segment[["open", "close"]].max(axis=1)
+        return (float(bodies_lo.min()), float(bodies_hi.max()))
+    else:
+        row = df.iloc[origin_idx]
+        lo = float(min(row["open"], row["close"]))
+        hi = float(max(row["open"], row["close"]))
+        return (lo, hi)
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +257,8 @@ def analyse_4h_structure(df_4h: pd.DataFrame, n: int = SWING_LOOKBACK) -> dict:
         ]
         weak_swing_price = post_bos_sh[0][1] if post_bos_sh else None
 
-        # Zone = body of the origin (Strong Swing) candle only
-        zone_low, zone_high = detect_zone(df, origin_idx)
+        # Zone = body range from Strong Swing candle through BOS candle
+        zone_low, zone_high = detect_zone(df, origin_idx, bos_idx, wide=ZONE_WIDE)
 
         # ATR impulse strength check — reject weak BOS
         atr = calc_atr(df.iloc[:bos_idx + 1])
@@ -301,8 +308,8 @@ def analyse_4h_structure(df_4h: pd.DataFrame, n: int = SWING_LOOKBACK) -> dict:
         ]
         weak_swing_price = post_bos_sl[0][1] if post_bos_sl else None
 
-        # Zone = body of the origin (Strong Swing) candle only
-        zone_low, zone_high = detect_zone(df, origin_idx)
+        # Zone = body range from Strong Swing candle through BOS candle
+        zone_low, zone_high = detect_zone(df, origin_idx, bos_idx, wide=ZONE_WIDE)
 
         # ATR impulse strength check — reject weak BOS
         atr = calc_atr(df.iloc[:bos_idx + 1])
@@ -486,7 +493,7 @@ def analyse_15m_structure(
         seg_lows     = lows[anchor_idx: bos_idx + 1]
         origin_idx   = int(np.argmin(seg_lows)) + anchor_idx
         strong_swing = float(lows[origin_idx])
-        zone_15m     = detect_zone(df, origin_idx)
+        zone_15m     = detect_zone(df, origin_idx, bos_idx, wide=ZONE_WIDE)
 
         # Weak Swing: first swing HIGH after BOS
         post_bos_sh    = [(i, p) for (i, p, _) in swing_highs if i > bos_idx]
@@ -525,7 +532,7 @@ def analyse_15m_structure(
         seg_highs    = highs[anchor_idx: bos_idx + 1]
         origin_idx   = int(np.argmax(seg_highs)) + anchor_idx
         strong_swing = float(highs[origin_idx])
-        zone_15m     = detect_zone(df, origin_idx)
+        zone_15m     = detect_zone(df, origin_idx, bos_idx, wide=ZONE_WIDE)
 
         # Weak Swing: first swing LOW after BOS
         post_bos_sl    = [(i, p) for (i, p, _) in swing_lows if i > bos_idx]

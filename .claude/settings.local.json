@@ -128,7 +128,10 @@
       "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2026-01-01 --end 2026-12-31 --symbol ustech)",
       "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2025-01-01 --end 2025-12-31 --symbol ustech)",
       "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2025-01-01 --end 2025-12-31 --symbol ustech --max_bars 600)",
-      "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2025-01-01 --end 2025-12-31 --max_bars 600)"
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2025-01-01 --end 2025-12-31 --max_bars 600)",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py)",
+      "Bash(python -X utf8 -c \"import strategy.market_structure as m; m.ZONE_WIDE=False; import importlib; importlib.reload\\(m\\)\")",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2025-01-01 --end 2025-05-26)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

@@ -108,9 +108,20 @@ def run_backtest(
     spread: Optional[float] = None,
     save_path: Optional[str] = None,
     chart: bool = False,
+    be_rr: float = 1.0,
+    partial_rr: float = 0.0,
+    partial_pct: float = 0.5,
+    trail_trigger_rr: float = 0.0,
+    trail_atr_mult: float = 1.5,
 ) -> dict:
     """
     Run the Market Structure backtest and print a summary report.
+
+    be_rr            — move SL to breakeven once price travels be_rr × risk in favour (0 = off)
+    partial_rr       — close partial_pct of position at partial_rr × risk; also triggers BE (0 = off)
+    partial_pct      — fraction of position to close at partial_rr (default 0.5 = 50%)
+    trail_trigger_rr — activate ATR trailing stop once price moves this many × risk in favour (0 = off)
+    trail_atr_mult   — trail distance = this many × 15M ATR (default 1.5)
 
     Returns the metrics dict (also saved to save_path as JSON if provided).
     """
@@ -265,33 +276,89 @@ def run_backtest(
         max_favourable = 0.0
         max_adverse    = 0.0
 
+        risk_dist      = abs(entry - sl)
+        active_sl      = sl
+        be_done        = False    # breakeven already triggered
+        partial_done   = False    # partial close already taken
+        partial_pnl    = 0.0      # locked-in P&L from the partial close
+        lot_remaining  = lot      # portion still in the trade
+
+        # ATR trailing stop state
+        atr_val        = _atr(df_15m_w)
+        trail_active   = False
+        trail_stop     = None     # current trailing SL price
+        best_favour_px = entry    # best price seen in trade direction
+
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
             fl = float(df_15m["low"].iloc[j])
 
-            if side == "buy":
-                max_favourable = max(max_favourable, fh - entry)
-                max_adverse    = max(max_adverse,    entry - fl)
-                if fh >= tp:
-                    outcome = 1;  exit_price = tp;  exit_bar = j; break
-                if fl <= sl:
-                    outcome = -1; exit_price = sl;  exit_bar = j; break
-            else:
-                max_favourable = max(max_favourable, entry - fl)
-                max_adverse    = max(max_adverse,    fh - entry)
-                if fl <= tp:
-                    outcome = 1;  exit_price = tp;  exit_bar = j; break
-                if fh >= sl:
-                    outcome = -1; exit_price = sl;  exit_bar = j; break
+            favour  = (fh - entry) if side == "buy" else (entry - fl)
+            adverse = (entry - fl) if side == "buy" else (fh - entry)
+            max_favourable = max(max_favourable, favour)
+            max_adverse    = max(max_adverse,    adverse)
 
-        # ---- P&L ----
+            # Partial close: lock in profit on half the position, then move to BE
+            if partial_rr > 0 and not partial_done and favour >= partial_rr * risk_dist:
+                partial_exit = entry + partial_rr * risk_dist if side == "buy" else entry - partial_rr * risk_dist
+                lot_partial  = lot * partial_pct
+                if side == "buy":
+                    partial_pnl = (partial_exit - entry) * lot_partial * contract_size
+                else:
+                    partial_pnl = (entry - partial_exit) * lot_partial * contract_size
+                lot_remaining = lot * (1 - partial_pct)
+                partial_done  = True
+                be_done       = True
+                active_sl     = entry
+
+            # Breakeven stop
+            if be_rr > 0 and not be_done and not trail_active and favour >= be_rr * risk_dist:
+                be_done   = True
+                active_sl = entry
+
+            # ATR trailing stop — activates once trail_trigger_rr × risk is reached
+            if trail_trigger_rr > 0 and atr_val > 0:
+                if side == "buy":
+                    if fh > best_favour_px:
+                        best_favour_px = fh
+                    if not trail_active and (best_favour_px - entry) >= trail_trigger_rr * risk_dist:
+                        trail_active = True
+                    if trail_active:
+                        new_trail = best_favour_px - trail_atr_mult * atr_val
+                        # ratchet: trail only moves in favourable direction
+                        trail_stop = max(trail_stop, new_trail) if trail_stop is not None else new_trail
+                        active_sl  = max(active_sl, trail_stop)
+                else:
+                    if fl < best_favour_px or best_favour_px == entry:
+                        best_favour_px = fl if fl < best_favour_px else best_favour_px
+                        best_favour_px = fl  # track lowest low for sells
+                    if not trail_active and (entry - best_favour_px) >= trail_trigger_rr * risk_dist:
+                        trail_active = True
+                    if trail_active:
+                        new_trail = best_favour_px + trail_atr_mult * atr_val
+                        trail_stop = min(trail_stop, new_trail) if trail_stop is not None else new_trail
+                        active_sl  = min(active_sl, trail_stop)
+
+            # TP / SL resolution
+            if side == "buy":
+                if fh >= tp:
+                    outcome = 1;  exit_price = tp;       exit_bar = j; break
+                if fl <= active_sl:
+                    outcome = -1; exit_price = active_sl; exit_bar = j; break
+            else:
+                if fl <= tp:
+                    outcome = 1;  exit_price = tp;       exit_bar = j; break
+                if fh >= active_sl:
+                    outcome = -1; exit_price = active_sl; exit_bar = j; break
+
+        # ---- P&L (remaining lot + any locked partial) ----
         if outcome != 0:
             if side == "buy":
-                pnl = (exit_price - entry) * lot * contract_size
+                pnl = (exit_price - entry) * lot_remaining * contract_size + partial_pnl
             else:
-                pnl = (entry - exit_price) * lot * contract_size
+                pnl = (entry - exit_price) * lot_remaining * contract_size + partial_pnl
         else:
-            pnl = 0.0   # expired without hitting TP or SL
+            pnl = partial_pnl   # expired: keep any partial profit, remainder = 0
 
         equity += pnl
         equity_curve.append(equity)
@@ -372,6 +439,9 @@ def run_backtest(
         "max_drawdown_%":   f"{max_dd_pct:.2f}",
         "spread_pts":       eff_spread,
         "sl_mode":          f"ATR×{sl_atr_mult}" if sl_atr_mult > 0 else "15M swing",
+        "breakeven_rr":     be_rr if be_rr > 0 else "off",
+        "partial_close":    f"{partial_pct*100:.0f}% at {partial_rr}RR" if partial_rr > 0 else "off",
+        "trail_stop":       f"trigger={trail_trigger_rr}RR atr×{trail_atr_mult}" if trail_trigger_rr > 0 else "off",
         "min_rr_filter":    min_rr,
         "max_hold_bars":    max_forward_bars,
     }
@@ -435,10 +505,20 @@ def main() -> None:
                              "0 = use 15M swing low/high (default)")
     parser.add_argument("--spread",   type=float, default=None,
                         help="Spread in points applied at entry (default: 0 for xauusd, 2 for ustech)")
-    parser.add_argument("--save",     default=None,
+    parser.add_argument("--save",        default=None,
                         help="Optional path to save JSON report (e.g. results/ms_backtest.json)")
-    parser.add_argument("--chart",    action="store_true",
+    parser.add_argument("--chart",       action="store_true",
                         help="Open interactive Plotly chart after backtest completes")
+    parser.add_argument("--be_rr",            type=float, default=1.0,
+                        help="Move SL to breakeven once price moves this many × risk in favour (0=off, default=1.0)")
+    parser.add_argument("--partial_rr",       type=float, default=0.0,
+                        help="Close partial position at this many × risk in favour (0=off)")
+    parser.add_argument("--partial_pct",      type=float, default=0.5,
+                        help="Fraction of position to close at partial_rr (default=0.5)")
+    parser.add_argument("--trail_trigger_rr", type=float, default=0.0,
+                        help="Activate ATR trailing stop once price moves this many × risk in favour (0=off)")
+    parser.add_argument("--trail_atr_mult",   type=float, default=1.5,
+                        help="Trail distance = this many × 15M ATR (default=1.5)")
     args = parser.parse_args()
 
     run_backtest(
@@ -452,6 +532,11 @@ def main() -> None:
         spread=args.spread,
         save_path=args.save,
         chart=args.chart,
+        be_rr=args.be_rr,
+        partial_rr=args.partial_rr,
+        partial_pct=args.partial_pct,
+        trail_trigger_rr=args.trail_trigger_rr,
+        trail_atr_mult=args.trail_atr_mult,
     )
 
 
