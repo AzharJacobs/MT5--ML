@@ -46,7 +46,10 @@ import joblib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.pipeline_config import RL_FEATURE_COLUMNS, REQUIRED_FEATURE_COLUMNS
+from config.pipeline_config import (
+    RL_FEATURE_COLUMNS, RL_FEATURE_COLUMNS_CYCLICAL,
+    REQUIRED_FEATURE_COLUMNS,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger("rl.train_shadow")
@@ -311,7 +314,8 @@ def split_data(tf_dfs: dict) -> tuple:
 #  Training
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
+def train(train_dfs: dict, test_dfs: dict, resume: bool = False,
+          session_encoding: str = "binary"):
     try:
         from sb3_contrib import RecurrentPPO
     except ImportError:
@@ -325,7 +329,20 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
     from stable_baselines3.common.monitor import Monitor
     from rl.environment_shadow import XAUUSDShadowEnv
 
+    feat_cols = (
+        RL_FEATURE_COLUMNS_CYCLICAL if session_encoding == "cyclical"
+        else RL_FEATURE_COLUMNS
+    )
+    suffix = f"_{session_encoding}" if session_encoding != "binary" else ""
+    shadow_dir  = os.path.join(MODELS_DIR, f"shadow_model{suffix}")
+    final_model = os.path.join(MODELS_DIR, f"final_shadow_model{suffix}")
+
     os.makedirs(MODELS_DIR, exist_ok=True)
+
+    logger.info(
+        "Session encoding: %s  |  feature_cols=%d per TF",
+        session_encoding, len(feat_cols),
+    )
 
     # Pre-compute ML signals for both splits
     logger.info("Pre-computing ML signals for training set (%d bars)...", len(train_dfs[PRIMARY_TF]))
@@ -341,7 +358,7 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
             env = XAUUSDShadowEnv(
                 primary_df      = primary_df,
                 secondary_dfs   = {tf: sec_dfs[tf] for tf in secondary_tfs},
-                feature_columns = RL_FEATURE_COLUMNS,
+                feature_columns = feat_cols,
                 initial_balance = INIT_BALANCE,
                 episode_length  = EPISODE_LEN,
             )
@@ -359,8 +376,8 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
 
     eval_cb = EvalCallback(
         eval_env,
-        best_model_save_path = SHADOW_DIR,
-        log_path             = os.path.join(MODELS_DIR, "eval_logs_shadow"),
+        best_model_save_path = shadow_dir,
+        log_path             = os.path.join(MODELS_DIR, f"eval_logs_shadow{suffix}"),
         eval_freq            = EVAL_FREQ,
         n_eval_episodes      = N_EVAL_EPS,
         deterministic        = True,
@@ -368,14 +385,14 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
     )
     checkpoint_cb = CheckpointCallback(
         save_freq   = 200_000,
-        save_path   = os.path.join(MODELS_DIR, "checkpoints_shadow"),
-        name_prefix = "rppo_shadow",
+        save_path   = os.path.join(MODELS_DIR, f"checkpoints_shadow{suffix}"),
+        name_prefix = f"rppo_shadow{suffix}",
         verbose     = 1,
     )
 
-    if resume and os.path.exists(FINAL_MODEL + ".zip"):
-        logger.info("Resuming from %s.zip", FINAL_MODEL)
-        model = RecurrentPPO.load(FINAL_MODEL, env=train_env)
+    if resume and os.path.exists(final_model + ".zip"):
+        logger.info("Resuming from %s.zip", final_model)
+        model = RecurrentPPO.load(final_model, env=train_env)
     else:
         logger.info("New RecurrentPPO shadow agent | obs=%d", obs_dim)
         model = RecurrentPPO(
@@ -411,8 +428,8 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
     elapsed = (datetime.now() - t0).total_seconds()
     logger.info("Training complete in %.1f min", elapsed / 60)
 
-    model.save(FINAL_MODEL)
-    logger.info("Saved final model → %s.zip", FINAL_MODEL)
+    model.save(final_model)
+    logger.info("Saved final model → %s.zip", final_model)
     return model
 
 
@@ -420,8 +437,13 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False):
 #  Test-set evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate(model, test_dfs: dict) -> dict:
+def evaluate(model, test_dfs: dict, session_encoding: str = "binary") -> dict:
     from rl.environment_shadow import XAUUSDShadowEnv
+
+    feat_cols = (
+        RL_FEATURE_COLUMNS_CYCLICAL if session_encoding == "cyclical"
+        else RL_FEATURE_COLUMNS
+    )
 
     test_primary  = compute_ml_signals_model(test_dfs[PRIMARY_TF])
     secondary_tfs = [tf for tf in TIMEFRAMES if tf != PRIMARY_TF]
@@ -429,7 +451,7 @@ def evaluate(model, test_dfs: dict) -> dict:
     env = XAUUSDShadowEnv(
         primary_df      = test_primary,
         secondary_dfs   = {tf: test_dfs[tf] for tf in secondary_tfs},
-        feature_columns = RL_FEATURE_COLUMNS,
+        feature_columns = feat_cols,
         initial_balance = INIT_BALANCE,
         episode_length  = len(test_primary),
     )
@@ -487,19 +509,24 @@ Examples:
   python rl/train_shadow.py --no-eval
         """,
     )
-    parser.add_argument("--steps",    type=int, default=TOTAL_STEPS, help="Total training steps")
-    parser.add_argument("--resume",   action="store_true",           help="Resume from final_shadow_model.zip")
-    parser.add_argument("--no-eval",  action="store_true",           help="Skip test-set evaluation")
+    parser.add_argument("--steps",            type=int, default=TOTAL_STEPS, help="Total training steps")
+    parser.add_argument("--resume",           action="store_true",           help="Resume from final_shadow_model.zip")
+    parser.add_argument("--no-eval",          action="store_true",           help="Skip test-set evaluation")
+    parser.add_argument("--session-encoding", default="binary",
+                        choices=["binary", "cyclical"],
+                        help="binary (default): in_session+session_id; "
+                             "cyclical: hour_sin+hour_cos (A/B experiment)")
     args = parser.parse_args()
 
     TOTAL_STEPS = args.steps
 
     tf_dfs = load_from_cache()
     train_dfs, test_dfs = split_data(tf_dfs)
-    model = train(train_dfs, test_dfs, resume=args.resume)
+    model = train(train_dfs, test_dfs, resume=args.resume,
+                  session_encoding=args.session_encoding)
 
     if not args.no_eval:
-        evaluate(model, test_dfs)
+        evaluate(model, test_dfs, session_encoding=args.session_encoding)
 
 
 if __name__ == "__main__":

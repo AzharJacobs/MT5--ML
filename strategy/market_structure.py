@@ -42,12 +42,12 @@ SWING_LOOKBACK   = 3     # bars each side to confirm a swing point (window = 2*n
 ZONE_WIDE        = False  # False = origin candle body only (tighter, better backtest results)
 H4_BARS          = 150   # needs 4+ swings × 21 bars each → 84 bars minimum; 150 gives headroom
 M15_BARS         = 60    # how many 15M bars to load for execution analysis
-ZONE_VISIT_BARS  = 20    # how many recent 15M bars to check for zone tap
+ZONE_VISIT_BARS  = 30    # how many recent 15M bars to check for zone tap
 ZONE_TOL         = 0.002 # ±0.2% tolerance on zone boundaries
-SL_BUFFER_PCT    = 0.0005  # small buffer beyond 15M swing point for SL
+SL_BUFFER_PCT    = 0.002   # ~40pt breathing room on USTEC noise
 ATR_PERIOD       = 14      # lookback for ATR calculation
 BOS_ATR_MULT     = 0.5     # BOS impulse must be >= this many ATRs to be valid
-MIN_SL_ATR_MULT  = 0.5     # minimum SL distance as multiple of 15M ATR (filters junk entries)
+MIN_SL_ATR_MULT  = 0.8     # tighter stops get hunted on USTEC noise
 M15_BOS_MAX_AGE  = 20      # 15M BOS must be within this many bars to be considered fresh
 
 
@@ -241,13 +241,24 @@ def analyse_4h_structure(df_4h: pd.DataFrame, n: int = SWING_LOOKBACK) -> dict:
 
         bos_close = closes[bos_idx]
 
-        # Strong Swing Low = candle with the lowest LOW between prior swing low and BOS candle
+        # Strong Swing Low = lowest low at the base of the impulse that caused the BOS
         prior_sl_idx = int(swing_lows[-2][0])
         lows_arr = df["low"].values
-        segment_lows = lows_arr[prior_sl_idx: bos_idx + 1]
+
+        # Walk back from BOS to find where the impulse started
+        # (last bearish close before the bullish impulse sequence)
+        impulse_start = bos_idx - 1
+        for k in range(bos_idx - 1, prior_sl_idx, -1):
+            if df["close"].iloc[k] < df["open"].iloc[k]:
+                impulse_start = k
+                break
+
+        # Strong swing = lowest low in the 5 bars around impulse start
+        search_start = max(prior_sl_idx, impulse_start - 4)
+        segment_lows = lows_arr[search_start: impulse_start + 1]
         if len(segment_lows) == 0:
             return result
-        origin_idx = int(np.argmin(segment_lows)) + prior_sl_idx
+        origin_idx = int(np.argmin(segment_lows)) + search_start
         strong_swing_price = float(lows_arr[origin_idx])
 
         # Weak Swing = first swing HIGH formed after the BOS candle (post-BOS retracement)
@@ -292,13 +303,24 @@ def analyse_4h_structure(df_4h: pd.DataFrame, n: int = SWING_LOOKBACK) -> dict:
 
         bos_close = closes[bos_idx]
 
-        # Strong Swing High = candle with the highest HIGH between prior swing high and BOS candle
+        # Strong Swing High = highest high at the base of the impulse that caused the BOS
         prior_sh_idx = int(swing_highs[-2][0])
         highs_arr = df["high"].values
-        segment_highs = highs_arr[prior_sh_idx: bos_idx + 1]
+
+        # Walk back from BOS to find where the impulse started
+        # (last bullish close before the bearish impulse sequence)
+        impulse_start = bos_idx - 1
+        for k in range(bos_idx - 1, prior_sh_idx, -1):
+            if df["close"].iloc[k] > df["open"].iloc[k]:
+                impulse_start = k
+                break
+
+        # Strong swing = highest high in the 5 bars around impulse start
+        search_start = max(prior_sh_idx, impulse_start - 4)
+        segment_highs = highs_arr[search_start: impulse_start + 1]
         if len(segment_highs) == 0:
             return result
-        origin_idx = int(np.argmax(segment_highs)) + prior_sh_idx
+        origin_idx = int(np.argmax(segment_highs)) + search_start
         strong_swing_price = float(highs_arr[origin_idx])
 
         # Weak Swing = first swing LOW formed after the BOS candle (post-BOS retracement)
@@ -490,8 +512,21 @@ def analyse_15m_structure(
         if not pre_bos_sl:
             return result
         anchor_idx   = pre_bos_sl[-1][0]
-        seg_lows     = lows[anchor_idx: bos_idx + 1]
-        origin_idx   = int(np.argmin(seg_lows)) + anchor_idx
+
+        # Walk back from BOS to find where the impulse started
+        # (last bearish close before the bullish impulse sequence)
+        impulse_start = bos_idx - 1
+        for k in range(bos_idx - 1, anchor_idx, -1):
+            if df["close"].iloc[k] < df["open"].iloc[k]:
+                impulse_start = k
+                break
+
+        # Strong swing = lowest low in the 5 bars around impulse start
+        search_start = max(anchor_idx, impulse_start - 4)
+        seg_lows = lows[search_start: impulse_start + 1]
+        if len(seg_lows) == 0:
+            return result
+        origin_idx   = int(np.argmin(seg_lows)) + search_start
         strong_swing = float(lows[origin_idx])
         zone_15m     = detect_zone(df, origin_idx, bos_idx, wide=ZONE_WIDE)
 
@@ -529,8 +564,21 @@ def analyse_15m_structure(
         if not pre_bos_sh:
             return result
         anchor_idx   = pre_bos_sh[-1][0]
-        seg_highs    = highs[anchor_idx: bos_idx + 1]
-        origin_idx   = int(np.argmax(seg_highs)) + anchor_idx
+
+        # Walk back from BOS to find where the impulse started
+        # (last bullish close before the bearish impulse sequence)
+        impulse_start = bos_idx - 1
+        for k in range(bos_idx - 1, anchor_idx, -1):
+            if df["close"].iloc[k] > df["open"].iloc[k]:
+                impulse_start = k
+                break
+
+        # Strong swing = highest high in the 5 bars around impulse start
+        search_start = max(anchor_idx, impulse_start - 4)
+        seg_highs = highs[search_start: impulse_start + 1]
+        if len(seg_highs) == 0:
+            return result
+        origin_idx   = int(np.argmax(seg_highs)) + search_start
         strong_swing = float(highs[origin_idx])
         zone_15m     = detect_zone(df, origin_idx, bos_idx, wide=ZONE_WIDE)
 

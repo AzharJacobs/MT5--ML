@@ -676,6 +676,16 @@ def build_features(
 
     df = add_strategy_rules(df)
 
+    # Cyclical hour-of-day encoding (always computed; included in feature set only
+    # when session_encoding="cyclical" is chosen at training time).
+    if "timestamp" in df.columns:
+        hour_f = pd.to_datetime(df["timestamp"]).dt.hour.astype(float)
+        df["hour_sin"] = np.sin(2 * np.pi * hour_f / 24.0).astype(np.float32)
+        df["hour_cos"] = np.cos(2 * np.pi * hour_f / 24.0).astype(np.float32)
+    else:
+        df["hour_sin"] = 0.0
+        df["hour_cos"] = 1.0   # cos(0) = 1 → midnight default
+
     # in_session: 1 if bar falls in the trading session used for label generation.
     # session_id: 1=London open, 2=NY open, 3=London/NY overlap, 0=off.
     # include_london_ny controls whether H16 is counted as in-session —

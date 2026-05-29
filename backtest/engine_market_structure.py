@@ -50,7 +50,7 @@ RISK_PCT = 0.01
 # contract_size: dollar value of 1 full lot per 1 point move
 SYMBOL_CONFIG = {
     "xauusd": ("XAUUSD",      "xauusd_ohlcv", 100.0),  # 1 lot = 100 oz, $1/oz = $100/lot
-    "ustech": ("ustech_ohlcv","ustech_ohlcv",   1.0),  # 1 lot = 1 unit, $1/pt = $1/lot
+    "ustech": ("ustech_ohlcv","ustech_ohlcv", 100.0),  # Exness USTEC = $100/pt/lot
 }
 
 # Default spread in points per symbol (applied to entry: buy+spread, sell-spread).
@@ -231,6 +231,15 @@ def run_backtest(
         tp     = sig["tp"]
         side   = sig["signal"]
         reason = sig["reason"]
+
+        # Rebase SL to actual entry price
+        # SL distance was calculated from signal close, entry may differ
+        signal_close = float(df_15m["close"].iloc[i])
+        sl_dist = abs(signal_close - sl)
+        if side == "buy":
+            sl = entry - sl_dist
+        else:
+            sl = entry + sl_dist
 
         # Apply spread cost (buy pays ask, sell receives bid)
         if eff_spread > 0:

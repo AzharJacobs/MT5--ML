@@ -127,3 +127,19 @@ REQUIRED_FEATURE_COLUMNS = [
 
 # Full RL feature set: ML features + macro regime context (66 per TF)
 RL_FEATURE_COLUMNS = REQUIRED_FEATURE_COLUMNS + RL_MACRO_FEATURE_COLUMNS
+
+# ---------------------------------------------------------------------------
+# Cyclical session encoding variants (A/B experiment counterparts).
+# Replace binary in_session + session_id with sin/cos hour-of-day features.
+# Obs dim is unchanged: 2-for-2 swap keeps 66 features per TF (279 total).
+# Use --session-encoding cyclical when retraining to select these lists.
+# ---------------------------------------------------------------------------
+_BINARY_SESSION_COLS = ["in_session", "session_id"]
+_CYCLICAL_SESSION_COLS = ["hour_sin", "hour_cos"]
+
+REQUIRED_FEATURE_COLUMNS_CYCLICAL = [
+    c if c not in _BINARY_SESSION_COLS else _CYCLICAL_SESSION_COLS[_BINARY_SESSION_COLS.index(c)]
+    for c in REQUIRED_FEATURE_COLUMNS
+]
+
+RL_FEATURE_COLUMNS_CYCLICAL = REQUIRED_FEATURE_COLUMNS_CYCLICAL + RL_MACRO_FEATURE_COLUMNS
