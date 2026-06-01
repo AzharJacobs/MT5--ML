@@ -133,7 +133,12 @@
       "Bash(python -X utf8 -c \"import strategy.market_structure as m; m.ZONE_WIDE=False; import importlib; importlib.reload\\(m\\)\")",
       "Bash(python -X utf8 scripts/backtest_market_structure.py --start 2025-01-01 --end 2025-05-26)",
       "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2024-07-01 --end 2024-10-01 --cash 10000 --min_rr 1.5)",
-      "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2024-01-01 --end 2025-12-31 --cash 1000 --min_rr 1.5)"
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2024-01-01 --end 2025-12-31 --cash 1000 --min_rr 1.5)",
+      "Bash(python -X utf8 rl/retrain_shadow.py --report-only)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\rl\\\\\" -File | Select-Object Name)",
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Bash(del rl\\\\environment_mtf.py rl\\\\environment_raw.py rl\\\\train_rl_mtf.py rl\\\\train_rl_raw.py rl\\\\test_env_mtf.py)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Directory)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

@@ -387,7 +387,7 @@ class LiveTrader:
                         timeframe=timeframe,
                         symbol=symbol,
                     )
-                    logger.info("RL shadow loaded (%s)", "multi-TF" if self.rl_shadow.is_multi_tf else "single-TF")
+                    logger.info("RL shadow loaded (trade optimizer — MultiDiscrete[2,3,3])")
                 except FileNotFoundError as exc:
                     logger.warning("RL shadow disabled — no trained model found: %s", exc)
         # Each entry: {"ticket": int, "direction": str ("buy"|"sell")}
@@ -761,16 +761,14 @@ class LiveTrader:
             if feat_df is not None and not isinstance(feat_df, pd.DataFrame):
                 feat_df = pd.DataFrame([feat_df])
             # Build secondary TF feature DFs so multi-TF shadow gets real obs blocks
-            secondary_feat_dfs = None
-            if self.rl_shadow.is_multi_tf:
-                secondary_feat_dfs = self._build_secondary_feat_dfs(h1_df, h4_df) or None
-            rl_sig = self.rl_shadow.observe(feat_df, secondary_feat_dfs=secondary_feat_dfs, ml_signal=sig)
+            secondary_rows = self._build_secondary_feat_dfs(h1_df, h4_df) or None
+            rl_sig = self.rl_shadow.observe(feat_df, ml_signal=sig, secondary_rows=secondary_rows)
             rl_dir = {1: "BUY", -1: "SELL", 0: "hold"}.get(rl_sig["signal"], "hold")
             logger.info(
                 "RL shadow: %s  sl=%.5f  tp=%.5f  rr=%s  (vpos=%d veq=%.2f)",
                 rl_dir,
                 rl_sig["sl"] or 0, rl_sig["tp"] or 0, rl_sig["rr"],
-                self.rl_shadow._position, self.rl_shadow._equity,
+                self.rl_shadow._position, self.rl_shadow._balance,
             )
 
         bar_time = str(bars.iloc[-1].get("timestamp", now))

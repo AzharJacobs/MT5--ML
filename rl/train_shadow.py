@@ -1,37 +1,30 @@
 """
-rl/train_shadow.py — Train the shadow RL agent that filters/augments ML signals.
+rl/train_shadow.py — Train the RL Trade Optimizer that learns HOW to trade ML signals.
+
+Action space: MultiDiscrete([2, 3, 3])
+  action[0]  TAKE/SKIP   — 0=skip, 1=take
+  action[1]  SL_MODE     — 0=ML_SL, 1=TIGHT (0.65×), 2=WIDE (1.4×)
+  action[2]  TP_MODE     — 0=ML_TP, 1=CONSERVATIVE (1.5× RR), 2=EXTENDED (2.5× RR)
 
 Pipeline:
-  1. Load multi-TF feature cache (reuse rl/data/features_*.csv from train_rl_mtf.py)
-  2. Pre-compute ML signals for the 15min primary TF:
-       • Load saved ML model bundle (experiments/runs/)
-       • Run inference on each bar — add ml_signal / ml_prob / ml_grade columns
-       • Falls back to rule-based proxy if no model exists yet
+  1. Load multi-TF feature cache (rl/data/features_*.csv)
+  2. Pre-compute ML signals for 15min primary TF
   3. Build XAUUSDShadowEnv for train + test splits
   4. Train RecurrentPPO (LSTM) for TOTAL_STEPS
-  5. Save to rl/models/shadow_model/  (best checkpoint)
-              rl/models/final_shadow_model.zip
-
-Requirements:
-  pip install sb3-contrib stable-baselines3
+  5. Save to rl/models/shadow_model/ (best) + rl/models/final_shadow_model.zip
 
 Usage:
-  # Prerequisites: run train_rl_mtf.py first to build the feature cache
-  python rl/train_rl_mtf.py --from-cache          # builds rl/data/features_*.csv
+  # Build feature cache first (if not already present):
+  python scripts/build_rl_cache.py   (or any script that writes rl/data/features_*.csv)
 
-  # Train shadow agent (uses cached features)
-  python rl/train_shadow.py
-
-  # Quick smoke test
-  python rl/train_shadow.py --steps 50000
-
-  # Resume interrupted run
-  python rl/train_shadow.py --resume
+  python rl/train_shadow.py               # full 2M step run
+  python rl/train_shadow.py --steps 200000  # quick initial model
+  python rl/train_shadow.py --resume        # continue from last checkpoint
 
 Output:
-  rl/models/shadow_model/best_model.zip  — best checkpoint (EvalCallback)
-  rl/models/final_shadow_model.zip       — final weights at end of run
-  rl/models/tensorboard_shadow/          — TensorBoard logs
+  rl/models/shadow_model/best_model.zip
+  rl/models/final_shadow_model.zip
+  rl/models/tensorboard_shadow/
 """
 
 import os
@@ -372,7 +365,7 @@ def train(train_dfs: dict, test_dfs: dict, resume: bool = False,
     eval_env  = DummyVecEnv([_make_env(test_primary,  test_sec)])
 
     obs_dim = train_env.observation_space.shape[0]
-    logger.info("Shadow env  obs_dim=%d  actions=3 (agree/skip/rotate)", obs_dim)
+    logger.info("Shadow env  obs_dim=%d  actions=MultiDiscrete([2,3,3]) take/sl/tp", obs_dim)
 
     eval_cb = EvalCallback(
         eval_env,
@@ -465,7 +458,7 @@ def evaluate(model, test_dfs: dict, session_encoding: str = "binary") -> dict:
         action, lstm_states = model.predict(
             obs, state=lstm_states, episode_start=episode_start, deterministic=True
         )
-        obs, _, terminated, truncated, _ = env.step(int(action))
+        obs, _, terminated, truncated, _ = env.step(np.array(action).flatten())
         done          = terminated or truncated
         episode_start = np.array([done])
 

@@ -105,61 +105,94 @@ def load_shadow_data() -> pd.DataFrame:
 
 def build_labeled_dataset(shadow: pd.DataFrame) -> pd.DataFrame:
     """
-    Derive correct_action from resolved outcome data already in rl_shadow rows.
+    Derive correct MultiDiscrete action [take, sl_mode, tp_mode] from resolved outcomes.
 
-    rl_was_correct (bool from DB) tells us if the agent was right.
-    We also re-derive correct_action for replay training:
-      rl_hypothetical_pnl > 0  → market went in RL direction (agree was right = 0)
-      rl_hypothetical_pnl < 0  → market went against RL     (skip was right  = 1)
-      stalled (pnl ≈ 0, long duration) → rotate was right   = 2
+    action[0] take:    1 if trade was profitable, 0 if not
+    action[1] sl_mode: 1=TIGHT if MAE < 40% of SL distance (clean zone),
+                       2=WIDE  if MAE > 80% of SL distance (noisy zone),
+                       0=ML_SL otherwise
+    action[2] tp_mode: 2=EXTENDED if MFE > 1.8× TP distance (market ran hard),
+                       1=CONSERVATIVE if MFE < 1.0× TP distance (market stalled early),
+                       0=ML_TP otherwise
     """
-    # Only rows with resolved outcomes
     resolved = shadow[shadow["rl_was_correct"].notna()].copy()
     if resolved.empty:
         logger.warning("No resolved outcome rows found in rl_shadow.")
         return resolved
 
-    # Map rl_decision int (0=agree,1=skip,2=rotate) back to name for compatibility
-    action_map = {0: "agree", 1: "skip", 2: "rotate"}
-    resolved["rl_action_name"] = resolved["rl_decision"].map(action_map).fillna("agree")
+    resolved["rl_action_name"] = resolved["rl_decision"].map(
+        {0: "skip", 1: "take"}
+    ).fillna("skip")
 
-    def _correct_action(row) -> int:
-        pnl  = row.get("rl_hypothetical_pnl") or 0.0
-        dur  = row.get("trade_duration") or 0
-        if pnl > 0:
-            return 0   # agree
-        if pnl < 0:
-            return 1   # skip
-        if dur >= 20:
-            return 2   # rotate
-        return 1       # stalled short → skip
+    def _correct_actions(row) -> tuple:
+        pnl     = float(row.get("rl_hypothetical_pnl") or 0.0)
+        mfe     = float(row.get("max_favourable")       or 0.0)
+        mae     = float(row.get("max_adverse")          or 0.0)
+        ml_sl   = row.get("ml_sl_price")
+        ml_tp   = row.get("ml_tp_price")
+        entry   = row.get("ml_entry_price") or 0.0
 
-    resolved["correct_action"] = resolved.apply(_correct_action, axis=1)
-    resolved["was_correct"]    = (
-        resolved["rl_decision"] == resolved["correct_action"]
-    )
+        # action[0]: should we have taken this trade?
+        take = 1 if pnl > 0 else 0
+
+        # max_favourable / max_adverse in DB are in USD (lot_size=0.01, contract=10 → $0.10/pt)
+        # ml_sl_price and ml_entry_price are raw price levels — convert to USD for comparison
+        lot_usd = 0.01 * 10   # $0.10 per price point for XAUUSD 0.01 lots
+
+        # action[1]: SL mode
+        sl_dist_usd = abs(float(entry) - float(ml_sl)) * lot_usd if ml_sl else 0.0
+        if sl_dist_usd > 0:
+            mae_ratio = mae / sl_dist_usd
+            if mae_ratio < 0.40:
+                sl_mode = 1   # TIGHT — zone was clean, tight SL would have held
+            elif mae_ratio > 0.80:
+                sl_mode = 2   # WIDE — zone was noisy, wider SL needed
+            else:
+                sl_mode = 0
+        else:
+            sl_mode = 0
+
+        # action[2]: TP mode
+        tp_dist_usd = abs(float(ml_tp) - float(entry)) * lot_usd if ml_tp else 0.0
+        if tp_dist_usd > 0:
+            mfe_ratio = mfe / tp_dist_usd
+            if mfe_ratio > 1.8:
+                tp_mode = 2   # EXTENDED — market ran well past TP, should have aimed higher
+            elif mfe_ratio < 1.0:
+                tp_mode = 1   # CONSERVATIVE — market stalled before TP, take earlier
+            else:
+                tp_mode = 0
+        else:
+            tp_mode = 0
+
+        return take, sl_mode, tp_mode
+
+    results = resolved.apply(_correct_actions, axis=1, result_type="expand")
+    resolved["correct_take"]    = results[0].astype(int)
+    resolved["correct_sl_mode"] = results[1].astype(int)
+    resolved["correct_tp_mode"] = results[2].astype(int)
+
+    # was_correct: did the agent match on take/skip at minimum?
+    resolved["was_correct"] = (resolved["rl_decision"] == resolved["correct_take"])
 
     total   = len(resolved)
     correct = resolved["was_correct"].sum()
+    took    = (resolved["correct_take"] == 1).sum()
+    skip    = (resolved["correct_take"] == 0).sum()
+    tight   = (resolved["correct_sl_mode"] == 1).sum()
+    wide    = (resolved["correct_sl_mode"] == 2).sum()
+    cons    = (resolved["correct_tp_mode"] == 1).sum()
+    ext     = (resolved["correct_tp_mode"] == 2).sum()
+
     logger.info(
-        "Labeled dataset: %d decisions | accuracy=%.1f%% | "
-        "correct_skip=%d  correct_agree=%d  correct_rotate=%d",
+        "Labeled dataset: %d decisions | take/skip accuracy=%.1f%% | "
+        "correct_take=%d  correct_skip=%d | "
+        "sl: tight=%d wide=%d ml=%d | tp: cons=%d ext=%d ml=%d",
         total, 100 * correct / max(total, 1),
-        (resolved["correct_action"] == 1).sum(),
-        (resolved["correct_action"] == 0).sum(),
-        (resolved["correct_action"] == 2).sum(),
+        took, skip,
+        tight, wide, total - tight - wide,
+        cons, ext, total - cons - ext,
     )
-
-    wrong = resolved[~resolved["was_correct"]]
-    if len(wrong) > 0:
-        logger.info(
-            "Wrong decisions breakdown: %s",
-            wrong.groupby(["rl_action_name",
-                           resolved.loc[wrong.index, "rl_hypothetical_pnl"].apply(
-                               lambda x: "lost" if (x or 0) < 0 else "stalled"
-                           )]).size().to_dict(),
-        )
-
     return resolved
 
 
@@ -244,29 +277,30 @@ class LiveReplayEnv:
                     "market_did":      market_did,
                     "pnl_usd":         hyp_pnl,
                     "bars_to_outcome": int(row.get("trade_duration") or 0),
-                    "correct_action":  int(row["correct_action"]),
+                    # 3-element correct action for new MultiDiscrete space
+                    "correct_take":    int(row.get("correct_take",    1 if hyp_pnl > 0 else 0)),
+                    "correct_sl_mode": int(row.get("correct_sl_mode", 0)),
+                    "correct_tp_mode": int(row.get("correct_tp_mode", 0)),
                 }
 
         total_real = len(self._real_idx)
         logger.info("LiveReplayEnv: %d real outcome anchors injected into feature cache",
                     total_real)
 
-        # Monkey-patch _evaluate_pending_skips to use real outcomes
+        # Patch skip evaluator to use real outcomes where available
         self._patch_env()
 
-        # Expose gym interface
         self.observation_space = self._env.observation_space
         self.action_space      = self._env.action_space
 
     def _patch_env(self):
-        """Override the pending-skip evaluator to use real outcomes at known bars."""
+        """Override pending-skip evaluator to use real outcomes at known bars."""
         real_idx = self._real_idx
         inner    = self._env
 
-        original_evaluate = inner._evaluate_pending_skips.__func__  # unbound
+        original_evaluate = inner._evaluate_pending_skips.__func__
 
         def patched_evaluate(env_self, row: "pd.Series") -> float:
-            """Use real outcome if available; fall back to price simulation."""
             current_ts = pd.to_datetime(
                 env_self.primary_df.iloc[env_self.current_step].get("timestamp", "")
             )
@@ -274,23 +308,17 @@ class LiveReplayEnv:
             if real is None:
                 return original_evaluate(env_self, row)
 
-            # Inject real outcome into each pending skip
             reward = 0.0
-            still_pending = []
-            for p in env_self._pending_skips:
+            market_did = real["market_did"]
+            for p in list(env_self._pending_skips):
                 p["age"] = p.get("age", 0) + 1
-                market_did = real["market_did"]
                 if market_did == "won":
-                    # We skipped a winner — penalise
                     reward -= env_self.skip_winner_penalty
                 elif market_did == "lost":
-                    # We skipped a loser — reward
                     reward += env_self.skip_loser_reward
                 elif market_did == "stalled":
-                    # Mild reward for avoiding a dead trade
                     reward += env_self.skip_loser_reward * 0.4
-                # resolved — don't keep in queue
-            env_self._pending_skips = still_pending
+            env_self._pending_skips = []   # all resolved
             return reward
 
         import types
@@ -438,39 +466,48 @@ def print_report(labeled: pd.DataFrame):
         return
     total   = len(labeled)
     correct = labeled["was_correct"].sum()
-
-    # Derive market direction from rl_hypothetical_pnl
-    pnl_col = labeled.get("rl_hypothetical_pnl", pd.Series(dtype=float)) \
-        if "rl_hypothetical_pnl" not in labeled.columns else labeled["rl_hypothetical_pnl"]
+    pnl_col = labeled["rl_hypothetical_pnl"] if "rl_hypothetical_pnl" in labeled.columns \
+              else pd.Series(dtype=float)
     won     = (pnl_col > 0).sum()
     lost    = (pnl_col < 0).sum()
     stalled = ((pnl_col == 0) | pnl_col.isna()).sum()
 
-    skipped_losers  = ((labeled["rl_action_name"] == "skip")  & (pnl_col < 0)).sum()
-    skipped_winners = ((labeled["rl_action_name"] == "skip")  & (pnl_col > 0)).sum()
-    agreed_winners  = ((labeled["rl_action_name"] == "agree") & (pnl_col > 0)).sum()
-    agreed_losers   = ((labeled["rl_action_name"] == "agree") & (pnl_col < 0)).sum()
+    skipped_losers  = ((labeled["rl_action_name"] == "skip") & (pnl_col < 0)).sum()
+    skipped_winners = ((labeled["rl_action_name"] == "skip") & (pnl_col > 0)).sum()
+    took_winners    = ((labeled["rl_action_name"] == "take") & (pnl_col > 0)).sum()
+    took_losers     = ((labeled["rl_action_name"] == "take") & (pnl_col < 0)).sum()
+
+    tight = (labeled.get("correct_sl_mode", pd.Series(dtype=int)) == 1).sum() \
+            if "correct_sl_mode" in labeled.columns else 0
+    wide  = (labeled.get("correct_sl_mode", pd.Series(dtype=int)) == 2).sum() \
+            if "correct_sl_mode" in labeled.columns else 0
+    cons  = (labeled.get("correct_tp_mode", pd.Series(dtype=int)) == 1).sum() \
+            if "correct_tp_mode" in labeled.columns else 0
+    ext   = (labeled.get("correct_tp_mode", pd.Series(dtype=int)) == 2).sum() \
+            if "correct_tp_mode" in labeled.columns else 0
 
     print("\n" + "=" * 60)
-    print("SHADOW AGENT — LIVE OUTCOME ANALYSIS")
+    print("TRADE OPTIMIZER — LIVE OUTCOME ANALYSIS")
     print("=" * 60)
     print(f"  Total resolved decisions : {total}")
     print(f"  Market won               : {won}  ({100*won/max(total,1):.1f}%)")
     print(f"  Market lost              : {lost}  ({100*lost/max(total,1):.1f}%)")
     print(f"  Market stalled           : {stalled}")
-    print(f"  Overall accuracy         : {100*correct/max(total,1):.1f}%")
+    print(f"  Take/Skip accuracy       : {100*correct/max(total,1):.1f}%")
     print("─" * 60)
-    print("  Good decisions:")
+    print("  Take/Skip decisions:")
+    print(f"    Took winners           : {took_winners}")
+    print(f"    Took losers            : {took_losers}")
     print(f"    Skipped losers         : {skipped_losers}")
-    print(f"    Agreed on winners      : {agreed_winners}")
-    print("  Bad decisions:")
     print(f"    Skipped winners        : {skipped_winners}")
-    print(f"    Agreed on losers       : {agreed_losers}")
+    print("─" * 60)
+    print("  Optimal level labels (for training):")
+    print(f"    SL: TIGHT={tight}  WIDE={wide}  ML={total-tight-wide}")
+    print(f"    TP: CONS={cons}   EXT={ext}   ML={total-cons-ext}")
     print("=" * 60)
 
     if total < 50:
-        print(f"\n  NOTE: Only {total} outcomes — more live data = better fine-tuning.")
-        print("  Consider running the live bot for more sessions before retraining.")
+        print(f"\n  NOTE: Only {total} outcomes — need 50+ for retraining.")
     print()
 
 
