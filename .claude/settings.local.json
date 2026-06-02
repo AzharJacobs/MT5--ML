@@ -138,7 +138,22 @@
       "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\rl\\\\\" -File | Select-Object Name)",
       "Bash(grep -E \"\\\\.py$|^d\")",
       "Bash(del rl\\\\environment_mtf.py rl\\\\environment_raw.py rl\\\\train_rl_mtf.py rl\\\\train_rl_raw.py rl\\\\test_env_mtf.py)",
-      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Directory)"
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Recurse -Directory)",
+      "Bash(Select-Object -First 20 FullName)",
+      "Bash(python -m models.trainer --help)",
+      "Bash(python -X utf8 -m models.trainer --timeframes 15min --end-date 2025-12-31)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny --be-r 1.0)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny --be-r 1.25 --no-trail)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny --be-r 999 --no-trail)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny --be-r 1.25 --no-trail --sl-buffer-atr 1.0)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny --be-r 1.25 --no-trail --require-confirmation)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2026-01-01 --end-date 2026-05-25 --cash 50 --no-london-ny --be-r 999 --no-trail --require-confirmation)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2025-07-01 --end-date 2025-12-31 --cash 50 --no-london-ny --be-r 999 --no-trail --require-confirmation)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2025-07-01 --end-date 2025-12-31 --cash 50 --no-london-ny --be-r 999 --no-trail --require-confirmation --trend-only)",
+      "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2024-01-01 --end-date 2024-12-31 --cash 50 --no-london-ny --be-r 999 --no-trail --require-confirmation --trend-only)",
+      "Bash(python -X utf8 scripts/diagnose_2024.py)",
+      "Bash(python -X utf8 -m models.trainer --timeframes 15min)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

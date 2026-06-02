@@ -75,10 +75,14 @@ print(f"htf_1h_bias:  {last.get('htf_1h_bias')}")
 print(f"atr_14:       {last.get('atr_14'):.4f}")
 print(f"volume_ratio: {last.get('volume_ratio'):.3f}")
 print(f"momentum:     {last.get('momentum_5')}")
+print(f"bos_bullish:             {last.get('bos_bullish')}")
+print(f"bos_bearish:             {last.get('bos_bearish')}")
+print(f"buy_confirmation_score:  {last.get('buy_confirmation_score')}")
+print(f"sell_confirmation_score: {last.get('sell_confirmation_score')}")
 
 # Also show last 10 bars with zone status
 print(f"\n=== LAST 10 BARS — ZONE MAP ===")
-cols = ["timestamp","close","in_demand_zone","in_supply_zone","between_zones","demand_zone_bottom","demand_zone_top","supply_zone_bottom","supply_zone_top","zone_quality"]
+cols = ["timestamp","close","in_demand_zone","in_supply_zone","between_zones","demand_zone_bottom","demand_zone_top","supply_zone_bottom","supply_zone_top","zone_quality","bos_bullish","bos_bearish","buy_confirmation_score","sell_confirmation_score"]
 available = [c for c in cols if c in feat.columns]
 print(feat[available].tail(10).to_string(index=False))
 

@@ -37,6 +37,7 @@ logger = logging.getLogger("mt5_collector.features")
 # Zone expiry settings
 MAX_ZONE_AGE_BARS = 500   # expire zone if older than this many bars
 ZONE_EXPIRE_ATR   = 5.0   # AND price is more than this many ATR away
+BOS_PIVOT_N       = 3     # bars on each side required to confirm a swing pivot
 
 # Session hours in broker time (Exness GMT+3)
 # London open: 10:00-12:30, London/NY overlap: 16:00-19:00
@@ -310,8 +311,8 @@ def add_strategy_rules(df: pd.DataFrame) -> pd.DataFrame:
     bos_bull  = df.get("bos_bullish",        pd.Series(0, index=df.index)).fillna(0)
     bos_bear  = df.get("bos_bearish",        pd.Series(0, index=df.index)).fillna(0)
 
-    rule_confirmed_buy  = ((bull_eng == 1) | (pin_bull == 1) | ((hi_low == 1) & (bos_bull == 1))).astype(float)
-    rule_confirmed_sell = ((bear_eng == 1) | (pin_bear == 1) | ((lo_high == 1) & (bos_bear == 1))).astype(float)
+    rule_confirmed_buy  = ((bull_eng == 1) | (pin_bull == 1) | (hi_low == 1) | (bos_bull == 1)).astype(float)
+    rule_confirmed_sell = ((bear_eng == 1) | (pin_bear == 1) | (lo_high == 1) | (bos_bear == 1)).astype(float)
 
     # --- Zone entry flags ---
     in_demand = df.get("in_demand_zone", pd.Series(0, index=df.index)).fillna(0)
@@ -335,14 +336,12 @@ def add_strategy_rules(df: pd.DataFrame) -> pd.DataFrame:
     # --- Full setup rules (all conditions) ---
     rule_valid_buy_setup = (
         (in_demand == 1) &
-        (rule_htf_aligned_buy == 1) &
-        (rule_good_session == 1)
+        (rule_htf_aligned_buy == 1)
     ).astype(float)
 
     rule_valid_sell_setup = (
         (in_supply == 1) &
-        (rule_htf_aligned_sell == 1) &
-        (rule_good_session == 1)
+        (rule_htf_aligned_sell == 1)
     ).astype(float)
 
     # --- Composite scores (how many conditions met) ---
@@ -473,10 +472,20 @@ def add_confirmation_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["higher_low"] = (df["low"]  > df["low"].shift(1)).astype(float)
     df["lower_high"] = (df["high"] < df["high"].shift(1)).astype(float)
 
-    swing_high = df["high"].rolling(5).max().shift(1)
-    swing_low  = df["low"].rolling(5).min().shift(1)
-    df["bos_bullish"] = (df["close"] > swing_high).astype(float)
-    df["bos_bearish"] = (df["close"] < swing_low).astype(float)
+    window          = 2 * BOS_PIVOT_N + 1
+    pivot_high_mask = df["high"].rolling(window).max() == df["high"].shift(BOS_PIVOT_N)
+    pivot_high_val  = df["high"].shift(BOS_PIVOT_N).where(pivot_high_mask)
+    last_swing_high = pivot_high_val.ffill()
+
+    pivot_low_mask  = df["low"].rolling(window).min() == df["low"].shift(BOS_PIVOT_N)
+    pivot_low_val   = df["low"].shift(BOS_PIVOT_N).where(pivot_low_mask)
+    last_swing_low  = pivot_low_val.ffill()
+
+    bos_bull_raw    = (df["close"] > last_swing_high)
+    df["bos_bullish"] = (bos_bull_raw & ~bos_bull_raw.shift(1).fillna(False)).astype(float)
+
+    bos_bear_raw    = (df["close"] < last_swing_low)
+    df["bos_bearish"] = (bos_bear_raw & ~bos_bear_raw.shift(1).fillna(False)).astype(float)
 
     df["buy_confirmation_score"]  = (
         df["bullish_engulfing"] + df["pin_bar_bullish"] +
@@ -541,6 +550,17 @@ def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5
     htf_df["timestamp"] = pd.to_datetime(htf_df["timestamp"])
     atr = _atr(htf_df, 14)
 
+    # Per-bar 1H trend bias: impulse direction forward-filled (mirrors htf_4h_bias pattern)
+    h1_body     = (htf_df["close"] - htf_df["open"]).abs()
+    h1_imp      = h1_body > 0.5 * atr
+    h1_bias_raw = np.where(
+        h1_imp & (htf_df["close"] > htf_df["open"]),  1.0,
+        np.where(
+            h1_imp & (htf_df["close"] < htf_df["open"]), -1.0, np.nan
+        )
+    )
+    h1_bias_series = pd.Series(h1_bias_raw).ffill().fillna(0.0)
+
     records       = []
     active_demand = None
     active_supply = None
@@ -584,11 +604,7 @@ def _extract_htf_zones(htf_df: pd.DataFrame, impulse_atr_multiplier: float = 0.5
             "htf_demand_zone_bottom": active_demand["bottom"] if active_demand else np.nan,
             "htf_supply_zone_top":    active_supply["top"]    if active_supply else np.nan,
             "htf_supply_zone_bottom": active_supply["bottom"] if active_supply else np.nan,
-            "htf_1h_bias": (
-                1.0  if active_demand and not active_supply else
-                -1.0 if active_supply and not active_demand else
-                0.0
-            ),
+            "htf_1h_bias": float(h1_bias_series.iloc[i]),
         })
     return pd.DataFrame(records)
 
@@ -618,12 +634,18 @@ def add_htf_context(ltf_df, h1_df, h4_df):
     if h4_df is not None and len(h4_df) > 0:
         h4_df = h4_df.copy()
         h4_df["timestamp"] = pd.to_datetime(h4_df["timestamp"])
-        h4_atr  = _atr(h4_df, 14)
-        h4_body = (h4_df["close"] - h4_df["open"]).abs()
-        h4_imp  = h4_body > 0.5 * h4_atr
-        h4_bias = np.where(h4_imp & (h4_df["close"] > h4_df["open"]),  1.0,
-                  np.where(h4_imp & (h4_df["close"] < h4_df["open"]), -1.0, np.nan))
-        h4_df["htf_4h_bias"] = pd.Series(h4_bias).ffill().fillna(0.0).values
+        if len(h4_df) >= 200:
+            h4_ema200 = _ema(h4_df["close"], 200)
+            h4_slope  = h4_ema200.diff()
+            h4_bias   = np.where(
+                (h4_df["close"].values > h4_ema200.values) & (h4_slope.values > 0),  1.0,
+                np.where(
+                    (h4_df["close"].values < h4_ema200.values) & (h4_slope.values < 0), -1.0, 0.0
+                )
+            )
+            h4_df["htf_4h_bias"] = h4_bias.astype(float)
+        else:
+            h4_df["htf_4h_bias"] = 0.0
         ltf_df = pd.merge_asof(
             ltf_df.sort_values("timestamp"),
             h4_df[["timestamp","htf_4h_bias"]].sort_values("timestamp"),

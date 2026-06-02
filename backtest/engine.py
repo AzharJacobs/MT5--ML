@@ -94,7 +94,9 @@ class BacktestResult:
     filtered_bad_sltp: int
     filtered_low_rr: int
     filtered_htf_filter: int = 0
-    filtered_risk_atr: int = 0
+    filtered_risk_atr:   int = 0
+    filtered_trend_buy:  int = 0
+    filtered_trend_sell: int = 0
     # Extended P&L fields
     start_cash: float = 10000.0
     gross_profit: float = 0.0
@@ -116,6 +118,10 @@ class BacktestResult:
     grade_c_trades: int = 0
     grade_c_wins:   int = 0
     be_lock_count:  int = 0
+    exits_tp:    int = 0
+    exits_sl:    int = 0
+    exits_be:    int = 0
+    exits_trail: int = 0
     trade_log: tuple = ()  # raw per-trade entries for breakdown analysis
 
 
@@ -202,6 +208,11 @@ class MLSignalStrategy(bt.Strategy):
         min_zone_quality=MIN_ZONE_QUALITY,
         breakeven_trigger_pts=0.0,  # >0: move SL to entry once profit reaches this level
         timeframe="1H",           # used to select 15min-specific BE/trail parameters
+        be_r=1.25,                # breakeven trigger in R multiples
+        no_trail=False,           # True = disable trailing stop, let trades run to TP
+        sl_buffer_atr=0.0,        # >0: override zone-quality SL floor with flat ATR multiple
+        require_confirmation=False,  # True: only enter when confirmation score >= 1
+        trend_only=False,         # hard HTF direction gate: buy only if htf_4h_bias >= 0, sell only if <= 0
     )
 
     def __init__(self):
@@ -294,6 +305,9 @@ class MLSignalStrategy(bt.Strategy):
             "with_trend":   with_trend,
             "initial_risk": initial_risk,
             "prob":         prob,
+            "close_reason": t.get("close_reason", "sl") if matched_idx is not None else "sl",
+            "zone_quality": t.get("zone_quality", float("nan")),
+            "entry_date":   t.get("entry_date"),
         })
 
         # Backtrader netting mode: 2 buys = 1 Trade object at double size.
@@ -364,9 +378,10 @@ class MLSignalStrategy(bt.Strategy):
 
                 # Timeframe-specific parameters
                 _is_15m      = (self.p.timeframe == "15min")
-                _be_r        = 0.8 if _is_15m else 1.0   # BE trigger: 0.8R on 15min, 1R otherwise
-                _trail_r     = 1.5                         # Trail trigger: 1.5R for all timeframes
-                _trail_dist  = 0.8 if _is_15m else 1.5    # Trail distance ATR: tighter on 15min
+                _be_r        = float(self.p.be_r)
+                _trail_r     = 9999.0 if self.p.no_trail else 1.5
+                _trail_dist  = float(self.p.trail_dist_atr) if float(self.p.trail_dist_atr) > 0 \
+                               else (0.8 if _is_15m else 1.5)
 
                 # Breakeven lock at _be_r × initial risk
                 if _ir > 0 and _atr > 0 and not t["be_locked"]:
@@ -453,6 +468,12 @@ class MLSignalStrategy(bt.Strategy):
                 elif side == "sell":
                     hit = (bar_high >= sl) or (bar_low <= tp)
                 if hit:
+                    if side == "buy":
+                        t["close_reason"] = "tp" if bar_high >= tp else \
+                            ("trail" if t["trail_active"] else ("breakeven" if t["be_locked"] else "sl"))
+                    else:
+                        t["close_reason"] = "tp" if bar_low <= tp else \
+                            ("trail" if t["trail_active"] else ("breakeven" if t["be_locked"] else "sl"))
                     self._any_exit_pending = True
                     self.close()  # close all open positions
                     break         # no need to check remaining trades
@@ -511,6 +532,26 @@ class MLSignalStrategy(bt.Strategy):
         else:
             self._diag["neutral"] += 1
             return
+
+        # ── Gate 4b: require confirmation signal ───────────────────────
+        if self.p.require_confirmation and _raw is not None:
+            if pred_label == "buy":
+                conf_score = float(_raw.get("buy_confirmation_score", 0) or 0)
+            else:
+                conf_score = float(_raw.get("sell_confirmation_score", 0) or 0)
+            if conf_score < 1.0:
+                self._diag["no_confirmation"] = self._diag.get("no_confirmation", 0) + 1
+                return
+
+        # ── Gate 4c: hard HTF trend-direction gate (--trend-only) ──────────
+        if self.p.trend_only and _raw is not None:
+            htf_4h = float(_raw.get("htf_4h_bias", 0.0))
+            if pred_label == "buy" and htf_4h < 0:
+                self._diag["trend_blocked_buy"] = self._diag.get("trend_blocked_buy", 0) + 1
+                return
+            elif pred_label == "sell" and htf_4h > 0:
+                self._diag["trend_blocked_sell"] = self._diag.get("trend_blocked_sell", 0) + 1
+                return
 
         # ── HTF soft filter: counter-trend trades require higher confidence ─
         htf_4h_bias = float(_raw.get("htf_4h_bias", 0.0)) if _raw is not None else 0.0
@@ -599,12 +640,24 @@ class MLSignalStrategy(bt.Strategy):
         # ── SL buffer: enforce zone-quality-scaled minimum SL distance ──
         atr_14 = float(_raw.get("atr_14", 0.0)) if _raw is not None else 0.0
         if atr_14 > 0:
-            sl_buf_atr = 0.3 if zone_quality >= 3.5 else (0.5 if zone_quality >= 2.0 else 0.7)
-            min_sl_dist = sl_buf_atr * atr_14
-            if pred_label == "buy":
-                sl = min(float(sl), close_price - min_sl_dist)
+            if float(self.p.sl_buffer_atr) > 0 and _raw is not None:
+                # Recompute SL from zone boundary with the specified ATR buffer
+                # (isolates buffer-size effect cleanly vs the default 0.5 ATR in base_strategy)
+                if pred_label == "buy":
+                    zone_bottom = float(_raw.get("demand_zone_bottom", float("nan")))
+                    if not np.isnan(zone_bottom):
+                        sl = zone_bottom - float(self.p.sl_buffer_atr) * atr_14
+                else:
+                    zone_top = float(_raw.get("supply_zone_top", float("nan")))
+                    if not np.isnan(zone_top):
+                        sl = zone_top + float(self.p.sl_buffer_atr) * atr_14
             else:
-                sl = max(float(sl), close_price + min_sl_dist)
+                sl_buf_atr = 0.3 if zone_quality >= 3.5 else (0.5 if zone_quality >= 2.0 else 0.7)
+                min_sl_dist = sl_buf_atr * atr_14
+                if pred_label == "buy":
+                    sl = min(float(sl), close_price - min_sl_dist)
+                else:
+                    sl = max(float(sl), close_price + min_sl_dist)
             if abs(close_price - float(sl)) / atr_14 < 0.5:
                 self._diag["risk_atr"] += 1
                 return
@@ -647,6 +700,9 @@ class MLSignalStrategy(bt.Strategy):
             "initial_risk": abs(close_price - float(sl)),
             "with_trend":   not is_counter,
             "prob":         winner_proba,
+            "close_reason": None,
+            "zone_quality": zone_quality,
+            "entry_date":   self.data.datetime.datetime(0),
         })
 
     @property
@@ -689,6 +745,11 @@ def run_backtest(
     min_zone_quality: float = MIN_ZONE_QUALITY,
     breakeven_trigger_pts: float = 0.0,
     max_confidence: float = 1.0,
+    be_r:    float = 1.25,
+    no_trail: bool = False,
+    sl_buffer_atr: float = 0.0,
+    require_confirmation: bool = False,
+    trend_only: bool = False,
 ) -> BacktestResult:
 
     db = get_connection()
@@ -785,7 +846,11 @@ def run_backtest(
             _raw_feat["timestamp"] = pd.to_datetime(_raw_feat["timestamp"])
 
             available_raw_cols = ["timestamp"] + [
-                c for c in RAW_ZONE_COLS + ["active_zone_quality"]
+                c for c in RAW_ZONE_COLS + [
+                    "active_zone_quality",
+                    "buy_confirmation_score",
+                    "sell_confirmation_score",
+                ]
                 if c in _raw_feat.columns
             ]
 
@@ -844,6 +909,11 @@ def run_backtest(
         min_zone_quality=float(min_zone_quality),
         breakeven_trigger_pts=float(breakeven_trigger_pts),
         timeframe=timeframe,
+        be_r=float(be_r),
+        no_trail=bool(no_trail),
+        sl_buffer_atr=float(sl_buffer_atr),
+        require_confirmation=bool(require_confirmation),
+        trend_only=bool(trend_only),
     )
 
     start_value = cerebro.broker.getvalue()
@@ -874,6 +944,11 @@ def run_backtest(
     grade_a_log = [t for t in trade_log if t.get("grade") == "A"]
     grade_b_log = [t for t in trade_log if t.get("grade") == "B"]
     grade_c_log = [t for t in trade_log if t.get("grade") == "C"]
+
+    exits_tp    = sum(1 for t in trade_log if t.get("close_reason") == "tp")
+    exits_sl    = sum(1 for t in trade_log if t.get("close_reason") == "sl")
+    exits_be    = sum(1 for t in trade_log if t.get("close_reason") == "breakeven")
+    exits_trail = sum(1 for t in trade_log if t.get("close_reason") == "trail")
 
     gross_profit = sum(win_pnls)
     gross_loss   = sum(loss_pnls)
@@ -913,6 +988,8 @@ def run_backtest(
         filtered_low_rr=diag.get("low_rr", 0),
         filtered_htf_filter=diag.get("htf_filter", 0),
         filtered_risk_atr=diag.get("risk_atr", 0),
+        filtered_trend_buy=diag.get("trend_blocked_buy", 0),
+        filtered_trend_sell=diag.get("trend_blocked_sell", 0),
         start_cash=float(start_value),
         gross_profit=round(gross_profit, 2),
         gross_loss=round(gross_loss, 2),
@@ -932,6 +1009,10 @@ def run_backtest(
         grade_c_trades=len(grade_c_log),
         grade_c_wins=sum(1 for t in grade_c_log if t["pnl"] > 0),
         be_lock_count=be_locks,
+        exits_tp=exits_tp,
+        exits_sl=exits_sl,
+        exits_be=exits_be,
+        exits_trail=exits_trail,
         trade_log=tuple(trade_log),
     )
 
@@ -961,6 +1042,17 @@ def main() -> None:
                         help=f"Minimum zone quality score to trade (default={MIN_ZONE_QUALITY})")
     parser.add_argument("--breakeven-trigger-pts", type=float, default=0.0,
                         help="Move SL to entry once profit reaches this level (0=disabled)")
+    parser.add_argument("--be-r",     type=float, default=1.25,
+                        help="Breakeven trigger in R multiples (default=1.25, was hardcoded 0.8)")
+    parser.add_argument("--no-trail", dest="no_trail", action="store_true", default=False,
+                        help="Disable trailing stop — let trades run to TP (zone-to-zone thesis)")
+    parser.add_argument("--sl-buffer-atr", type=float, default=0.0,
+                        help=">0: override zone-quality SL floor with flat ATR multiple (e.g. 1.0)")
+    parser.add_argument("--require-confirmation", dest="require_confirmation",
+                        action="store_true", default=False,
+                        help="Only enter when buy/sell_confirmation_score >= 1")
+    parser.add_argument("--trend-only", dest="trend_only", action="store_true", default=False,
+                        help="Hard HTF gate: buy only if htf_4h_bias >= 0, sell only if <= 0")
     args = parser.parse_args()
 
     res = run_backtest(
@@ -980,6 +1072,11 @@ def main() -> None:
         min_zone_quality=args.min_zone_quality,
         breakeven_trigger_pts=args.breakeven_trigger_pts,
         max_confidence=args.max_confidence,
+        be_r=args.be_r,
+        no_trail=args.no_trail,
+        sl_buffer_atr=args.sl_buffer_atr,
+        require_confirmation=args.require_confirmation,
+        trend_only=args.trend_only,
     )
 
     W  = 62
@@ -1019,7 +1116,15 @@ def main() -> None:
     print(f"    Trail activations  : {res.trail_activations:>8,}   "
           f"(trigger={args.trail_trigger_pts:.0f}pts, dist={args.trail_dist_atr:.1f}ATR)")
     print(f"    Breakeven locks    : {res.be_lock_count:>8,}   "
-          f"(1R ATR-based + params fallback)")
+          f"(be_r={args.be_r:.2f}R)")
+
+    # ── Exit reason breakdown ──────────────────────────────────────────
+    n = res.total_trades or 1
+    print(f"\n  EXIT REASONS")
+    print(f"    TP hit             : {res.exits_tp:>8,}   ({res.exits_tp/n*100:.1f}%)")
+    print(f"    SL hit             : {res.exits_sl:>8,}   ({res.exits_sl/n*100:.1f}%)")
+    print(f"    Breakeven SL hit   : {res.exits_be:>8,}   ({res.exits_be/n*100:.1f}%)")
+    print(f"    Trail stop hit     : {res.exits_trail:>8,}   ({res.exits_trail/n*100:.1f}%)")
 
     # ── By direction ──────────────────────────────────────────────────
     buy_wr  = res.buy_wins  / res.buy_trades  * 100 if res.buy_trades  else 0
@@ -1136,11 +1241,14 @@ def main() -> None:
         f"low_rr<{MIN_RR:.1f}":     res.filtered_low_rr,
         "htf_soft_filter":   res.filtered_htf_filter,
         "risk_atr<0.5":      res.filtered_risk_atr,
+        "trend_gate (buys)": res.filtered_trend_buy,
+        "trend_gate (sells)": res.filtered_trend_sell,
     }
     bars_total = (
         res.filtered_no_row + res.filtered_session + res.filtered_zone_quality +
         res.filtered_confidence + res.filtered_neutral + res.filtered_bad_sltp +
         res.filtered_low_rr + res.filtered_htf_filter + res.filtered_risk_atr +
+        res.filtered_trend_buy + res.filtered_trend_sell +
         res.entries_submitted
     )
     print(f"  {'Gate':<26} {'Count':>8}  {'% of total':>10}")
