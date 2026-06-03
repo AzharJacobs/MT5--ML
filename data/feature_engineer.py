@@ -487,6 +487,21 @@ def add_confirmation_signals(df: pd.DataFrame) -> pd.DataFrame:
     bos_bear_raw    = (df["close"] < last_swing_low)
     df["bos_bearish"] = (bos_bear_raw & ~bos_bear_raw.shift(1).fillna(False)).astype(float)
 
+    # CHoCH: structure break AGAINST the recent local move.
+    # Bullish: swing lows declining (lower lows = bearish local structure),
+    #          then close breaks above the last confirmed swing high.
+    prior_swing_low  = last_swing_low.shift(2 * BOS_PIVOT_N)
+    ll_forming       = last_swing_low < prior_swing_low
+    choch_bull_raw   = ll_forming & bos_bull_raw
+    df["choch_bullish"] = (choch_bull_raw & ~choch_bull_raw.shift(1).fillna(False)).astype(float)
+
+    # Bearish: swing highs rising (higher highs = bullish local structure),
+    #          then close breaks below the last confirmed swing low.
+    prior_swing_high = last_swing_high.shift(2 * BOS_PIVOT_N)
+    hh_forming       = last_swing_high > prior_swing_high
+    choch_bear_raw   = hh_forming & bos_bear_raw
+    df["choch_bearish"] = (choch_bear_raw & ~choch_bear_raw.shift(1).fillna(False)).astype(float)
+
     df["buy_confirmation_score"]  = (
         df["bullish_engulfing"] + df["pin_bar_bullish"] +
         df["higher_low"]        + df["bos_bullish"]

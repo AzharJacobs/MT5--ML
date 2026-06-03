@@ -30,7 +30,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import joblib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 try:
@@ -43,7 +43,10 @@ from data.loader import get_connection
 from data.feature_engineer import build_features
 from models.trainer import MODEL_DIR, MODEL_FILE, METADATA_FILE
 from utils.trade_logger import TradeLogger
-from utils.db_writer import write_market_context, utcnow as _db_utcnow
+from utils.db_writer import (
+    write_market_context, write_ml_signal, update_ml_entry, update_ml_exit,
+    utcnow as _db_utcnow,
+)
 
 # ── Optional RL shadow (loads only when --rl-shadow flag is passed) ───────────
 try:
@@ -80,15 +83,8 @@ LOOKBACK_BARS            = 350     # need enough for warmup in build_features()
 RISK_PCT                 = 1.0     # % of account balance risked per trade (when lot-size is 0)
 DEFAULT_LOTS             = 0.01    # fallback if account-based sizing fails
 MAX_CONCURRENT_POSITIONS = 2       # max 2 concurrent trades (same direction only)
+SELL_MIN_4H_BIAS         = -0.30   # sells need 4H bias more bearish than this
 
-# ── Grade system (mirrors backtest engine.py exactly) ─────────────────────────
-GRADE_A_MIN_ZONE_QUALITY = 3.5
-GRADE_A_MIN_CONFIDENCE   = 0.42
-GRADE_B_MIN_ZONE_QUALITY = 3.0
-GRADE_B_MIN_CONFIDENCE   = 0.40
-# B=0 means skip; A=0.02 lots, C=0.01 lots (fixed sizing matching backtest)
-GRADE_MULTIPLIERS = {"A": 1, "B": 0, "C": 1}
-GRADE_LOTS        = {"A": 0.02, "C": 0.01}   # fixed lot sizes per grade
 
 logging.basicConfig(
     level=logging.INFO,
@@ -255,6 +251,7 @@ def evaluate_bar(
     include_london_ny: bool = True,
     h1_df: pd.DataFrame = None,
     h4_df: pd.DataFrame = None,
+    buy_only: bool = False,
 ) -> dict:
     """
     Run model on the latest completed bar and return a signal dict.
@@ -322,21 +319,36 @@ def evaluate_bar(
 
     direction = 1 if in_demand else -1
 
-    # Grade filter — mirrors backtest engine grade system
-    zone_quality = float(row.get("active_zone_quality", 0) or 0)
-    if zone_quality >= GRADE_A_MIN_ZONE_QUALITY and prob_win >= GRADE_A_MIN_CONFIDENCE:
-        grade = "A"
-    elif zone_quality >= GRADE_B_MIN_ZONE_QUALITY and prob_win >= GRADE_B_MIN_CONFIDENCE:
-        grade = "B"
-    else:
-        grade = "C"
+    # CHoCH gate: only enter on a structural reversal at the zone
+    choch_bullish = float(row.get("choch_bullish", 0) or 0)
+    choch_bearish = float(row.get("choch_bearish", 0) or 0)
+    if in_demand and choch_bullish != 1.0:
+        return {**no_trade, "reason": "no choch_bullish at demand zone"}
+    if in_supply and choch_bearish != 1.0:
+        return {**no_trade, "reason": "no choch_bearish at supply zone"}
 
-    if GRADE_MULTIPLIERS.get(grade, 1) == 0:
-        return {**no_trade, "reason": f"Grade B skipped (zone_quality={zone_quality:.2f} prob={prob_win:.3f})"}
+    # Sell-quality gates (diagnostic: LTF-only zones fail 3×; weak bias WR=30%)
+    if direction == -1:
+        if float(row.get("htf_supply_zone_top", 0) or 0) == 0.0:
+            return {**no_trade, "reason": "sell rejected: no HTF supply zone"}
+        if float(row.get("htf_4h_bias", 0) or 0) > SELL_MIN_4H_BIAS:
+            return {**no_trade, "reason": "sell rejected: 4H bias too weak"}
+
+    grade = "C"  # single lot size for all trades
 
     sl, tp, rr = compute_sl_tp(row, direction)
     if sl is None:
         return {**no_trade, "reason": "SL/TP computation failed (missing zone levels or RR<1.5)"}
+
+    # Buy-only mode: sell passed ALL gates → return as shadow (logged, never executed)
+    if direction == -1 and buy_only:
+        return {
+            "signal":   -1, "sl": sl, "tp": tp, "rr": rr,
+            "prob":     prob_win, "grade": grade,
+            "reason":   f"shadow_sell prob={prob_win:.3f} rr={rr}",
+            "shadow":   True,
+            "feat_row": row,
+        }
 
     return {
         "signal":    direction,
@@ -345,7 +357,7 @@ def evaluate_bar(
         "rr":        rr,
         "prob":      prob_win,
         "grade":     grade,
-        "reason":    f"{'buy' if direction==1 else 'sell'} Grade={grade} zone_quality={zone_quality:.2f} prob={prob_win:.3f} rr={rr}",
+        "reason":    f"{'buy' if direction==1 else 'sell'} CHoCH prob={prob_win:.3f} rr={rr}",
         "feat_row":  row,
     }
 
@@ -365,6 +377,7 @@ class LiveTrader:
         risk_pct: float = RISK_PCT,
         lot_size: float = 0.0,   # 0 = auto-calculate from risk_pct
         enable_rl_shadow: bool = False,
+        buy_only: bool = False,
     ):
         self.broker     = broker
         self.mode       = mode
@@ -396,6 +409,8 @@ class LiveTrader:
         # Mirror training: 15min was trained without H16
         _tf_bp = self.bundle["metadata"].get("tf_build_params", {}).get(timeframe, {})
         self.include_london_ny = bool(_tf_bp.get("include_london_ny", timeframe != "15min"))
+        self.buy_only          = buy_only
+        self._shadow_sells: list = []   # [{db_id, entry_price, sl, tp, entry_ts, bars_open}]
 
         self.tlog = TradeLogger()
 
@@ -660,6 +675,119 @@ class LiveTrader:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df.iloc[::-1].reset_index(drop=True)   # chronological
 
+    def _open_shadow_sell(self, sig: dict, bars: pd.DataFrame) -> None:
+        """Write a shadow-sell entry to ml_performance and start tracking its outcome."""
+        bar   = bars.iloc[-1]
+        entry = float(bar["close"])
+
+        raw_ts = bar.get("timestamp", datetime.utcnow())
+        if isinstance(raw_ts, pd.Timestamp):
+            ts = raw_ts.to_pydatetime()
+        else:
+            ts = pd.to_datetime(raw_ts).to_pydatetime()
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        _PIP  = 0.10
+        sl, tp, rr = sig["sl"], sig["tp"], sig["rr"]
+
+        def _pips(diff):
+            try: return round(abs(float(diff)) / _PIP, 1)
+            except Exception: return None
+
+        def _safe(v):
+            try:
+                import math; f = float(v)
+                return round(f, 5) if not (math.isnan(f) or math.isinf(f)) else None
+            except Exception: return None
+
+        db_id = write_ml_signal(
+            timestamp        = ts,
+            symbol           = self.symbol,
+            signal           = -1,
+            confidence       = float(sig.get("prob", 0) or 0),
+            triggered_rule   = sig.get("reason", "shadow_sell"),
+            triggered_tf     = self.timeframe,
+            sl_price         = _safe(sl),
+            tp_price         = _safe(tp),
+            sl_distance_pips = _pips(sl - entry),
+            tp_distance_pips = _pips(entry - tp),
+            rr_ratio         = _safe(rr),
+        )
+        if db_id:
+            update_ml_entry(db_id, entry)
+
+        self._shadow_sells.append({
+            "db_id":       db_id,
+            "entry_price": entry,
+            "sl":          float(sl),
+            "tp":          float(tp),
+            "entry_ts":    ts,
+            "bars_open":   0,
+        })
+        logger.info(
+            "SHADOW SELL  entry=%.5f  sl=%.5f  tp=%.5f  rr=%s  prob=%.3f  db_id=%s",
+            entry, float(sl), float(tp), rr,
+            float(sig.get("prob", 0) or 0), db_id,
+        )
+
+    def _check_shadow_outcomes(self, bars: pd.DataFrame) -> None:
+        """Check the latest bar against all open shadow sells; fill outcome when SL/TP hit."""
+        if not self._shadow_sells:
+            return
+
+        bar      = bars.iloc[-1]
+        bar_high = float(bar["high"])
+        bar_low  = float(bar["low"])
+        raw_ts   = bar.get("timestamp", datetime.utcnow())
+        if isinstance(raw_ts, pd.Timestamp):
+            closed_at = raw_ts.to_pydatetime()
+        else:
+            closed_at = pd.to_datetime(raw_ts).to_pydatetime()
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+
+        _PIP       = 0.10
+        still_open = []
+        for shadow in self._shadow_sells:
+            shadow["bars_open"] += 1
+            sl    = shadow["sl"]
+            tp    = shadow["tp"]
+            entry = shadow["entry_price"]
+            db_id = shadow["db_id"]
+
+            sl_hit = bar_high >= sl   # sell: stop above entry
+            tp_hit = bar_low  <= tp   # sell: target below entry
+
+            if sl_hit or tp_hit:
+                if sl_hit:            # SL wins when both trigger same bar
+                    reason, exit_px = "sl", sl
+                else:
+                    reason, exit_px = "tp", tp
+
+                pnl_pips = round((entry - exit_px) / _PIP, 1)
+                outcome  = "win" if pnl_pips > 0 else ("loss" if pnl_pips < 0 else "breakeven")
+
+                if db_id:
+                    update_ml_exit(
+                        row_id          = db_id,
+                        exit_price      = exit_px,
+                        exit_reason     = reason,
+                        actual_pnl_usd  = 0.0,        # shadow — no lots
+                        actual_pnl_pips = pnl_pips,
+                        outcome         = outcome,
+                        closed_at       = closed_at,
+                        trade_duration  = shadow["bars_open"],
+                    )
+                logger.info(
+                    "SHADOW SELL EXIT  db_id=%s  exit=%.5f  via=%s  pnl=%+.1f pips  (%s)  bars=%d",
+                    db_id, exit_px, reason, pnl_pips, outcome, shadow["bars_open"],
+                )
+            else:
+                still_open.append(shadow)
+
+        self._shadow_sells = still_open
+
     def _sync_open_positions(self) -> None:
         """Remove any positions that have been closed by SL/TP and log their outcome."""
         if self.mode == "paper":
@@ -704,19 +832,10 @@ class LiveTrader:
         except Exception as e:
             logger.warning("Could not sync positions: %s", e)
 
-    def _get_lots(self, grade: str, sl_distance: float = 0.0) -> float:
-        """Risk-based lot sizing — risks RISK_PCT% of balance per trade.
-        Grade A gets 1.5× the base risk allocation; Grade C gets 1.0×.
-        Falls back to fixed DEFAULT_LOTS if MT5 data is unavailable."""
+    def _get_lots(self) -> float:
+        """Fixed lot size: user-specified or DEFAULT_LOTS (0.01) for all trades."""
         if self.lot_size > 0:
             return self.lot_size
-        if sl_distance > 0:
-            grade_risk_multiplier = 1.5 if grade == "A" else 1.0
-            adjusted_risk_pct = self.risk_pct * grade_risk_multiplier
-            return calculate_lot_size(
-                self.broker, self.symbol, sl_distance,
-                adjusted_risk_pct, fallback_lots=DEFAULT_LOTS,
-            )
         return DEFAULT_LOTS
 
     def run_once(self) -> None:
@@ -745,6 +864,9 @@ class LiveTrader:
             logger.warning("Only %d bars — need more warmup", len(bars))
             return
 
+        # Simulate outcomes for any open shadow sells against this bar
+        self._check_shadow_outcomes(bars)
+
         logger.info(
             "HTF context: h1=%s bars  h4=%s bars",
             len(h1_df) if h1_df is not None else "None",
@@ -752,7 +874,7 @@ class LiveTrader:
         )
 
         # Evaluate signal
-        sig = evaluate_bar(bars, self.bundle, self.timeframe, self.include_london_ny, h1_df=h1_df, h4_df=h4_df)
+        sig = evaluate_bar(bars, self.bundle, self.timeframe, self.include_london_ny, h1_df=h1_df, h4_df=h4_df, buy_only=self.buy_only)
 
         # ── RL shadow: observe same bar, log what it would do (no execution) ──
         if self.rl_shadow is not None:
@@ -772,6 +894,12 @@ class LiveTrader:
             )
 
         bar_time = str(bars.iloc[-1].get("timestamp", now))
+
+        # Shadow sell: passed all gates but buy_only blocks execution → log and track
+        if sig.get("shadow"):
+            self._open_shadow_sell(sig, bars)
+            return   # no broker order, no tlog.log_signal (avoids _last_signal_id pollution)
+
         self.tlog.log_signal(bar_time, sig, sig.get("feat_row"))
 
         if sig["signal"] == 0:
@@ -792,13 +920,12 @@ class LiveTrader:
                 return
 
         entry = float(bars.iloc[-1]["close"])
+        lots  = self._get_lots()
         grade = sig.get("grade", "C")
-        sl_distance = abs(entry - sig["sl"]) if sig.get("sl") else 0.0
-        lots  = self._get_lots(grade, sl_distance=sl_distance)
 
         logger.info(
-            "SIGNAL %s | Grade=%s entry=%.5f sl=%.5f tp=%.5f rr=%.2f prob=%.3f lots=%.2f",
-            direction_str.upper(), grade,
+            "SIGNAL %s | entry=%.5f sl=%.5f tp=%.5f rr=%.2f prob=%.3f lots=%.2f",
+            direction_str.upper(),
             entry, sig["sl"], sig["tp"], sig["rr"], sig["prob"], lots,
         )
 
@@ -808,7 +935,7 @@ class LiveTrader:
             volume    = lots,
             sl        = sig["sl"],
             tp        = sig["tp"],
-            comment   = f"lt_{self.timeframe}_{grade}_{sig['prob']:.2f}",
+            comment   = f"lt_{self.timeframe}_{sig['prob']:.2f}",
         )
 
         if ticket is not None:
@@ -896,6 +1023,8 @@ Examples:
     parser.add_argument("--once",       action="store_true",            help="Evaluate one bar then exit (for testing)")
     parser.add_argument("--rl-shadow",  action="store_true",
                         help="Run the trained RL agent in shadow mode (logs signals, no execution)")
+    parser.add_argument("--buy-only",   action="store_true", default=False,
+                        help="Skip all sell signals — take buys only (diagnostic flag)")
     args = parser.parse_args()
 
     if args.mode == "mt5":
@@ -927,6 +1056,7 @@ Examples:
         risk_pct          = args.risk_pct,
         lot_size          = args.lot_size,
         enable_rl_shadow  = args.rl_shadow,
+        buy_only          = args.buy_only,
     )
 
     if args.once:

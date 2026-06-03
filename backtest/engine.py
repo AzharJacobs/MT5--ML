@@ -60,6 +60,7 @@ GRADE_A_MIN_ZONE_QUALITY = 3.5
 GRADE_A_MIN_CONFIDENCE   = 0.58
 GRADE_B_MIN_ZONE_QUALITY = 3.0
 GRADE_B_MIN_CONFIDENCE   = 0.50
+SELL_MIN_4H_BIAS         = -0.30   # sells need 4H bias more bearish than this
 GRADE_MULTIPLIERS = {"A": 1, "B": 0, "C": 1}   # B=0 = skip; scale A when account grows
 
 # Raw zone columns we need at execution time (unscaled, real price levels)
@@ -213,6 +214,7 @@ class MLSignalStrategy(bt.Strategy):
         sl_buffer_atr=0.0,        # >0: override zone-quality SL floor with flat ATR multiple
         require_confirmation=False,  # True: only enter when confirmation score >= 1
         trend_only=False,         # hard HTF direction gate: buy only if htf_4h_bias >= 0, sell only if <= 0
+        buy_only=False,           # diagnostic: skip all sell signals
     )
 
     def __init__(self):
@@ -533,6 +535,11 @@ class MLSignalStrategy(bt.Strategy):
             self._diag["neutral"] += 1
             return
 
+        # ── Buy-only diagnostic flag ────────────────────────────────────
+        if self.p.buy_only and pred_label == "sell":
+            self._diag["buy_only_skip"] = self._diag.get("buy_only_skip", 0) + 1
+            return
+
         # ── Gate 4b: require confirmation signal ───────────────────────
         if self.p.require_confirmation and _raw is not None:
             if pred_label == "buy":
@@ -576,11 +583,26 @@ class MLSignalStrategy(bt.Strategy):
 
         close_price = float(self.data.close[0])
 
-        grade = self._calc_grade(zone_quality, winner_proba)
-        if GRADE_MULTIPLIERS.get(grade, 1) == 0:
-            self._diag["grade_skip"] = self._diag.get("grade_skip", 0) + 1
+        # CHoCH gate: only enter on structural reversal at the zone
+        choch_bullish = float(_raw.get("choch_bullish", 0) or 0) if _raw is not None else 0.0
+        choch_bearish = float(_raw.get("choch_bearish", 0) or 0) if _raw is not None else 0.0
+        if pred_label == "buy" and choch_bullish != 1.0:
+            self._diag["no_choch"] = self._diag.get("no_choch", 0) + 1
             return
-        size      = self._calc_size(close_price, grade)
+        if pred_label == "sell" and choch_bearish != 1.0:
+            self._diag["no_choch"] = self._diag.get("no_choch", 0) + 1
+            return
+        # Sell-quality gates (match live_trader.py evaluate_bar exactly)
+        if pred_label == "sell" and _raw is not None:
+            if float(_raw.get("htf_supply_zone_top", 0) or 0) == 0.0:
+                self._diag["sell_no_htf"] = self._diag.get("sell_no_htf", 0) + 1
+                return
+            if float(_raw.get("htf_4h_bias", 0) or 0) > SELL_MIN_4H_BIAS:
+                self._diag["sell_weak_bias"] = self._diag.get("sell_weak_bias", 0) + 1
+                return
+
+        grade = "C"
+        size  = 0.01  # fixed lot size (old C lot size)
         required  = close_price * size
         available = self.broker.getcash()
         if required > available * 0.99:
@@ -750,6 +772,7 @@ def run_backtest(
     sl_buffer_atr: float = 0.0,
     require_confirmation: bool = False,
     trend_only: bool = False,
+    buy_only: bool = False,
 ) -> BacktestResult:
 
     db = get_connection()
@@ -850,6 +873,8 @@ def run_backtest(
                     "active_zone_quality",
                     "buy_confirmation_score",
                     "sell_confirmation_score",
+                    "choch_bullish",
+                    "choch_bearish",
                 ]
                 if c in _raw_feat.columns
             ]
@@ -914,6 +939,7 @@ def run_backtest(
         sl_buffer_atr=float(sl_buffer_atr),
         require_confirmation=bool(require_confirmation),
         trend_only=bool(trend_only),
+        buy_only=bool(buy_only),
     )
 
     start_value = cerebro.broker.getvalue()
@@ -1053,6 +1079,8 @@ def main() -> None:
                         help="Only enter when buy/sell_confirmation_score >= 1")
     parser.add_argument("--trend-only", dest="trend_only", action="store_true", default=False,
                         help="Hard HTF gate: buy only if htf_4h_bias >= 0, sell only if <= 0")
+    parser.add_argument("--buy-only",   dest="buy_only",   action="store_true", default=False,
+                        help="Skip all sell signals — diagnostic flag to compare buy-only vs mixed")
     args = parser.parse_args()
 
     res = run_backtest(
@@ -1077,6 +1105,7 @@ def main() -> None:
         sl_buffer_atr=args.sl_buffer_atr,
         require_confirmation=args.require_confirmation,
         trend_only=args.trend_only,
+        buy_only=args.buy_only,
     )
 
     W  = 62
