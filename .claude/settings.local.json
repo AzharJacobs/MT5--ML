@@ -158,7 +158,8 @@
       "PowerShell(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\rl\" -Recurse -Force | Select-Object FullName | ForEach-Object { $_.FullName })",
       "Bash(Find . -type f -name \"*rl*\" -o -name \"*shadow*\")",
       "Bash(grep -E \"\\\\.py$|\\\\.sh$\")",
-      "PowerShell(Remove-Item -Recurse -Force \"f:\\\\MT5- ML\\\\rl\" -Confirm:$false)"
+      "PowerShell(Remove-Item -Recurse -Force \"f:\\\\MT5- ML\\\\rl\" -Confirm:$false)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"from strategy.zones import detect_zones, update_freshness, nearest_zones, strongest_zones, Zone, ZoneConfig; print\\('OK'\\)\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
