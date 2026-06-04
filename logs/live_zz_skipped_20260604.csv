@@ -1,0 +1,2 @@
+timestamp,symbol,reason,h4_bias,zone_tapped,active_zone
+2026-06-04T21:14:48.508160+00:00,USTECH,conf_failed: [],bearish,True,Zone(supply 25217.15–25315.39 str=2.3 bar=75 tapped×1)

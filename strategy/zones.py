@@ -77,6 +77,13 @@ class Zone:
     tap_count: int = 0
 
     @property
+    def zone_id(self) -> str:
+        """Stable unique identifier based on kind + price edges (1dp).
+        Stable across rolling window calls — origin_bar is window-relative
+        and changes each call, so it is intentionally excluded."""
+        return f"{self.kind}_{round(self.bottom, 1):.1f}_{round(self.top, 1):.1f}"
+
+    @property
     def mid(self) -> float:
         return (self.top + self.bottom) / 2
 

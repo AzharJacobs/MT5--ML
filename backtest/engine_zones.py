@@ -42,9 +42,9 @@ MAX_FORWARD_BARS = 350   # 350 × 15 min ≈ 87 h ≈ 4 trading days
 RISK_PCT = 0.01   # 1 % of equity risked per trade
 
 # Zone re-entry cooldown — outcome-based (M15 bars).
-COOLDOWN_WIN     = 9999   # zone consumed; block for remainder of sim
-COOLDOWN_LOSS    =   48   # 12 hours; allow retry
-COOLDOWN_EXPIRED =    0   # expired; no cooldown
+# COOLDOWN_WIN replaced by config-driven logic (cooldown_bars / require_leave_and_return).
+COOLDOWN_LOSS    = 48   # loss retry window: 48 bars = 12 h
+COOLDOWN_EXPIRED =  0   # expired: no cooldown
 
 SYMBOL_CONFIG = {
     "ustech": ("ustech_ohlcv", "ustech_ohlcv", 100.0),
@@ -110,6 +110,14 @@ def run_backtest(
     midline_pct: float = 0.50,
     sl_buffer_pct: float = 0.002,
     fixed_lot: float = 0.0,         # 0 = dynamic 1% risk sizing; >0 = fixed lot every trade
+    # Win-cooldown mode (two toggleable modes, not mutually exclusive)
+    require_leave_and_return: bool = True,
+    # True (default): zone becomes re-tradeable only after price fully exits the zone
+    # AND later returns to it. Prevents re-entering on a continuous touch.
+    cooldown_bars: int = 15,
+    # When require_leave_and_return=False: bar-count cooldown after a TP hit.
+    # Also applies as a minimum floor when require_leave_and_return=True
+    # (prevents re-entry within the first N bars even if price wiggles out and back).
     # Output
     save_path: Optional[str] = None,
     chart: bool = False,
@@ -188,6 +196,13 @@ def run_backtest(
     trades:  list = []
     skip_until   = -1
     zone_cooldown: dict = {}
+    # zone_reentry: tracks leave-and-return state after a win.
+    # key = zone_key tuple; value = {'phase': 'exit'|'return', 'bottom': float, 'top': float}
+    zone_reentry: dict = {}
+    won_zones:    set  = set()   # zone keys that have had at least one win
+    # zone_outcome_history: exact zone_id → list of outcomes in entry order.
+    # Used to determine prior_bucket for each trade (first / post_win / post_loss).
+    zone_outcome_history: dict = {}
     n     = len(df_15m)
     warmup = max(M15_WINDOW, 30)
 
@@ -201,6 +216,30 @@ def run_backtest(
 
     # ── Bar-by-bar loop ────────────────────────────────────────────────────
     for i in range(warmup, n - max_forward_bars):
+
+        # ── Leave-and-return zone state update (runs on EVERY bar) ───────────
+        # Must happen before skip_until so state advances even while in position.
+        if require_leave_and_return and zone_reentry:
+            bar_h = float(df_15m["high"].iloc[i])
+            bar_l = float(df_15m["low"].iloc[i])
+            tol   = 0.001
+            ready = []
+            for zk, state in zone_reentry.items():
+                z_bot = state["bottom"] * (1 - tol)
+                z_top = state["top"]    * (1 + tol)
+                if state["phase"] == "exit":
+                    # Price has fully left the zone when the bar's range
+                    # is entirely above zone top or entirely below zone bottom
+                    if bar_h < z_bot or bar_l > z_top:
+                        state["phase"] = "return"
+                else:  # "return"
+                    # Price has returned when any part of bar overlaps zone
+                    if bar_l <= z_top and bar_h >= z_bot:
+                        # Also enforce minimum bar cooldown as a floor
+                        if i >= state["earliest_reentry"]:
+                            ready.append(zk)
+            for zk in ready:
+                del zone_reentry[zk]
 
         if i <= skip_until:
             filters["in_position"] += 1
@@ -241,6 +280,24 @@ def run_backtest(
         if zone_cooldown.get(zk, -1) >= i:
             filters["zone_cooldown"] += 1
             continue
+        if require_leave_and_return and zk in zone_reentry:
+            filters["zone_cooldown"] += 1
+            continue
+
+        # Flag: has this zone been won before? (re-test trade)
+        is_retest = zk in won_zones
+
+        # Prior-outcome bucket using exact zone_id (kind + rounded edges, stable)
+        zid     = active_zone.zone_id
+        history = zone_outcome_history.get(zid, [])
+        if not history:
+            prior_bucket = "first_attempt"
+        elif history[-1] == 1:
+            prior_bucket = "post_win"
+        elif history[-1] == -1:
+            prior_bucket = "post_loss"
+        else:  # prior was expired (0)
+            prior_bucket = "post_expired"
 
         # ── Step 4: trade setup geometry ──────────────────────────────────
         signal_price = float(df_15m_w["close"].iloc[-1])
@@ -314,8 +371,23 @@ def run_backtest(
         skip_until = exit_bar
 
         # Zone cooldown (outcome-based)
+        # Record outcome to exact zone history (used for prior_bucket tagging)
+        zone_outcome_history.setdefault(zid, []).append(outcome)
+
         if outcome == 1:
-            zone_cooldown[zk] = exit_bar + COOLDOWN_WIN
+            won_zones.add(zk)
+            if require_leave_and_return:
+                # Block via leave-and-return state machine; also set a minimum
+                # bar floor so price can't instantly re-enter on the same candle
+                zone_reentry[zk] = {
+                    "phase":           "exit",
+                    "bottom":          active_zone.bottom,
+                    "top":             active_zone.top,
+                    "earliest_reentry": exit_bar + cooldown_bars,
+                }
+            else:
+                # Simple bar-count cooldown
+                zone_cooldown[zk] = exit_bar + cooldown_bars
         elif outcome == -1:
             zone_cooldown[zk] = exit_bar + COOLDOWN_LOSS
 
@@ -339,6 +411,8 @@ def run_backtest(
             "h4_bias":      tf_result["h4_bias"],
             "entry_mode":   setup.entry_mode,
             "tp_mode":      setup.tp_mode,
+            "is_retest":    is_retest,
+            "prior_bucket": prior_bucket,
             "structure":    {"zone": (active_zone.bottom, active_zone.top)},
         })
 
@@ -393,6 +467,7 @@ def run_backtest(
         "entry_mode":      "zone_boundary" if aggressive_entry else "confirmation",
         "tp_mode":         f"midline_{midline_pct:.0%}" if midline_tp else "zone_edge",
         "directional_filter": directional_filter,
+        "win_cooldown":       f"leave_and_return (floor={cooldown_bars}b)" if require_leave_and_return else f"{cooldown_bars} bars",
     }
 
     print_report(metrics, run_label="Zone Strategy")
@@ -425,8 +500,37 @@ def run_backtest(
     print()
 
     # Full trade log
+    # Prior-outcome bucket breakdown (exact zone_id — no approximation)
+    def _pb_stats(bucket):
+        g = df_t[df_t["prior_bucket"] == bucket]
+        if len(g) == 0:
+            return 0, 0, 0.0, 0.0
+        wr  = (g["outcome"] == 1).mean() * 100
+        net = g["pnl"].sum()
+        return len(g), int((g["outcome"] == 1).sum()), wr, net
+
+    print(f"\n  Prior-outcome split (exact zone_id):")
+    for pb in ("first_attempt", "post_win", "post_loss", "post_expired"):
+        n_pb, w_pb, wr_pb, net_pb = _pb_stats(pb)
+        if n_pb == 0:
+            continue
+        print(f"    {pb:<16} : {n_pb:>3} trades  W={w_pb:>2}  "
+              f"WR={wr_pb:.0f}%  net=${net_pb:+.2f}")
+    print()
+
+    # Sanity: first_attempt + post_win should match earlier first-tap vs re-test
+    n_ft = len(df_t[df_t["is_retest"] == False])
+    n_rt = len(df_t[df_t["is_retest"] == True])
+    n_fa = len(df_t[df_t["prior_bucket"] == "first_attempt"])
+    n_pl = len(df_t[df_t["prior_bucket"] == "post_loss"])
+    n_pw = len(df_t[df_t["prior_bucket"] == "post_win"])
+    print(f"  Sanity check:  is_retest=False={n_ft}  vs  first_attempt+post_loss="
+          f"{n_fa}+{n_pl}={n_fa+n_pl}  |  "
+          f"is_retest=True={n_rt}  vs  post_win={n_pw}")
+    print()
+
     cols = ["date", "side", "h4_bias", "signals", "confirmations",
-            "entry", "sl", "tp", "exit", "pnl", "outcome"]
+            "is_retest", "prior_bucket", "entry", "sl", "tp", "exit", "pnl", "outcome"]
     print(df_t[cols].to_string(index=False))
     print()
 
@@ -479,6 +583,12 @@ def main() -> None:
     # Output
     parser.add_argument("--save",  default=None)
     parser.add_argument("--chart", action="store_true")
+    parser.add_argument("--cooldown_bars",          type=int,  default=15,
+                        help="Bars blocked after a TP hit (default 15). "
+                             "Used as bar-count cooldown when --no_leave_return, "
+                             "and as minimum floor in leave-and-return mode.")
+    parser.add_argument("--no_leave_return",        action="store_true",
+                        help="Disable leave-and-return mode; use bar-count cooldown only.")
     args = parser.parse_args()
 
     run_backtest(
@@ -498,6 +608,8 @@ def main() -> None:
         midline_pct=args.midline_pct,
         sl_buffer_pct=args.sl_buffer,
         fixed_lot=args.fixed_lot,
+        require_leave_and_return=not args.no_leave_return,
+        cooldown_bars=args.cooldown_bars,
         save_path=args.save,
         chart=args.chart,
     )

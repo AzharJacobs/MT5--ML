@@ -159,7 +159,12 @@
       "Bash(Find . -type f -name \"*rl*\" -o -name \"*shadow*\")",
       "Bash(grep -E \"\\\\.py$|\\\\.sh$\")",
       "PowerShell(Remove-Item -Recurse -Force \"f:\\\\MT5- ML\\\\rl\" -Confirm:$false)",
-      "Bash(.venv\\\\Scripts\\\\python.exe -c \"from strategy.zones import detect_zones, update_freshness, nearest_zones, strongest_zones, Zone, ZoneConfig; print\\('OK'\\)\")"
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"from strategy.zones import detect_zones, update_freshness, nearest_zones, strongest_zones, Zone, ZoneConfig; print\\('OK'\\)\")",
+      "Bash(dir \"f:\\\\MT5- ML\\\\execution\\\\\" 2>&1)",
+      "Bash(dir \"f:\\\\MT5- ML\\\\risk\\\\\" 2>&1)",
+      "Bash(dir /b \"f:\\\\MT5- ML\\\\*.py\")",
+      "Bash(grep -l \"place_order\\\\|close_order\\\\|open_position\\\\|close_position\" \"f:\\\\MT5- ML\"/*.py \"f:\\\\MT5- ML\"\\\\*\\\\*.py 2>/dev/null | grep -v \".venv\")",
+      "Read(//f//**)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
