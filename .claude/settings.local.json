@@ -153,7 +153,12 @@
       "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2025-07-01 --end-date 2025-12-31 --cash 50 --no-london-ny --be-r 999 --no-trail --require-confirmation --trend-only)",
       "Bash(python -X utf8 backtest.py --timeframe 15min --start-date 2024-01-01 --end-date 2024-12-31 --cash 50 --no-london-ny --be-r 999 --no-trail --require-confirmation --trend-only)",
       "Bash(python -X utf8 scripts/diagnose_2024.py)",
-      "Bash(python -X utf8 -m models.trainer --timeframes 15min)"
+      "Bash(python -X utf8 -m models.trainer --timeframes 15min)",
+      "Bash(Get-ChildItem -Path \"rl\" -Recurse -Force)",
+      "PowerShell(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\rl\" -Recurse -Force | Select-Object FullName | ForEach-Object { $_.FullName })",
+      "Bash(Find . -type f -name \"*rl*\" -o -name \"*shadow*\")",
+      "Bash(grep -E \"\\\\.py$|\\\\.sh$\")",
+      "PowerShell(Remove-Item -Recurse -Force \"f:\\\\MT5- ML\\\\rl\" -Confirm:$false)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
