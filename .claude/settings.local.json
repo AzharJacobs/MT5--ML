@@ -169,7 +169,13 @@
       "Bash(python -)",
       "Bash(python -X utf8 -)",
       "Bash(python -X utf8 -c \"import sys; sys.path.insert\\(0,'f:/MT5-Collector'\\); from config import SYMBOL; print\\('Config SYMBOL:', SYMBOL\\)\")",
-      "Bash(python -X utf8 -m collectors.price_collector --full)"
+      "Bash(python -X utf8 -m collectors.price_collector --full)",
+      "Bash(grep -E \"\\\\.\\(json|txt|csv\\)$\")",
+      "Bash(python -X utf8 scripts/diag_xauusd.py)",
+      "Bash(Start-Sleep -Seconds 30)",
+      "Bash(Write-Output \"waited\")",
+      "PowerShell(\\(Get-Item \"C:\\\\Users\\\\AZHARJ~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\f--MT5--ML\\\\228d41c8-8595-42d1-9445-74ea1be918d6\\\\tasks\\\\bqpt1wn0z.output\"\\).Length)",
+      "Bash(python -X utf8 scripts/compare_gold_ZZ.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

@@ -413,6 +413,10 @@ def run_backtest(
             "tp_mode":      setup.tp_mode,
             "is_retest":    is_retest,
             "prior_bucket": prior_bucket,
+            "zone_bottom":  active_zone.bottom,
+            "zone_top":     active_zone.top,
+            "zone_strength": active_zone.strength,
+            "zone_kind":    active_zone.kind,
             "structure":    {"zone": (active_zone.bottom, active_zone.top)},
         })
 
@@ -545,7 +549,7 @@ def run_backtest(
         fig = plot_trades(df_15m, trades, title=title, start_cash=cash)
         fig.show()
 
-    return metrics
+    return metrics, df_t
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +616,7 @@ def main() -> None:
         cooldown_bars=args.cooldown_bars,
         save_path=args.save,
         chart=args.chart,
-    )
+    )  # returns (metrics, df_t) — ignored here
 
 
 if __name__ == "__main__":
