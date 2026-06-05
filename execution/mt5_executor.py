@@ -35,6 +35,17 @@ class MT5Executor(BrokerInterface):
             # Symbol may not be enabled in Market Watch — try selecting it, then retry.
             mt5.symbol_select(symbol, True)
             tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            # Log diagnostics to help identify the correct symbol name on this server.
+            err = mt5.last_error()
+            info = mt5.symbol_info(symbol)
+            trade_mode = getattr(info, "trade_mode", "N/A") if info else "no symbol_info"
+            similar = [s.name for s in (mt5.symbols_get() or [])
+                       if symbol.upper()[:5] in s.name.upper() or "NAS" in s.name.upper()][:10]
+            logger.debug(
+                "_get_tick: %s → None | last_error=%s | trade_mode=%s | similar=%s",
+                symbol, err, trade_mode, similar,
+            )
         return tick
 
     def place_order(

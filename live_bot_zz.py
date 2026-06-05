@@ -69,7 +69,7 @@ log = logging.getLogger("live_zz")
 # Validated baseline constants — must match engine_zones.py exactly
 # ---------------------------------------------------------------------------
 
-SYMBOL          = "USTECH"
+SYMBOL          = "USTECm"
 DB_NAME         = "ustech_ohlcv"
 TABLE           = "ustech_ohlcv"
 CONTRACT_SIZE   = 100.0       # $100/pt/lot (Exness USTEC)
@@ -303,6 +303,21 @@ class ZZLiveBot:
         self.db.database = DB_NAME
         self.db.connect()
 
+        # ── Verify symbol exists on this MT5 server ───────────────────────
+        if mode == "mt5":
+            import MetaTrader5 as mt5
+            info = mt5.symbol_info(SYMBOL)
+            if info is None:
+                similar = [s.name for s in (mt5.symbols_get() or [])
+                           if SYMBOL[:5] in s.name.upper() or "NAS" in s.name.upper()][:15]
+                log.warning(
+                    "SYMBOL '%s' not found on this server — check the symbol name. "
+                    "Similar symbols available: %s", SYMBOL, similar
+                )
+            else:
+                log.info("Symbol verified: %s | trade_mode=%d | digits=%d",
+                         SYMBOL, info.trade_mode, info.digits)
+
         log.info("ZZLiveBot ready | mode=%s | symbol=%s | min_conf=%d | "
                  "leave_and_return=True | loss_cooldown=%dh",
                  mode, SYMBOL, MIN_CONF, COOLDOWN_LOSS_H)
@@ -391,6 +406,25 @@ class ZZLiveBot:
         if df_15m.empty or df_4h.empty or len(df_15m) < M15_WINDOW:
             log.warning("Insufficient data — 15M=%d 4H=%d", len(df_15m), len(df_4h))
             return
+
+        # ── Market-open guard (MT5 mode only) ────────────────────────────
+        if self.mode == "mt5":
+            import MetaTrader5 as mt5
+            info = mt5.symbol_info(SYMBOL)
+            if info is None:
+                similar = [s.name for s in (mt5.symbols_get() or [])
+                           if SYMBOL[:5] in s.name.upper() or "NAS" in s.name.upper()][:10]
+                log.warning(
+                    "symbol_info(%s) returned None — symbol may not exist on this server. "
+                    "Similar symbols: %s", SYMBOL, similar
+                )
+                return
+            if info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+                log.info(
+                    "Market not open for %s (trade_mode=%d) — skipping bar",
+                    SYMBOL, info.trade_mode,
+                )
+                return
 
         # Trim to window sizes
         df_15m_w = df_15m.tail(M15_WINDOW).reset_index(drop=True)
