@@ -164,7 +164,12 @@
       "Bash(dir \"f:\\\\MT5- ML\\\\risk\\\\\" 2>&1)",
       "Bash(dir /b \"f:\\\\MT5- ML\\\\*.py\")",
       "Bash(grep -l \"place_order\\\\|close_order\\\\|open_position\\\\|close_position\" \"f:\\\\MT5- ML\"/*.py \"f:\\\\MT5- ML\"\\\\*\\\\*.py 2>/dev/null | grep -v \".venv\")",
-      "Read(//f//**)"
+      "Read(//f//**)",
+      "Bash(python -c \"import MetaTrader5 as mt5; ok = mt5.initialize\\(\\); print\\('MT5 init:', ok\\); print\\('error:', mt5.last_error\\(\\)\\); mt5.shutdown\\(\\)\")",
+      "Bash(python -)",
+      "Bash(python -X utf8 -)",
+      "Bash(python -X utf8 -c \"import sys; sys.path.insert\\(0,'f:/MT5-Collector'\\); from config import SYMBOL; print\\('Config SYMBOL:', SYMBOL\\)\")",
+      "Bash(python -X utf8 -m collectors.price_collector --full)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

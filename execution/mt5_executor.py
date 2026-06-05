@@ -21,6 +21,22 @@ class MT5Executor(BrokerInterface):
     def disconnect(self) -> None:
         self._conn.disconnect()
 
+    @staticmethod
+    def _get_tick(symbol: str):
+        """
+        Fetch a live tick, ensuring the symbol is selected in Market Watch first.
+        Exness symbols are often suffixed (e.g. USTECm) — symbol_info_tick returns
+        None if the name is wrong, the symbol isn't selected, or the market is closed.
+        Returns the tick or None.
+        """
+        import MetaTrader5 as mt5
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            # Symbol may not be enabled in Market Watch — try selecting it, then retry.
+            mt5.symbol_select(symbol, True)
+            tick = mt5.symbol_info_tick(symbol)
+        return tick
+
     def place_order(
         self,
         symbol: str,
@@ -32,8 +48,21 @@ class MT5Executor(BrokerInterface):
     ) -> Optional[int]:
         import MetaTrader5 as mt5
         order_type = mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL
-        tick = mt5.symbol_info_tick(symbol)
+
+        tick = self._get_tick(symbol)
+        if tick is None:
+            logger.error(
+                "place_order: no tick for %s — check symbol name/Market Watch/market hours. "
+                "Order NOT placed.", symbol
+            )
+            return None
+
         price = tick.ask if direction == "buy" else tick.bid
+        if not price:
+            logger.error("place_order: tick for %s has no valid price (bid=%s ask=%s). Order NOT placed.",
+                         symbol, tick.bid, tick.ask)
+            return None
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -47,8 +76,12 @@ class MT5Executor(BrokerInterface):
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
         result = mt5.order_send(request)
+        if result is None:
+            logger.error("place_order: order_send returned None for %s — last_error=%s",
+                         symbol, mt5.last_error())
+            return None
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error("Order failed: %s", result.comment)
+            logger.error("Order failed: retcode=%s %s", result.retcode, result.comment)
             return None
         logger.info("Order placed: ticket=%s %s %s vol=%.2f", result.order, direction, symbol, volume)
         return result.order
@@ -61,8 +94,21 @@ class MT5Executor(BrokerInterface):
             return False
         pos = position[0]
         order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        tick = mt5.symbol_info_tick(pos.symbol)
+
+        tick = self._get_tick(pos.symbol)
+        if tick is None:
+            logger.error(
+                "close_order: no tick for %s (ticket=%d) — check symbol/Market Watch/market hours. "
+                "Position NOT closed.", pos.symbol, ticket
+            )
+            return False
+
         price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+        if not price:
+            logger.error("close_order: tick for %s has no valid price (bid=%s ask=%s). Position NOT closed.",
+                         pos.symbol, tick.bid, tick.ask)
+            return False
+
         request = {
             "action":      mt5.TRADE_ACTION_DEAL,
             "symbol":      pos.symbol,
@@ -75,8 +121,12 @@ class MT5Executor(BrokerInterface):
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
         result = mt5.order_send(request)
+        if result is None:
+            logger.error("close_order: order_send returned None for ticket=%d — last_error=%s",
+                         ticket, mt5.last_error())
+            return False
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error("close_order failed: ticket=%d %s", ticket, result.comment)
+            logger.error("close_order failed: ticket=%d retcode=%s %s", ticket, result.retcode, result.comment)
             return False
         logger.info("Position closed: ticket=%d", ticket)
         return True
