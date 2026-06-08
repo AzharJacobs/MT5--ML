@@ -191,7 +191,13 @@
       "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\strategy_v2\" -File)",
       "Bash(python scripts/backtest_market_structure.py --symbol ustech --start 2023-01-01 --end 2025-12-31 --cash 50)",
       "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2023-01-01 --end 2025-12-31 --cash 50)",
-      "PowerShell(Get-ChildItem \"f:\\\\MT5- ML\" -Directory | Where-Object { $_.Name -ne '.venv' } | Select-Object Name)"
+      "PowerShell(Get-ChildItem \"f:\\\\MT5- ML\" -Directory | Where-Object { $_.Name -ne '.venv' } | Select-Object Name)",
+      "Bash(grep -E '\\\\.py$|\\\\.json$|\\\\.yaml$|\\\\.yml$|\\\\.env$')",
+      "Bash(python -X utf8 scripts/backtest_zones.py --start 2023-01-01 --end 2026-01-01 --fixed_lot 0.05 --symbol ustech)",
+      "Bash(Get-Content \"C:\\\\Users\\\\AZHARJ~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\f--MT5--ML\\\\370c635b-3d0f-4c7a-8d0c-37c96844ed47\\\\tasks\\\\bmdv7cb6w.output\" -Raw)",
+      "Bash(grep -v \"^Loading\\\\|^Symbol\\\\|^Config\\\\|^=== Backtest\\\\|^  strategy\\\\|^  symbol\\\\|^  period\\\\|^  start_cash\\\\|^  final\\\\|^  net_pnl\\\\|^  total\\\\|^  tp_hits\\\\|^  sl_hits\\\\|^  expired\\\\|^  win_rate\\\\|^  buy_trades\\\\|^  buy_wins\\\\|^  sell_trades\\\\|^  sell_wins\\\\|^  avg_win_\\\\$\\\\|^  avg_loss_\\\\$\\\\|^  largest\\\\|^  max_draw\\\\|^  spread\\\\|^  min_rr\\\\|^  min_conf\\\\|^  entry_mode\\\\|^  tp_mode\\\\|^  directional\\\\|^  win_cool\\\\|^────\\\\|^  Filter\\\\|^  in_pos\\\\|^  tf_neu\\\\|^  conf_\\\\|^  setup\\\\|^  zone_cool\\\\|^  signals fired\\\\|^  Confirmation\\\\|^  H4 bias\\\\|^\\\\s*[0-9] conf\\\\|^\\\\s*bear\\\\|^\\\\s*bull\\\\|^\\\\s*neutral\\\\|^  Prior\\\\|^\\\\s*first_a\\\\|^\\\\s*post_\\\\|^  Sanity\\\\|removed\\\\|Connected\\\\|^  date\")",
+      "Bash(python -X utf8 scripts/compare_fixes.py)",
+      "Bash(grep -E \"^Config|^----|^BASELINE|^Fix|^ALL|^$\")"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

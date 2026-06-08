@@ -222,7 +222,46 @@ class ZZLogger:
 # Data loader
 # ---------------------------------------------------------------------------
 
+_MT5_TF_MAP = None  # populated on first call to _load_ohlcv_mt5
+
+def _load_ohlcv_mt5(timeframe: str, n_bars: int) -> pd.DataFrame:
+    """
+    Fetch closed bars directly from the connected MT5 terminal.
+    position=1 skips bar 0 (currently forming) so we only see closed bars.
+    Timestamps are converted from Exness broker time (GMT+3) to UTC.
+    """
+    import MetaTrader5 as mt5
+    global _MT5_TF_MAP
+    if _MT5_TF_MAP is None:
+        _MT5_TF_MAP = {
+            "15min": mt5.TIMEFRAME_M15,
+            "4H":    mt5.TIMEFRAME_H4,
+        }
+    tf_const = _MT5_TF_MAP.get(timeframe)
+    if tf_const is None:
+        log.error("_load_ohlcv_mt5: unknown timeframe '%s'", timeframe)
+        return pd.DataFrame()
+
+    rates = mt5.copy_rates_from_pos(SYMBOL, tf_const, 1, n_bars)
+    if rates is None or len(rates) == 0:
+        log.error("_load_ohlcv_mt5: no data for %s %s — %s", SYMBOL, timeframe, mt5.last_error())
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rates)
+    # Exness broker timestamps are GMT+3; convert to naive UTC
+    df["timestamp"] = (
+        pd.to_datetime(df["time"], unit="s")
+        .dt.tz_localize("Etc/GMT-3")
+        .dt.tz_convert("UTC")
+        .dt.tz_localize(None)
+    )
+    for col in ("open", "high", "low", "close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+
+
 def _load_ohlcv(db, timeframe: str, n_bars: int) -> pd.DataFrame:
+    """Fetch bars from the PostgreSQL DB (used in paper mode)."""
     q = (
         f"SELECT * FROM {TABLE} WHERE timeframe = %s "
         f"ORDER BY timestamp DESC LIMIT %s"
@@ -399,8 +438,30 @@ class ZZLiveBot:
 
         # ── Fetch data ────────────────────────────────────────────────────
         try:
-            df_15m = _load_ohlcv(self.db, "15min", M15_WINDOW + 10)
-            df_4h  = _load_ohlcv(self.db, "4H",    H4_WINDOW  + 10)
+            if self.mode == "mt5":
+                # Pull bars directly from the connected MT5 terminal — always
+                # current, no DB lag, no collector dependency.
+                import MetaTrader5 as mt5
+                info = mt5.symbol_info(SYMBOL)
+                if info is None:
+                    similar = [s.name for s in (mt5.symbols_get() or [])
+                               if SYMBOL[:5] in s.name.upper() or "NAS" in s.name.upper()][:10]
+                    log.warning(
+                        "symbol_info(%s) returned None — symbol may not exist on this server. "
+                        "Similar symbols: %s", SYMBOL, similar
+                    )
+                    return
+                if info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+                    log.info(
+                        "Market not open for %s (trade_mode=%d) — skipping bar",
+                        SYMBOL, info.trade_mode,
+                    )
+                    return
+                df_15m = _load_ohlcv_mt5("15min", M15_WINDOW + 10)
+                df_4h  = _load_ohlcv_mt5("4H",    H4_WINDOW  + 10)
+            else:
+                df_15m = _load_ohlcv(self.db, "15min", M15_WINDOW + 10)
+                df_4h  = _load_ohlcv(self.db, "4H",    H4_WINDOW  + 10)
         except Exception as exc:
             log.error("Data fetch failed: %s", exc)
             return
@@ -409,28 +470,24 @@ class ZZLiveBot:
             log.warning("Insufficient data — 15M=%d 4H=%d", len(df_15m), len(df_4h))
             return
 
-        # ── Market-open guard (MT5 mode only) ────────────────────────────
-        if self.mode == "mt5":
-            import MetaTrader5 as mt5
-            info = mt5.symbol_info(SYMBOL)
-            if info is None:
-                similar = [s.name for s in (mt5.symbols_get() or [])
-                           if SYMBOL[:5] in s.name.upper() or "NAS" in s.name.upper()][:10]
-                log.warning(
-                    "symbol_info(%s) returned None — symbol may not exist on this server. "
-                    "Similar symbols: %s", SYMBOL, similar
-                )
-                return
-            if info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
-                log.info(
-                    "Market not open for %s (trade_mode=%d) — skipping bar",
-                    SYMBOL, info.trade_mode,
-                )
-                return
-
         # Trim to window sizes
         df_15m_w = df_15m.tail(M15_WINDOW).reset_index(drop=True)
         df_4h_w  = df_4h.tail(H4_WINDOW).reset_index(drop=True)
+
+        # Staleness guard — only applies to paper mode (DB-backed).
+        # MT5 mode fetches directly from the terminal so data is always current.
+        if self.mode == "paper":
+            last_bar_ts = df_15m_w["timestamp"].iloc[-1]
+            if last_bar_ts.tzinfo is None:
+                last_bar_ts = last_bar_ts.replace(tzinfo=timezone.utc)
+            data_age = (now - last_bar_ts).total_seconds() / 60
+            if data_age > 30:
+                log.warning(
+                    "DB data stale — last 15M bar is %.0f min old (%s) — skipping bar. "
+                    "Check that the MT5 collector is running.",
+                    data_age, last_bar_ts.strftime("%H:%M UTC"),
+                )
+                return
 
         # Update leave-and-return state with the latest bar
         bar_h = float(df_15m_w["high"].iloc[-1])
@@ -544,6 +601,17 @@ class ZZLiveBot:
                     log.warning(
                         "Setup stale vs live price=%.2f — sell sl=%.2f tp=%.2f — skip",
                         live_price, sl, tp,
+                    )
+                    return
+                # Reject if live price has already travelled more than 50% of the
+                # reward distance — setup is stale and trade would enter mid-move.
+                reward = abs(tp - entry)
+                price_drift = abs(live_price - entry)
+                if price_drift > 0.5 * reward:
+                    log.warning(
+                        "Setup stale — live price=%.2f drifted %.1f pts (>50%% of reward=%.1f) "
+                        "from signal entry=%.2f — skip",
+                        live_price, price_drift, reward, entry,
                     )
                     return
 

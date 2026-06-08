@@ -1,0 +1,4 @@
+timestamp,symbol,reason,h4_bias,zone_tapped,active_zone
+2026-06-08T13:30:03.934774+00:00,USTECm,zone_cooldown,bearish,True,Zone(supply 30088.75–30253.61 str=2.8 bar=107 tapped×1)
+2026-06-08T13:45:03.015176+00:00,USTECm,zone_cooldown,bearish,True,Zone(supply 30088.75–30253.61 str=2.8 bar=107 tapped×1)
+2026-06-08T14:00:03.043495+00:00,USTECm,zone_cooldown,bearish,True,Zone(supply 30088.75–30253.61 str=2.8 bar=107 tapped×1)

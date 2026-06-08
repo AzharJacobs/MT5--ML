@@ -126,6 +126,14 @@ class ConfirmationConfig:
     zone_tolerance_pct: float = 0.001
     # ±0.1% on zone edges when checking whether bar idx overlaps the zone.
 
+    # ── Signals excluded from the confirmation count ─────────────────────────
+    excluded_from_count: List[str] = field(default_factory=list)
+    # Signal names here still FIRE and appear in trade logs but do NOT increment
+    # the count toward min_confirmations.  Lets you keep a signal for analysis
+    # without letting it gate entries on its own.
+    # Example: ["rejection_wick"] → pin bar alone won't satisfy min_conf=1,
+    # but is still logged when it co-fires with another confirmation.
+
 
 # ---------------------------------------------------------------------------
 # Result
@@ -644,12 +652,16 @@ def check_all_confirmations(
     if strk: fired.append("structure_shift")
     if chch: fired.append("choch")
 
+    # count_effective excludes signals in excluded_from_count from the gate check.
+    # count (total fired) is preserved for logging so trade records are unchanged.
+    excluded = set(cfg.excluded_from_count or [])
+    count_effective = sum(1 for s in fired if s not in excluded)
     count = len(fired)
 
     if cfg.aggressive_boundary:
         confirmed = True
     else:
-        confirmed = count >= cfg.min_confirmations
+        confirmed = count_effective >= cfg.min_confirmations
 
     return ConfirmationResult(
         direction=direction,

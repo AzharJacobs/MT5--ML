@@ -104,6 +104,7 @@ def run_backtest(
     # Step 3 toggles
     min_confirmations: int = 1,
     aggressive_boundary: bool = False,
+    excluded_from_count: Optional[list] = None,
     # Step 4 toggles
     aggressive_entry: bool = False,
     midline_tp: bool = False,
@@ -112,12 +113,10 @@ def run_backtest(
     fixed_lot: float = 0.0,         # 0 = dynamic 1% risk sizing; >0 = fixed lot every trade
     # Win-cooldown mode (two toggleable modes, not mutually exclusive)
     require_leave_and_return: bool = True,
-    # True (default): zone becomes re-tradeable only after price fully exits the zone
-    # AND later returns to it. Prevents re-entering on a continuous touch.
     cooldown_bars: int = 15,
-    # When require_leave_and_return=False: bar-count cooldown after a TP hit.
-    # Also applies as a minimum floor when require_leave_and_return=True
-    # (prevents re-entry within the first N bars even if price wiggles out and back).
+    # Zone loss blacklist: permanently skip a zone after this many consecutive losses.
+    # 0 = disabled (default baseline behaviour).
+    zone_max_losses: int = 0,
     # Output
     save_path: Optional[str] = None,
     chart: bool = False,
@@ -153,6 +152,16 @@ def run_backtest(
         print("ERROR: no data returned — check DB connection and date range.")
         return {}
 
+    # Drop consecutive 4H rows with identical OHLCV — historical data was stored with
+    # each bar duplicated (bar open + bar close timestamps, same prices). Dedup preserves
+    # the last (close-time) row of each pair so timestamps align with bar boundaries.
+    _ohlcv = ["open", "high", "low", "close"]
+    _before = len(df_4h)
+    df_4h = df_4h[df_4h[_ohlcv].ne(df_4h[_ohlcv].shift()).any(axis=1)].reset_index(drop=True)
+    _dupes = _before - len(df_4h)
+    if _dupes:
+        print(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
+
     print(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
 
     # ── Step config objects ────────────────────────────────────────────────
@@ -176,6 +185,7 @@ def run_backtest(
         aggressive_boundary=aggressive_boundary,
         bos_lookback=15,
         structure_lookback=25,
+        excluded_from_count=excluded_from_count or [],
     )
     setup_cfg = TradeSetupConfig(
         aggressive_entry=aggressive_entry,
@@ -203,6 +213,9 @@ def run_backtest(
     # zone_outcome_history: exact zone_id → list of outcomes in entry order.
     # Used to determine prior_bucket for each trade (first / post_win / post_loss).
     zone_outcome_history: dict = {}
+    # zone_consec_losses: consecutive loss count per zone_id for blacklist logic.
+    zone_consec_losses: dict = {}
+    zone_blacklist:      set  = set()   # permanently blocked zone_ids
     n     = len(df_15m)
     warmup = max(M15_WINDOW, 30)
 
@@ -212,6 +225,7 @@ def run_backtest(
         "conf_failed":       0,    # Step 3 no confirmation
         "setup_invalid":     0,    # Step 4 geometry/RR failure
         "zone_cooldown":     0,
+        "zone_blacklist":    0,    # zone permanently blocked after zone_max_losses
     }
 
     # ── Bar-by-bar loop ────────────────────────────────────────────────────
@@ -284,11 +298,17 @@ def run_backtest(
             filters["zone_cooldown"] += 1
             continue
 
+        # ── Zone blacklist gate (consecutive-loss limit) ──────────────────
+        zid = active_zone.zone_id
+        if zone_max_losses > 0 and zid in zone_blacklist:
+            filters["zone_blacklist"] += 1
+            continue
+
         # Flag: has this zone been won before? (re-test trade)
         is_retest = zk in won_zones
 
         # Prior-outcome bucket using exact zone_id (kind + rounded edges, stable)
-        zid     = active_zone.zone_id
+        # (zid already set above)
         history = zone_outcome_history.get(zid, [])
         if not history:
             prior_bucket = "first_attempt"
@@ -376,9 +396,9 @@ def run_backtest(
 
         if outcome == 1:
             won_zones.add(zk)
+            # Win resets consecutive loss count for this zone
+            zone_consec_losses[zid] = 0
             if require_leave_and_return:
-                # Block via leave-and-return state machine; also set a minimum
-                # bar floor so price can't instantly re-enter on the same candle
                 zone_reentry[zk] = {
                     "phase":           "exit",
                     "bottom":          active_zone.bottom,
@@ -386,10 +406,17 @@ def run_backtest(
                     "earliest_reentry": exit_bar + cooldown_bars,
                 }
             else:
-                # Simple bar-count cooldown
                 zone_cooldown[zk] = exit_bar + cooldown_bars
         elif outcome == -1:
             zone_cooldown[zk] = exit_bar + COOLDOWN_LOSS
+            # Consecutive loss tracking for blacklist
+            if zone_max_losses > 0:
+                new_count = zone_consec_losses.get(zid, 0) + 1
+                zone_consec_losses[zid] = new_count
+                if new_count >= zone_max_losses:
+                    zone_blacklist.add(zid)
+        else:  # expired
+            zone_consec_losses[zid] = 0
 
         exit_ts = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
         trades.append({
@@ -470,8 +497,11 @@ def run_backtest(
         "min_confirmations": min_confirmations,
         "entry_mode":      "zone_boundary" if aggressive_entry else "confirmation",
         "tp_mode":         f"midline_{midline_pct:.0%}" if midline_tp else "zone_edge",
-        "directional_filter": directional_filter,
-        "win_cooldown":       f"leave_and_return (floor={cooldown_bars}b)" if require_leave_and_return else f"{cooldown_bars} bars",
+        "directional_filter":  directional_filter,
+        "win_cooldown":        f"leave_and_return (floor={cooldown_bars}b)" if require_leave_and_return else f"{cooldown_bars} bars",
+        "excluded_from_count": ",".join(excluded_from_count) if excluded_from_count else "none",
+        "zone_max_losses":     zone_max_losses if zone_max_losses > 0 else "disabled",
+        "zones_blacklisted":   len(zone_blacklist),
     }
 
     print_report(metrics, run_label="Zone Strategy")
@@ -576,6 +606,12 @@ def main() -> None:
     parser.add_argument("--min_confirmations", type=int,   default=1)
     parser.add_argument("--aggressive_boundary", action="store_true",
                         help="Enter on zone touch, no confirmation pattern required")
+    parser.add_argument("--exclude_signals", default="",
+                        help="Comma-separated signal names excluded from confirmation count "
+                             "(still logged). Example: --exclude_signals rejection_wick,choch")
+    parser.add_argument("--zone_max_losses", type=int, default=0,
+                        help="Permanently blacklist a zone after this many consecutive losses "
+                             "(0 = disabled). Recommended: 2.")
     # Step 4
     parser.add_argument("--aggressive_entry", action="store_true",
                         help="Entry at zone boundary instead of confirmation bar close")
@@ -607,6 +643,7 @@ def main() -> None:
         allow_neutral=not args.no_neutral,
         min_confirmations=args.min_confirmations,
         aggressive_boundary=args.aggressive_boundary,
+        excluded_from_count=[s.strip() for s in args.exclude_signals.split(",") if s.strip()],
         aggressive_entry=args.aggressive_entry,
         midline_tp=args.midline_tp,
         midline_pct=args.midline_pct,
@@ -614,6 +651,7 @@ def main() -> None:
         fixed_lot=args.fixed_lot,
         require_leave_and_return=not args.no_leave_return,
         cooldown_bars=args.cooldown_bars,
+        zone_max_losses=args.zone_max_losses,
         save_path=args.save,
         chart=args.chart,
     )  # returns (metrics, df_t) — ignored here
