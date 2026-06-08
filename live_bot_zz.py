@@ -74,7 +74,9 @@ DB_NAME         = "ustech_ohlcv"
 TABLE           = "ustech_ohlcv"
 CONTRACT_SIZE   = 100.0       # $100/pt/lot (Exness USTEC)
 SPREAD_PTS      = 2.0         # applied at fill for paper mode; MT5 uses real fill
-RISK_PCT        = 0.01        # 1% of equity per trade
+RISK_PCT        = 0.01        # 1% of equity per trade (unused — fixed lot mode)
+FIXED_LOTS      = 0.05        # fixed lot size per trade
+MAX_POSITIONS   = 2           # maximum concurrent open positions
 MIN_RR          = 1.5
 MIN_CONF        = 1
 H4_WINDOW       = 150         # H4 bars for zone + bias
@@ -296,7 +298,7 @@ class ZZLiveBot:
         self.zone_outcome_history: dict = {}
 
         # ── Open position tracking ────────────────────────────────────────
-        self.open_position: Optional[dict] = None  # only 1 position at a time
+        self.open_positions: list = []  # up to MAX_POSITIONS concurrent
 
         # ── DB connection ─────────────────────────────────────────────────
         self.db = get_connection()
@@ -319,12 +321,12 @@ class ZZLiveBot:
                          SYMBOL, info.trade_mode, info.digits)
 
         log.info("ZZLiveBot ready | mode=%s | symbol=%s | min_conf=%d | "
-                 "leave_and_return=True | loss_cooldown=%dh",
-                 mode, SYMBOL, MIN_CONF, COOLDOWN_LOSS_H)
+                 "leave_and_return=True | loss_cooldown=%dh | lots=%.2f | max_pos=%d",
+                 mode, SYMBOL, MIN_CONF, COOLDOWN_LOSS_H, FIXED_LOTS, MAX_POSITIONS)
         log.info("Config: directional_filter=True allow_neutral=True "
                  "aggressive_entry=False midline_tp=False min_rr=%.1f "
-                 "sl_buffer=0.002 spread=%.1fpts risk=%.0f%%",
-                 MIN_RR, SPREAD_PTS, RISK_PCT * 100)
+                 "sl_buffer=0.002 spread=%.1fpts",
+                 MIN_RR, SPREAD_PTS)
 
     # ── Demo guard ────────────────────────────────────────────────────────
 
@@ -435,13 +437,13 @@ class ZZLiveBot:
         bar_l = float(df_15m_w["low"].iloc[-1])
         self._update_zone_reentry(now, bar_h, bar_l)
 
-        # ── Check if open position has closed ─────────────────────────────
-        if self.open_position is not None:
-            self._check_open_position(bar_h, bar_l, now)
+        # ── Check if any open positions have closed ───────────────────────
+        for pos in list(self.open_positions):
+            self._check_open_position(pos, bar_h, bar_l, now)
 
-        # Only one position at a time
-        if self.open_position is not None:
-            log.info("In position — skipping entry evaluation")
+        # Cap at MAX_POSITIONS concurrent trades
+        if len(self.open_positions) >= MAX_POSITIONS:
+            log.info("Max positions (%d) reached — skipping entry evaluation", MAX_POSITIONS)
             return
 
         # ── Step 2: timeframe analysis ────────────────────────────────────
@@ -525,13 +527,7 @@ class ZZLiveBot:
             log.warning("Geometry invalid after spread adjust — skip")
             return
 
-        # Lot size
-        if self.mode == "mt5":
-            lots = _lot_size_mt5(SYMBOL, abs(entry - sl))
-        else:
-            acct_info = self.broker.get_account_info()
-            equity    = float(acct_info.get("balance", 10_000.0))
-            lots      = _lot_size_formula(equity, abs(entry - sl))
+        lots = FIXED_LOTS
 
         rr = abs(tp - entry) / abs(entry - sl)
 
@@ -582,7 +578,7 @@ class ZZLiveBot:
 
         self.zlog.log_trade_open(record)
 
-        self.open_position = {
+        self.open_positions.append({
             "ticket":    ticket,
             "direction": direction,
             "entry":     entry,
@@ -594,13 +590,11 @@ class ZZLiveBot:
             "zone":      active_zone,
             "open_time": now,
             "record":    record,
-        }
+        })
 
     # ── Check if open position has closed ─────────────────────────────────
 
-    def _check_open_position(self, bar_h: float, bar_l: float, now: datetime) -> None:
-        pos = self.open_position
-
+    def _check_open_position(self, pos: dict, bar_h: float, bar_l: float, now: datetime) -> None:
         if self.mode == "mt5":
             self._check_position_mt5(pos, now)
             return
@@ -631,7 +625,7 @@ class ZZLiveBot:
                 if direction == "buy"
                 else (pos["entry"] - close_price) * pos["lots"] * CONTRACT_SIZE
             )
-            self._on_position_close(outcome, close_price, pnl, now)
+            self._on_position_close(pos, outcome, close_price, pnl, now)
 
     def _check_position_mt5(self, pos: dict, now: datetime) -> None:
         try:
@@ -644,14 +638,13 @@ class ZZLiveBot:
             close_price = float(deal.get("exit_price", pos["entry"]))
             pnl         = float(deal.get("pnl", 0.0))
             outcome = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
-            self._on_position_close(outcome, close_price, pnl, now)
+            self._on_position_close(pos, outcome, close_price, pnl, now)
         except Exception as exc:
             log.warning("MT5 position check failed: %s", exc)
 
     def _on_position_close(
-        self, outcome: int, close_price: float, pnl: float, now: datetime
+        self, pos: dict, outcome: int, close_price: float, pnl: float, now: datetime
     ) -> None:
-        pos = self.open_position
         zk  = pos["zk"]
         zid = pos["zid"]
 
@@ -681,7 +674,7 @@ class ZZLiveBot:
         record["pnl"]         = round(pnl, 2)
 
         self.zlog.log_trade_close(record)
-        self.open_position = None
+        self.open_positions.remove(pos)
 
     # ── Main loop ─────────────────────────────────────────────────────────
 

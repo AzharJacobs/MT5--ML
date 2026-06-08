@@ -72,7 +72,12 @@ def _load_ohlcv(db, table: str, timeframe: str, start: str, end: str) -> pd.Data
     df = df.sort_values("timestamp").reset_index(drop=True)
     for col in ("open", "high", "low", "close"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["open", "high", "low", "close"])
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    # Drop duplicate bars (identical OHLCV stored at multiple timestamps in DB)
+    ohlcv_cols = ["open", "high", "low", "close"]
+    changed = (df[ohlcv_cols] != df[ohlcv_cols].shift()).any(axis=1)
+    df = df[changed | (df.index == df.index[0])].reset_index(drop=True)
+    return df
 
 
 def _atr(df_15m: pd.DataFrame, period: int = 14) -> float:

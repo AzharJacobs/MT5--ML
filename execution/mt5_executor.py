@@ -74,6 +74,31 @@ class MT5Executor(BrokerInterface):
                          symbol, tick.bid, tick.ask)
             return None
 
+        # Validate SL/TP against symbol's minimum stop distance
+        info = mt5.symbol_info(symbol)
+        if info is not None:
+            stops_level = info.trade_stops_level  # in points
+            point       = info.point
+            min_dist    = stops_level * point
+            if direction == "buy":
+                sl_dist = price - sl
+                tp_dist = tp - price
+            else:
+                sl_dist = sl - price
+                tp_dist = price - tp
+            logger.debug(
+                "place_order: %s %s price=%.2f sl=%.2f tp=%.2f "
+                "sl_dist=%.2f tp_dist=%.2f min_dist=%.2f (stops_level=%d pts)",
+                direction, symbol, price, sl, tp, sl_dist, tp_dist, min_dist, stops_level,
+            )
+            if sl_dist < min_dist or tp_dist < min_dist:
+                logger.error(
+                    "place_order: stops too close for %s — price=%.2f sl=%.2f tp=%.2f "
+                    "sl_dist=%.2f tp_dist=%.2f min_dist=%.2f (stops_level=%d pts). Order NOT placed.",
+                    symbol, price, sl, tp, sl_dist, tp_dist, min_dist, stops_level,
+                )
+                return None
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,

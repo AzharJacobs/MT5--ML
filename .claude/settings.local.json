@@ -175,7 +175,22 @@
       "Bash(Start-Sleep -Seconds 30)",
       "Bash(Write-Output \"waited\")",
       "PowerShell(\\(Get-Item \"C:\\\\Users\\\\AZHARJ~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\f--MT5--ML\\\\228d41c8-8595-42d1-9445-74ea1be918d6\\\\tasks\\\\bqpt1wn0z.output\"\\).Length)",
-      "Bash(python -X utf8 scripts/compare_gold_ZZ.py)"
+      "Bash(python -X utf8 scripts/compare_gold_ZZ.py)",
+      "Bash(python scripts/backtest_zones.py --start 2024-01-01 --end 2025-01-01)",
+      "Bash(python -X utf8 scripts/backtest_zones.py --start 2024-01-01 --end 2025-01-01)",
+      "Bash(python -X utf8 scripts/backtest_gold_ZZ.py --start 2023-01-01 --end 2024-01-01)",
+      "Bash(python -X utf8 scripts/backtest_gold_ZZ.py --start 2024-01-01 --end 2025-01-01)",
+      "Bash(python -X utf8 scripts/backtest_gold_ZZ.py --start 2025-01-01 --end 2026-01-01)",
+      "Bash(python -X utf8 scripts/backtest_gold_ZZ.py --start 2023-01-01 --end 2024-01-01 --active_signals bos_msb rejection_wick choch)",
+      "Bash(python -X utf8 scripts/backtest_gold_ZZ.py --start 2024-01-01 --end 2025-01-01 --active_signals bos_msb rejection_wick choch)",
+      "Bash(python -X utf8 scripts/backtest_gold_ZZ.py --start 2025-01-01 --end 2026-01-01 --active_signals bos_msb rejection_wick choch)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\" -Directory)",
+      "Bash(Select-Object Name, LastWriteTime)",
+      "Bash(Sort-Object Name)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\strategy\" -File)",
+      "Bash(Get-ChildItem -Path \"f:\\\\MT5- ML\\\\strategy_v2\" -File)",
+      "Bash(python scripts/backtest_market_structure.py --symbol ustech --start 2023-01-01 --end 2025-12-31 --cash 50)",
+      "Bash(python -X utf8 scripts/backtest_market_structure.py --symbol ustech --start 2023-01-01 --end 2025-12-31 --cash 50)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
