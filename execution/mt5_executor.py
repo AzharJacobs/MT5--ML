@@ -91,6 +91,13 @@ class MT5Executor(BrokerInterface):
                 "sl_dist=%.2f tp_dist=%.2f min_dist=%.2f (stops_level=%d pts)",
                 direction, symbol, price, sl, tp, sl_dist, tp_dist, min_dist, stops_level,
             )
+            if sl_dist < 0 or tp_dist < 0:
+                logger.error(
+                    "place_order: SL/TP on wrong side for %s %s — price=%.2f sl=%.2f tp=%.2f "
+                    "sl_dist=%.2f tp_dist=%.2f. Setup is stale (price moved past SL or TP). Order NOT placed.",
+                    direction, symbol, price, sl, tp, sl_dist, tp_dist,
+                )
+                return None
             if sl_dist < min_dist or tp_dist < min_dist:
                 logger.error(
                     "place_order: stops too close for %s — price=%.2f sl=%.2f tp=%.2f "

@@ -519,13 +519,33 @@ class ZZLiveBot:
         sl_dist = abs(setup.entry - sl)
         sl = (entry - sl_dist) if direction == "buy" else (entry + sl_dist)
 
-        # Re-validate geometry after spread adjustment
+        # Re-validate geometry after spread adjustment (vs setup entry)
         if direction == "buy" and (sl >= entry or tp <= entry):
             log.warning("Geometry invalid after spread adjust — skip")
             return
         if direction == "sell" and (sl <= entry or tp >= entry):
             log.warning("Geometry invalid after spread adjust — skip")
             return
+
+        # For MT5 mode: validate SL/TP against LIVE price — signal_price may be
+        # stale if price moved significantly since the confirmation bar closed.
+        if self.mode == "mt5":
+            from execution.mt5_executor import MT5Executor
+            tick = MT5Executor._get_tick(SYMBOL)
+            if tick is not None:
+                live_price = tick.bid if direction == "sell" else tick.ask
+                if direction == "buy" and (sl >= live_price or tp <= live_price):
+                    log.warning(
+                        "Setup stale vs live price=%.2f — buy sl=%.2f tp=%.2f — skip",
+                        live_price, sl, tp,
+                    )
+                    return
+                if direction == "sell" and (sl <= live_price or tp >= live_price):
+                    log.warning(
+                        "Setup stale vs live price=%.2f — sell sl=%.2f tp=%.2f — skip",
+                        live_price, sl, tp,
+                    )
+                    return
 
         lots = FIXED_LOTS
 
