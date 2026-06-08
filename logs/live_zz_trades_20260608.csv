@@ -1,3 +1,5 @@
 timestamp,symbol,mode,zone_id,zone_bottom,zone_top,zone_kind,zone_strength,zone_fresh,h4_bias,direction,signals_fired,confirmation_count,choch_fired,entry_mode,tp_mode,entry,sl,tp,rr,lots,fill_price,outcome,close_price,pnl,prior_bucket
 2026-06-08T13:15:03.806592+00:00,USTECm,mt5,supply_30088.8_30253.6,30088.75,30253.61,supply,2.76,False,bearish,sell,structure_shift,1,False,confirmation,zone_edge,30209.04,30314.12,29519.08,6.57,0.05,30209.04,,,,first_attempt
 2026-06-08T13:15:03.806592+00:00,USTECm,mt5,supply_30088.8_30253.6,30088.75,30253.61,supply,2.76,False,bearish,sell,structure_shift,1,False,confirmation,zone_edge,30209.04,30314.12,29519.08,6.57,0.05,30209.04,1,29519.08,2.76,first_attempt
+2026-06-08T20:30:03.808752+00:00,USTECm,mt5,supply_29158.7_29385.8,29158.66,29385.84,supply,3.95,False,bearish,sell,structure_shift,1,False,confirmation,zone_edge,29431.33,29444.61,29318.23,8.52,0.05,29431.33,,,,first_attempt
+2026-06-08T20:30:03.808752+00:00,USTECm,mt5,supply_29158.7_29385.8,29158.66,29385.84,supply,3.95,False,bearish,sell,structure_shift,1,False,confirmation,zone_edge,29431.33,29444.61,29318.23,8.52,0.05,29431.33,-1,29444.61,-0.68,first_attempt

@@ -16,6 +16,7 @@ Usage (via scripts/backtest_zones.py):
 from __future__ import annotations
 
 import argparse
+import random
 from typing import Optional
 
 import numpy as np
@@ -79,6 +80,25 @@ def _zone_key(zone) -> tuple:
     return (round(zone.bottom, 1), round(zone.top, 1))
 
 
+def _dynamic_spread(ts: pd.Timestamp, base: float = 4.0) -> float:
+    """Session-aware spread model (points).
+    - Daily break  21:00–22:05 UTC  → 3× base (~12 pts)
+    - Asian quiet  00:00–06:00 UTC  → 2× base (~8 pts)
+    - London/NY                     → 1× base (~4 pts)
+    """
+    h = ts.hour + ts.minute / 60.0
+    if 21.0 <= h < 22.1:
+        return base * 3.0
+    if h < 6.0:
+        return base * 2.0
+    return base
+
+
+def _count_overnights(ts_entry: pd.Timestamp, ts_exit: pd.Timestamp) -> int:
+    """Calendar days between entry and exit dates (proxy for overnight swaps)."""
+    return max(0, (ts_exit.date() - ts_entry.date()).days)
+
+
 def _lot_size(equity: float, sl_dist: float, contract_size: float) -> float:
     if sl_dist <= 0:
         return 0.01
@@ -117,6 +137,19 @@ def run_backtest(
     # Zone loss blacklist: permanently skip a zone after this many consecutive losses.
     # 0 = disabled (default baseline behaviour).
     zone_max_losses: int = 0,
+    # ── Realistic execution ───────────────────────────────────────────────────
+    # min_sl_pct: skip any trade whose SL is closer than this % from entry.
+    min_sl_pct: float = 0.0,
+    # realistic=True enables session-spread widening, SL slippage, swap, margin enforcement.
+    realistic: bool = False,
+    # Override SYMBOL_CONFIG contract size (e.g. pass 1.0 for live Exness USTECm spec).
+    contract_size_override: Optional[float] = None,
+    base_spread_pts: float = 4.0,       # used when realistic=True
+    swap_long_pts: float = -1.5,        # pts per lot per night, long positions
+    swap_short_pts: float = 0.8,        # pts per lot per night, short positions
+    slippage_max_pts: float = 3.0,      # max adverse slippage on SL exits (pts)
+    margin_rate: float = 0.01,          # 1 % margin requirement
+    margin_call_pct: float = 0.60,      # margin call level (60 %)
     # Output
     save_path: Optional[str] = None,
     chart: bool = False,
@@ -131,7 +164,11 @@ def run_backtest(
         raise ValueError(f"Unknown symbol '{symbol}'. Choose from: {list(SYMBOL_CONFIG)}")
 
     db_name, table, contract_size = SYMBOL_CONFIG[sym]
+    if contract_size_override is not None:
+        contract_size = contract_size_override
     eff_spread = spread if spread is not None else SYMBOL_SPREAD.get(sym, 0.0)
+    if realistic and spread is None:
+        eff_spread = base_spread_pts  # session-aware spread computed per bar below
 
     db = get_connection()
     db.database = db_name
@@ -216,6 +253,9 @@ def run_backtest(
     # zone_consec_losses: consecutive loss count per zone_id for blacklist logic.
     zone_consec_losses: dict = {}
     zone_blacklist:      set  = set()   # permanently blocked zone_ids
+    stopout_occurred:   bool  = False   # realistic mode: did account ever hit stop-out?
+    total_swap_pnl:    float  = 0.0
+    total_slippage:    float  = 0.0
     n     = len(df_15m)
     warmup = max(M15_WINDOW, 30)
 
@@ -226,6 +266,8 @@ def run_backtest(
         "setup_invalid":     0,    # Step 4 geometry/RR failure
         "zone_cooldown":     0,
         "zone_blacklist":    0,    # zone permanently blocked after zone_max_losses
+        "sl_too_tight":      0,    # SL distance below min_sl_pct threshold
+        "margin_call":       0,    # equity too low to open (realistic mode)
     }
 
     # ── Bar-by-bar loop ────────────────────────────────────────────────────
@@ -329,9 +371,10 @@ def run_backtest(
         # ── Realistic entry: open of next bar ─────────────────────────────
         entry = float(df_15m["open"].iloc[i + 1])
 
-        # Apply spread cost
-        if eff_spread > 0:
-            entry = entry + eff_spread if direction == "buy" else entry - eff_spread
+        # Apply spread cost (session-aware if realistic mode)
+        bar_spread = _dynamic_spread(ts_now, base_spread_pts) if realistic else eff_spread
+        if bar_spread > 0:
+            entry = entry + bar_spread if direction == "buy" else entry - bar_spread
 
         # Rebase SL to actual entry (keep risk distance, adjust anchor)
         sl_dist = abs(signal_price - setup.sl)
@@ -355,7 +398,21 @@ def run_backtest(
                 filters["setup_invalid"] += 1
                 continue
 
+        # ── min_sl_pct filter ─────────────────────────────────────────────
+        if min_sl_pct > 0.0:
+            sl_dist_pct = abs(entry - sl) / entry * 100.0
+            if sl_dist_pct < min_sl_pct:
+                filters["sl_too_tight"] += 1
+                continue
+
         lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size)
+
+        # ── Margin check (realistic mode) ────────────────────────────────
+        if realistic:
+            margin_needed = lot * contract_size * entry * margin_rate
+            if equity < margin_needed * margin_call_pct:
+                filters["margin_call"] += 1
+                continue
 
         # ── Simulate forward price action ─────────────────────────────────
         outcome        = 0
@@ -363,6 +420,15 @@ def run_backtest(
         exit_bar       = i + max_forward_bars
         max_favourable = 0.0
         max_adverse    = 0.0
+
+        # Stop-out price: price at which equity hits exactly zero (realistic mode).
+        # P&L at stop-out = -equity → price_delta = equity / (lot * contract_size)
+        if realistic and lot * contract_size > 0:
+            price_to_zero = equity / (lot * contract_size)
+            stopout_price_buy  = entry - price_to_zero   # buy: falls this far → account = 0
+            stopout_price_sell = entry + price_to_zero   # sell: rises this far → account = 0
+        else:
+            stopout_price_buy = stopout_price_sell = None
 
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
@@ -374,19 +440,50 @@ def run_backtest(
             max_adverse    = max(max_adverse,    adverse)
 
             if direction == "buy":
+                # Stop-out before SL (realistic mode only)
+                if stopout_price_buy is not None and fl <= stopout_price_buy:
+                    outcome = -1; exit_price = stopout_price_buy; exit_bar = j
+                    stopout_occurred = True; break
                 if fh >= tp:   outcome =  1; exit_price = tp; exit_bar = j; break
                 if fl <= sl:   outcome = -1; exit_price = sl; exit_bar = j; break
             else:
+                if stopout_price_sell is not None and fh >= stopout_price_sell:
+                    outcome = -1; exit_price = stopout_price_sell; exit_bar = j
+                    stopout_occurred = True; break
                 if fl <= tp:   outcome =  1; exit_price = tp; exit_bar = j; break
                 if fh >= sl:   outcome = -1; exit_price = sl; exit_bar = j; break
 
         # ── P&L ──────────────────────────────────────────────────────────
+        # Slippage: add adverse slippage on SL exits (realistic mode)
+        slip = 0.0
+        if realistic and outcome == -1 and not stopout_occurred:
+            slip = random.uniform(0.0, slippage_max_pts)
+            if direction == "buy":
+                exit_price -= slip
+            else:
+                exit_price += slip
+            total_slippage += slip * lot * contract_size
+
         if direction == "buy":
             pnl = (exit_price - entry) * lot * contract_size
         else:
             pnl = (entry - exit_price) * lot * contract_size
 
+        # Swap: overnight holding cost (realistic mode)
+        swap_pnl = 0.0
+        if realistic and exit_bar > i + 1:
+            ts_entry_bar = df_15m["timestamp"].iloc[i + 1]
+            ts_exit_bar  = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
+            nights = _count_overnights(ts_entry_bar, ts_exit_bar)
+            if nights > 0:
+                swap_rate = swap_long_pts if direction == "buy" else swap_short_pts
+                swap_pnl  = swap_rate * lot * contract_size * nights
+                pnl      += swap_pnl
+                total_swap_pnl += swap_pnl
+
         equity += pnl
+        if equity < 0:          # safety floor — should only occur at stop-out
+            equity = 0.0
         equity_curve.append(equity)
         skip_until = exit_bar
 
@@ -502,6 +599,12 @@ def run_backtest(
         "excluded_from_count": ",".join(excluded_from_count) if excluded_from_count else "none",
         "zone_max_losses":     zone_max_losses if zone_max_losses > 0 else "disabled",
         "zones_blacklisted":   len(zone_blacklist),
+        "min_sl_pct":          min_sl_pct if min_sl_pct > 0 else "disabled",
+        "realistic_mode":      realistic,
+        "contract_size":       contract_size,
+        "total_swap_pnl":      f"${total_swap_pnl:+.2f}" if realistic else "n/a",
+        "total_slippage_cost": f"${-abs(total_slippage):.2f}" if realistic else "n/a",
+        "stopout_occurred":    stopout_occurred if realistic else "n/a",
     }
 
     print_report(metrics, run_label="Zone Strategy")

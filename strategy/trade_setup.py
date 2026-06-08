@@ -246,6 +246,21 @@ def build_trade_setup(
         entry      = signal_price
         entry_mode = "confirmation"
 
+    # ── Zone-entry guard (confirmation mode) ─────────────────────────────────
+    # In confirmation mode entry = signal_price (M15 bar close). If price has
+    # already exited the zone in the adverse direction, the SL anchored to the
+    # zone edge becomes dangerously tight. Uses same 0.1% tolerance as M15 tap.
+    _ZONE_ENTRY_TOL = 0.001
+    if entry_mode == "confirmation":
+        if direction == "sell" and signal_price > entry_zone.top * (1.0 + _ZONE_ENTRY_TOL):
+            return _invalid(direction, entry_zone, entry_mode,
+                            f"signal {signal_price:.4f} above supply top "
+                            f"{entry_zone.top:.4f} — price exited zone")
+        if direction == "buy" and signal_price < entry_zone.bottom * (1.0 - _ZONE_ENTRY_TOL):
+            return _invalid(direction, entry_zone, entry_mode,
+                            f"signal {signal_price:.4f} below demand bottom "
+                            f"{entry_zone.bottom:.4f} — price exited zone")
+
     # ── Stop loss — always outside the zone ──────────────────────────────────
     if direction == "buy":
         sl = entry_zone.bottom * (1.0 - cfg.sl_buffer_pct)

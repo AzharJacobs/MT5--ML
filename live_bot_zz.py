@@ -79,6 +79,7 @@ FIXED_LOTS      = 0.05        # fixed lot size per trade
 MAX_POSITIONS   = 2           # maximum concurrent open positions
 MIN_RR          = 1.5
 MIN_CONF        = 1
+MIN_SL_PCT      = 0.25        # skip trade if SL is closer than 0.25% from entry
 H4_WINDOW       = 150         # H4 bars for zone + bias
 M15_WINDOW      = 80          # M15 bars for confirmations
 COOLDOWN_LOSS_H = 12          # hours to block zone after a loss (≈48 × 15M bars)
@@ -364,8 +365,8 @@ class ZZLiveBot:
                  mode, SYMBOL, MIN_CONF, COOLDOWN_LOSS_H, FIXED_LOTS, MAX_POSITIONS)
         log.info("Config: directional_filter=True allow_neutral=True "
                  "aggressive_entry=False midline_tp=False min_rr=%.1f "
-                 "sl_buffer=0.002 spread=%.1fpts",
-                 MIN_RR, SPREAD_PTS)
+                 "sl_buffer=0.002 spread=%.1fpts min_sl_pct=%.2f%%",
+                 MIN_RR, SPREAD_PTS, MIN_SL_PCT)
 
     # ── Demo guard ────────────────────────────────────────────────────────
 
@@ -582,6 +583,15 @@ class ZZLiveBot:
             return
         if direction == "sell" and (sl <= entry or tp >= entry):
             log.warning("Geometry invalid after spread adjust — skip")
+            return
+
+        # SL distance filter — skip if SL is too close to entry (noise risk)
+        sl_dist_pct = abs(entry - sl) / entry * 100.0
+        if sl_dist_pct < MIN_SL_PCT:
+            log.info(
+                "SL too tight (%.3f%% < %.2f%%) — skip  entry=%.2f sl=%.2f",
+                sl_dist_pct, MIN_SL_PCT, entry, sl,
+            )
             return
 
         # For MT5 mode: validate SL/TP against LIVE price — signal_price may be
