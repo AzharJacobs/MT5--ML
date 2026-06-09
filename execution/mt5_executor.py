@@ -179,6 +179,25 @@ class MT5Executor(BrokerInterface):
         info = mt5.account_info()
         return info._asdict() if info else {}
 
+    def get_entry_deal_price(self, ticket: int) -> Optional[float]:
+        """
+        Return the actual fill price for the opening deal of a position.
+        Retries briefly since MT5 may not write the deal to history instantly.
+        """
+        import MetaTrader5 as mt5
+        import time
+        for _ in range(3):
+            deals = mt5.history_deals_get(position=ticket)
+            if deals:
+                for deal in deals:
+                    if deal.entry == mt5.DEAL_ENTRY_IN:
+                        return float(deal.price)
+            time.sleep(0.2)
+        logger.warning(
+            "get_entry_deal_price: no DEAL_ENTRY_IN found for ticket=%d after retries", ticket
+        )
+        return None
+
     def get_closed_deal_info(self, ticket: int) -> dict:
         """
         Fetch exit details for a position that has been closed (SL/TP/manual).

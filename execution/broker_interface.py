@@ -33,5 +33,9 @@ class BrokerInterface(ABC):
         """Optional: return exit details for a closed position. MT5 only."""
         return {}
 
+    def get_entry_deal_price(self, ticket: int) -> Optional[float]:
+        """Optional: return the actual fill price for the opening deal. MT5 only."""
+        return None
+
     @abstractmethod
     def disconnect(self) -> None: ...

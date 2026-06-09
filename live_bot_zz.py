@@ -158,7 +158,7 @@ TRADE_FIELDS = [
     "signals_fired", "confirmation_count", "choch_fired",
     "entry_mode", "tp_mode",
     "entry", "sl", "tp", "rr", "lots",
-    "fill_price", "outcome", "close_price", "pnl",
+    "ticket", "signal_price", "fill_price", "outcome", "close_price", "pnl",
     "prior_bucket",
 ]
 
@@ -346,6 +346,7 @@ class ZZLiveBot:
         self.db.connect()
 
         # ── Verify symbol exists on this MT5 server ───────────────────────
+        self.contract_size = CONTRACT_SIZE  # fallback; updated from symbol_info below
         if mode == "mt5":
             import MetaTrader5 as mt5
             info = mt5.symbol_info(SYMBOL)
@@ -357,8 +358,13 @@ class ZZLiveBot:
                     "Similar symbols available: %s", SYMBOL, similar
                 )
             else:
-                log.info("Symbol verified: %s | trade_mode=%d | digits=%d",
-                         SYMBOL, info.trade_mode, info.digits)
+                cs = float(getattr(info, "trade_contract_size", 0) or 0)
+                if cs > 0:
+                    self.contract_size = cs
+                log.info(
+                    "Symbol verified: %s | trade_mode=%d | digits=%d | contract_size=%.2f",
+                    SYMBOL, info.trade_mode, info.digits, self.contract_size,
+                )
 
         log.info("ZZLiveBot ready | mode=%s | symbol=%s | min_conf=%d | "
                  "leave_and_return=True | loss_cooldown=%dh | lots=%.2f | max_pos=%d",
@@ -562,6 +568,7 @@ class ZZLiveBot:
         self, now, direction, setup, active_zone, zk, zid,
         tf_result, conf,
     ) -> None:
+        signal_price = setup.entry          # raw M15 close — always logged for slippage audit
         entry = setup.entry
         sl    = setup.sl
         tp    = setup.tp
@@ -599,31 +606,36 @@ class ZZLiveBot:
         if self.mode == "mt5":
             from execution.mt5_executor import MT5Executor
             tick = MT5Executor._get_tick(SYMBOL)
-            if tick is not None:
-                live_price = tick.bid if direction == "sell" else tick.ask
-                if direction == "buy" and (sl >= live_price or tp <= live_price):
-                    log.warning(
-                        "Setup stale vs live price=%.2f — buy sl=%.2f tp=%.2f — skip",
-                        live_price, sl, tp,
-                    )
-                    return
-                if direction == "sell" and (sl <= live_price or tp >= live_price):
-                    log.warning(
-                        "Setup stale vs live price=%.2f — sell sl=%.2f tp=%.2f — skip",
-                        live_price, sl, tp,
-                    )
-                    return
-                # Reject if live price has already travelled more than 50% of the
-                # reward distance — setup is stale and trade would enter mid-move.
-                reward = abs(tp - entry)
-                price_drift = abs(live_price - entry)
-                if price_drift > 0.5 * reward:
-                    log.warning(
-                        "Setup stale — live price=%.2f drifted %.1f pts (>50%% of reward=%.1f) "
-                        "from signal entry=%.2f — skip",
-                        live_price, price_drift, reward, entry,
-                    )
-                    return
+            if tick is None:
+                log.warning(
+                    "Live tick unavailable for %s — cannot validate setup, rejecting trade",
+                    SYMBOL,
+                )
+                return
+            live_price = tick.bid if direction == "sell" else tick.ask
+            if direction == "buy" and (sl >= live_price or tp <= live_price):
+                log.warning(
+                    "Setup stale vs live price=%.2f — buy sl=%.2f tp=%.2f — skip",
+                    live_price, sl, tp,
+                )
+                return
+            if direction == "sell" and (sl <= live_price or tp >= live_price):
+                log.warning(
+                    "Setup stale vs live price=%.2f — sell sl=%.2f tp=%.2f — skip",
+                    live_price, sl, tp,
+                )
+                return
+            # Reject if live price has already travelled more than 50% of the
+            # reward distance — setup is stale and trade would enter mid-move.
+            reward = abs(tp - entry)
+            price_drift = abs(live_price - entry)
+            if price_drift > 0.5 * reward:
+                log.warning(
+                    "Setup stale — live price=%.2f drifted %.1f pts (>50%% of reward=%.1f) "
+                    "from signal entry=%.2f — skip",
+                    live_price, price_drift, reward, entry,
+                )
+                return
 
         lots = FIXED_LOTS
 
@@ -642,6 +654,28 @@ class ZZLiveBot:
         if ticket is None:
             log.error("Order placement failed")
             return
+
+        # In MT5 mode: read the actual fill price from deal history.
+        # fill_price is left None (blank in CSV) if the deal isn't readable yet,
+        # so it's distinguishable from a true zero-slippage fill.
+        if self.mode == "mt5":
+            real_fill = self.broker.get_entry_deal_price(ticket)
+            if real_fill is None:
+                fill_price = None
+                log.warning(
+                    "Could not read entry deal for ticket=%d — fill_price will be blank in log",
+                    ticket,
+                )
+            else:
+                fill_price = real_fill
+                # Adverse slippage: positive = worse fill than signal, for both directions.
+                slippage = (fill_price - signal_price) if direction == "buy" else (signal_price - fill_price)
+                log.info(
+                    "Fill: ticket=%d signal=%.2f fill=%.2f adverse_slippage=%+.2f pts (%s)",
+                    ticket, signal_price, fill_price, slippage, direction,
+                )
+        else:
+            fill_price = entry  # paper mode: fill = spread-adjusted entry
 
         prior = self._prior_bucket(zid)
 
@@ -667,7 +701,9 @@ class ZZLiveBot:
             "tp":                 round(tp, 2),
             "rr":                 round(rr, 2),
             "lots":               lots,
-            "fill_price":         round(entry, 2),
+            "ticket":             ticket,
+            "signal_price":       round(signal_price, 2),
+            "fill_price":         round(fill_price, 2) if fill_price is not None else None,
             "outcome":            None,
             "close_price":        None,
             "pnl":                None,
@@ -719,9 +755,9 @@ class ZZLiveBot:
 
         if outcome is not None:
             pnl = (
-                (close_price - pos["entry"]) * pos["lots"] * CONTRACT_SIZE
+                (close_price - pos["entry"]) * pos["lots"] * self.contract_size
                 if direction == "buy"
-                else (pos["entry"] - close_price) * pos["lots"] * CONTRACT_SIZE
+                else (pos["entry"] - close_price) * pos["lots"] * self.contract_size
             )
             self._on_position_close(pos, outcome, close_price, pnl, now)
 

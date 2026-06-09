@@ -201,7 +201,8 @@
       "Bash(python -X utf8 scripts/analyse_losses.py)",
       "Bash(python -X utf8 scripts/confirm_queries.py)",
       "Bash(python -X utf8 scripts/min_sl_sweep.py)",
-      "Bash(python -X utf8 scripts/realistic_comparison.py)"
+      "Bash(python -X utf8 scripts/realistic_comparison.py)",
+      "Bash(python -X utf8 scripts/compare_bias_levers.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"

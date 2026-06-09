@@ -121,6 +121,8 @@ def run_backtest(
     # Step 2 toggles
     directional_filter: bool = True,
     allow_neutral: bool = True,
+    h4_swing_left: int = 2,
+    h4_swing_right: int = 2,
     # Step 3 toggles
     min_confirmations: int = 1,
     aggressive_boundary: bool = False,
@@ -206,6 +208,8 @@ def run_backtest(
         directional_filter=directional_filter,
         allow_neutral_up=allow_neutral,
         allow_neutral_down=allow_neutral,
+        h4_swing_left=h4_swing_left,
+        h4_swing_right=h4_swing_right,
         h4_zone_cfg=ZoneConfig(
             impulse_atr_mult=2.0,
             body_ratio_min=0.50,
@@ -703,6 +707,10 @@ def main() -> None:
     parser.add_argument("--spread",   type=float, default=None)
     # Step 2
     parser.add_argument("--no_directional_filter", action="store_true")
+    parser.add_argument("--h4_swing_left",  type=int, default=2,
+                        help="Fractal pivot left-bar width for H4 bias (default 2)")
+    parser.add_argument("--h4_swing_right", type=int, default=2,
+                        help="Fractal pivot right-bar width for H4 bias (default 2)")
     parser.add_argument("--no_neutral",            action="store_true",
                         help="Block neutral_up/neutral_down bias (require strict bullish/bearish)")
     # Step 3
@@ -744,6 +752,8 @@ def main() -> None:
         spread=args.spread,
         directional_filter=not args.no_directional_filter,
         allow_neutral=not args.no_neutral,
+        h4_swing_left=args.h4_swing_left,
+        h4_swing_right=args.h4_swing_right,
         min_confirmations=args.min_confirmations,
         aggressive_boundary=args.aggressive_boundary,
         excluded_from_count=[s.strip() for s in args.exclude_signals.split(",") if s.strip()],
