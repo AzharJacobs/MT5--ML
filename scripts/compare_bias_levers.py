@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from backtest.engine_zones import run_backtest
+from trading.strategies.zz.ustec.engine import run_backtest
 
 START = "2023-01-01"
 END   = "2025-01-01"

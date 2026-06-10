@@ -202,10 +202,33 @@
       "Bash(python -X utf8 scripts/confirm_queries.py)",
       "Bash(python -X utf8 scripts/min_sl_sweep.py)",
       "Bash(python -X utf8 scripts/realistic_comparison.py)",
-      "Bash(python -X utf8 scripts/compare_bias_levers.py)"
+      "Bash(python -X utf8 scripts/compare_bias_levers.py)",
+      "Bash(python3 -c \"import yaml; print\\(yaml.__version__\\)\")",
+      "Bash(mkdir -p /Users/azhar.jacobs/Documents/MT5--ML/trading/strategies/zz/xauusd \\\\ *)",
+      "Bash(python3 -c ' *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -m pip install pyyaml -q)",
+      "Read(//Users/azhar.jacobs/miniconda3/**)",
+      "Bash(conda env *)",
+      "Bash(python3 -c \"import sys; print\\(sys.version, sys.executable\\)\")",
+      "Read(//usr/**)",
+      "Bash(ls /usr/local/bin/python* 2>/dev/null; ls /opt/homebrew/bin/python* 2>/dev/null; cat /Users/azhar.jacobs/Documents/MT5--ML/.python-version 2>/dev/null)",
+      "Read(//opt/homebrew/**)",
+      "Read(//Users/**)",
+      "Bash(pyenv which *)",
+      "Bash(find /Library /Users/azhar.jacobs/Library -name \"numpy\" -path \"*/site-packages/*\" -maxdepth 10 2>/dev/null | head -5)",
+      "Read(//Library/**)",
+      "Bash(sed 's/from strategy\\\\.zones/from trading.strategies.zz.core.zones/g; *)",
+      "Bash(sed 's|from strategy\\\\.market_structure|from trading.strategies.zz.core.market_structure|g; *)",
+      "Bash(sed 's/from execution\\\\.broker_interface/from trading.shared.broker_interface/g; *)",
+      "Bash(sed 's/from execution\\\\.broker_interface/from trading.shared.broker_interface/g' execution/paper_trader.py)",
+      "Bash(sed 's/from utils\\\\.db_writer/from trading.db/g' utils/trade_logger.py)",
+      "Bash(git -C /Users/azhar.jacobs/Documents/MT5--ML status)",
+      "Bash(git add *)"
     ],
     "additionalDirectories": [
-      "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML"
+      "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML",
+      "/Users/azhar.jacobs/Documents/MT5--ML/trading/strategies/zz"
     ]
   }
 }

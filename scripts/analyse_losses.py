@@ -14,7 +14,7 @@ Run:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backtest.engine_zones import run_backtest
+from trading.strategies.zz.ustec.engine import run_backtest
 import pandas as pd
 
 print("Running 3-year baseline (2023-2025)...")

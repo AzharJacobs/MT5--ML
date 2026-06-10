@@ -33,7 +33,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.db_writer import get_engine, _clean
+from trading.db.writer import get_engine, _clean
 from sqlalchemy import text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")

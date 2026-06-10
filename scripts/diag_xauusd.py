@@ -27,7 +27,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from backtest.engine_zones import run_backtest
+from trading.strategies.zz.ustec.engine import run_backtest
 
 YEARS = [
     ("2023-01-01", "2024-01-01"),

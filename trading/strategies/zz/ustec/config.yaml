@@ -1,0 +1,73 @@
+# USTEC Zone-to-Zone strategy — single source of truth
+# Loaded by both backtest.py and live_bot_zz.py.
+# Edit here; do NOT duplicate these values in Python files.
+
+symbol: USTECm          # Exness symbol name (live/demo MT5)
+db_name: ustech_ohlcv   # PostgreSQL database
+table: ustech_ohlcv     # OHLCV table
+contract_size: 100.0    # $100/pt/lot (Exness USTEC)
+
+# Execution
+spread_pts: 2.0         # applied at fill in paper mode; MT5 uses real fill
+fixed_lot: 0.05         # fixed lot size per trade
+risk_pct: 0.01          # 1% equity risk (used only with dynamic lot sizing)
+min_rr: 1.5
+min_sl_pct: 0.25        # skip trade if SL < 0.25% from entry (noise filter)
+max_positions: 2
+h4_window: 150
+m15_window: 80
+
+# Zone detection (fed to ZoneConfig)
+zone:
+  impulse_atr_mult: 2.0
+  body_ratio_min: 0.50
+  min_departure_candles: 2
+  departure_window: 6
+  base_lookback: 5
+  min_strength: 1.5
+  tap_tolerance_pct: 0.001
+
+# Timeframe (H4 bias + M15 entry)
+timeframe:
+  directional_filter: true
+  allow_neutral: true
+  h4_swing_left: 2
+  h4_swing_right: 2
+  prefer_fresh_h4: true
+  m15_tap_lookback: 20
+  require_m15_directional_close: true
+
+# Confirmations — all 5 signals active (no gold-style disabling)
+confirmations:
+  min_confirmations: 1
+  aggressive_boundary: false
+  active_signals: [engulfing, rejection_wick, bos_msb, structure_shift, choch]
+  engulf_full_body: true
+  wick_ratio_min: 0.60
+  body_ratio_max: 0.35
+  close_in_upper_half: true
+  bos_lookback: 15
+  bos_swing_n: 2
+  structure_lookback: 25
+  structure_swing_n: 2
+  choch_lookback: 20
+  choch_swing_left: 2
+  choch_swing_right: 2
+  choch_min_swings: 2
+
+# Trade setup
+trade_setup:
+  aggressive_entry: false
+  sl_buffer_pct: 0.002
+  sl_min_points: 0.0
+  midline_tp: false
+  midline_pct: 0.50
+  tp_prefer_fresh: true
+
+# Cooldown
+cooldown:
+  require_leave_and_return: true
+  cooldown_bars: 15            # ≈4h minimum floor after a win
+  cooldown_loss_h: 12          # hours to block zone after a loss (≈48 × M15 bars)
+  cooldown_win_floor_h: 3.75   # minimum hours after win before leave-and-return eligible
+  max_forward_bars: 350        # 350 × 15 min ≈ 87 h ≈ 4 trading days

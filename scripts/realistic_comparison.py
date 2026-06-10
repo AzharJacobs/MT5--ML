@@ -17,7 +17,7 @@ Run:
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backtest.engine_zones import run_backtest
+from trading.strategies.zz.ustec.engine import run_backtest
 
 YEARS = [("2023-01-01", "2024-01-01", "2023"),
          ("2024-01-01", "2025-01-01", "2024"),

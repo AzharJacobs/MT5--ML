@@ -22,9 +22,9 @@ if PROJECT_ROOT not in sys.path:
 
 import pandas as pd
 
-from backtest.engine_zones import run_backtest
-from strategy_v2.config_ZZ import GoldZZConfig
-from strategy_v2.engine_ZZ import run_backtest_gold
+from trading.strategies.zz.ustec.engine import run_backtest
+from trading.strategies.zz.xauusd.strategy import GoldZZConfig
+from trading.strategies.zz.xauusd.engine import run_backtest_gold
 
 YEARS = [
     ("2023-01-01", "2024-01-01", "2023"),
