@@ -224,7 +224,9 @@
       "Bash(sed 's/from execution\\\\.broker_interface/from trading.shared.broker_interface/g' execution/paper_trader.py)",
       "Bash(sed 's/from utils\\\\.db_writer/from trading.db/g' utils/trade_logger.py)",
       "Bash(git -C /Users/azhar.jacobs/Documents/MT5--ML status)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git -C /Users/azhar.jacobs/Documents/MT5--ML config user.email)",
+      "Bash(git -C /Users/azhar.jacobs/Documents/MT5--ML config user.name)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML",
