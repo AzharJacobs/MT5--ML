@@ -25,21 +25,13 @@ for H4 bias.  Step 3's higher_low/lower_high use a separate M15 mechanism.
 
 from __future__ import annotations
 
-import importlib.util
-import pathlib
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 
-# Load swing_structure_Z&Z.py via importlib (& is not a valid Python identifier)
-_zz_path = pathlib.Path(__file__).parent / "swing_structure_Z&Z.py"
-_zz_spec = importlib.util.spec_from_file_location("swing_structure_zz", _zz_path)
-_zz_mod  = importlib.util.module_from_spec(_zz_spec)
-_zz_spec.loader.exec_module(_zz_mod)
-_detect_swings_zz = _zz_mod.detect_swings
-_label_structure  = _zz_mod.label_structure
+from trading.strategies.zz.core.swing_structure import detect_swings as _detect_swings_zz, label_structure as _label_structure
 
 from trading.strategies.zz.core.zones import (
     Zone,
