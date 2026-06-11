@@ -4,7 +4,7 @@ USTEC Zone-to-Zone — multi-group backtest.
 
 Each signal fires a GROUP of 3 positions:
   Tier 1 : TP at 50% of range  |  normal SL
-  Tier 2 : TP at 100%          |  SL → breakeven when 50% hit; SL → 75% when 80% hit
+  Tier 2 : TP at 70% of range  |  SL → 30% mark when 50% hit
   Tier 3 : same as Tier 2
 
 Usage:
@@ -40,10 +40,7 @@ from trading.strategies.zz.ustec.strategy import (
 from trading.strategies.zz.core.timeframe_structure import analyse_timeframes
 from trading.strategies.zz.core.confirmations import check_confirmations_at_last_bar
 from trading.strategies.zz.core.trade_setup import setup_from_analysis
-from trading.strategies.zz.core.zones import ZoneConfig, detect_zones
 from trading.shared.data_loader import get_connection
-
-H1_WINDOW = 100
 
 
 def _load_ohlcv(db, table: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
@@ -71,8 +68,6 @@ def run_multi_backtest(
     max_groups: int = 1,
     lot: float = 0.04,
     spread: float = SPREAD_PTS,
-    zone_max_losses: int = 0,
-    use_h1_confirm: bool = False,
 ) -> None:
     tf_cfg, conf_cfg, setup_cfg = make_configs()
     COOLDOWN_LOSS_BARS = int(COOLDOWN_LOSS_H * 4)
@@ -88,14 +83,11 @@ def run_multi_backtest(
     print(f"  Spread        : {spread} pts  |  Contract size: ${CONTRACT_SIZE}/pt/lot")
     print(f"  Tier 1        : TP @ 50% of range, normal SL")
     print(f"  Tier 2 & 3    : TP @ 70% of range, SL → 30% mark when 50% hit")
-    print(f"  Zone max losses : {zone_max_losses if zone_max_losses > 0 else 'disabled'}")
-    print(f"  1H zone confirm : {'on' if use_h1_confirm else 'off'}")
     print(f"{'='*70}")
 
     print("\nLoading data ...")
     df_15m = _load_ohlcv(db, "ustech_ohlcv", "15min", start, end)
     df_4h  = _load_ohlcv(db, "ustech_ohlcv", "4H",    start, end)
-    df_1h  = _load_ohlcv(db, "ustech_ohlcv", "1H",    start, end) if use_h1_confirm else pd.DataFrame()
 
     try:
         db.connection.close()
@@ -104,10 +96,6 @@ def run_multi_backtest(
 
     if df_15m.empty or df_4h.empty:
         print("ERROR: no data returned — check DB and date range.")
-        return
-
-    if use_h1_confirm and df_1h.empty:
-        print("ERROR: 1H data not available.")
         return
 
     _ohlcv = ["open", "high", "low", "close"]
@@ -124,23 +112,10 @@ def run_multi_backtest(
     open_positions:     list[dict] = []
     closed_trades:      list[dict] = []
 
-    zone_cooldown:      dict = {}
-    zone_reentry:       dict = {}
-    zone_consec_losses: dict = {}
-    zone_blacklist:     set  = set()
-    daily_pnl:          dict = {}
-    pending_groups:     dict = {}   # group_id → {zone info, outcomes, trail_states}
-    group_counter:      int  = 0
-
-    _h1_zone_cfg = ZoneConfig(
-        impulse_atr_mult=1.5,
-        body_ratio_min=0.40,
-        min_departure_candles=2,
-        departure_window=6,
-        base_lookback=5,
-        min_strength=1.0,
-        tap_tolerance_pct=0.001,
-    )
+    zone_cooldown:  dict = {}
+    zone_reentry:   dict = {}
+    pending_groups: dict = {}   # group_id → {zone info, outcomes, trail_states}
+    group_counter:  int  = 0
 
     for i in range(warmup, n - 1):
         ts_now = df_15m["timestamp"].iloc[i]
@@ -221,9 +196,6 @@ def run_multi_backtest(
                 })
                 closed_trades.append(pos)
 
-                exit_day = ts_now.date()
-                daily_pnl[exit_day] = daily_pnl.get(exit_day, 0.0) + pnl
-
                 # Accumulate group completion state
                 gid = pos["group_id"]
                 if gid not in pending_groups:
@@ -248,7 +220,6 @@ def run_multi_backtest(
 
                     if any_win or any_trailed:
                         # Trade went in our direction — leave-and-return
-                        zone_consec_losses[zk] = 0
                         zone_reentry[zk] = {
                             "phase":            "exit",
                             "bottom":           pending_groups[gid]["zone_bottom"],
@@ -258,11 +229,6 @@ def run_multi_backtest(
                     else:
                         # All 3 hit original SL — genuine bad trade
                         zone_cooldown[zk] = i + COOLDOWN_LOSS_BARS
-                        if zone_max_losses > 0:
-                            new_count = zone_consec_losses.get(zk, 0) + 1
-                            zone_consec_losses[zk] = new_count
-                            if new_count >= zone_max_losses:
-                                zone_blacklist.add(zk)
                     del pending_groups[gid]
             else:
                 still_open.append(pos)
@@ -290,27 +256,12 @@ def run_multi_backtest(
         direction   = tf_result["direction"]
         zk          = _zone_key(active_zone)
 
-        if zone_max_losses > 0 and zk in zone_blacklist:
-            continue
         if zone_cooldown.get(zk, -1) >= i:
             continue
         if zk in zone_reentry:
             continue
         if zk in {p["zone_key"] for p in open_positions}:
             continue
-
-        if use_h1_confirm:
-            df_1h_w = df_1h[df_1h["timestamp"] <= ts_now].tail(H1_WINDOW).reset_index(drop=True)
-            h1_zones = detect_zones(df_1h_w, cfg=_h1_zone_cfg)
-            needed_kind = "demand" if direction == "buy" else "supply"
-            h1_match = any(
-                z.kind == needed_kind
-                and z.bottom <= active_zone.top
-                and z.top    >= active_zone.bottom
-                for z in h1_zones
-            )
-            if not h1_match:
-                continue
 
         conf = check_confirmations_at_last_bar(df_15m_w, active_zone, direction, conf_cfg)
         if not conf.confirmed:
@@ -441,13 +392,6 @@ def run_multi_backtest(
     print(f"  Losers total     : ${losers_pnl:+,.2f}")
     print(f"  Avg winning grp  : ${avg_win:+,.2f}")
     print(f"  Avg losing grp   : ${avg_loss:+,.2f}")
-    print(f"  Zones blacklisted: {len(zone_blacklist)}")
-
-    if daily_pnl:
-        worst_day, worst_day_pnl = min(daily_pnl.items(), key=lambda x: x[1])
-        best_day,  best_day_pnl  = max(daily_pnl.items(), key=lambda x: x[1])
-        print(f"  Worst single day : {worst_day}  ${worst_day_pnl:+,.2f}")
-        print(f"  Best  single day : {best_day}   ${best_day_pnl:+,.2f}")
     print()
 
     # ── Monthly breakdown ─────────────────────────────────────────────────────
@@ -522,10 +466,8 @@ def main() -> None:
     parser.add_argument("--end",            default="2026-06-10")
     parser.add_argument("--max_groups",     type=int,   default=1,
                         help="Max concurrent signal groups (each group = 3 positions)")
-    parser.add_argument("--lot",            type=float, default=0.04)
-    parser.add_argument("--spread",         type=float, default=SPREAD_PTS)
-    parser.add_argument("--zone_max_losses",type=int,   default=0)
-    parser.add_argument("--h1_confirm",     action="store_true")
+    parser.add_argument("--lot",    type=float, default=0.04)
+    parser.add_argument("--spread", type=float, default=SPREAD_PTS)
     args = parser.parse_args()
 
     run_multi_backtest(
@@ -534,8 +476,6 @@ def main() -> None:
         max_groups=args.max_groups,
         lot=args.lot,
         spread=args.spread,
-        zone_max_losses=args.zone_max_losses,
-        use_h1_confirm=args.h1_confirm,
     )
 
 
