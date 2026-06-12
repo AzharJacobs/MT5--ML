@@ -121,6 +121,7 @@ def run_backtest(
     margin_rate: float = 0.01,
     margin_call_pct: float = 0.60,
     save_path: Optional[str] = None,
+    zone_guard: bool = True,
     chart: bool = False,
 ) -> dict:
     sym = symbol.lower()
@@ -303,10 +304,24 @@ def run_backtest(
             filters["setup_invalid"] += 1
             continue
 
-        entry = float(df_15m["open"].iloc[i + 1])
+        raw_open = float(df_15m["open"].iloc[i + 1])
+        entry    = raw_open
         bar_spread = _dynamic_spread(ts_now, base_spread_pts) if realistic else eff_spread
         if bar_spread > 0:
             entry = entry + bar_spread if direction == "buy" else entry - bar_spread
+
+        # Skip if the fill bar opened outside the zone boundary.
+        # 0.2% tolerance absorbs normal spread without being loose enough to
+        # allow genuine gap-outside entries.  Pass zone_guard=False to bypass
+        # (used only by the outside-zone diagnostic script).
+        if zone_guard:
+            _gap_tol = 0.002
+            if direction == "buy" and entry > active_zone.top * (1 + _gap_tol):
+                filters["setup_invalid"] += 1
+                continue
+            if direction == "sell" and entry < active_zone.bottom * (1 - _gap_tol):
+                filters["setup_invalid"] += 1
+                continue
 
         sl_dist = abs(signal_price - setup.sl)
         sl = entry - sl_dist if direction == "buy" else entry + sl_dist
@@ -340,11 +355,11 @@ def run_backtest(
                 filters["margin_call"] += 1
                 continue
 
-        outcome        = 0
-        exit_price     = entry
-        exit_bar       = i + max_forward_bars
-        max_favourable = 0.0
-        max_adverse    = 0.0
+        outcome         = 0
+        exit_price      = entry
+        exit_bar        = i + max_forward_bars
+        max_favourable  = 0.0
+        max_adverse     = 0.0
 
         if realistic and lot * contract_size > 0:
             price_to_zero      = equity / (lot * contract_size)
@@ -454,7 +469,9 @@ def run_backtest(
             "zone_top":      active_zone.top,
             "zone_strength": active_zone.strength,
             "zone_kind":     active_zone.kind,
-            "structure":     {"zone": (active_zone.bottom, active_zone.top)},
+            "structure":       {"zone": (active_zone.bottom, active_zone.top)},
+            "signal_close":    signal_price,
+            "raw_open":        raw_open,
         })
 
     if not trades:

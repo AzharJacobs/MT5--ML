@@ -259,7 +259,16 @@
       "Bash(python -X utf8 trading/strategies/zz/ustec/backtest_multi.py --start 2024-01-01 --end 2024-12-31 --max_groups 1 --lot 0.04)",
       "Bash(python -X utf8 trading/strategies/zz/ustec/backtest_multi.py --start 2025-01-01 --end 2025-12-31 --max_groups 1 --lot 0.04)",
       "Bash(python -X utf8 trading/strategies/zz/ustec/backtest_multi.py --start 2026-01-01 --end 2026-06-10 --max_groups 1 --lot 0.04)",
-      "Bash(python -X utf8 trading/strategies/zz/ustec/analysis_regime.py --start 2023-01-01 --end 2026-06-10 --lot 0.04)"
+      "Bash(python -X utf8 trading/strategies/zz/ustec/analysis_regime.py --start 2023-01-01 --end 2026-06-10 --lot 0.04)",
+      "Bash(python -X utf8 scripts/backtest_zz_2023_2025_detailed.py)",
+      "Bash(python -X utf8 scripts/backtest_be_analysis.py)",
+      "Bash(python -X utf8 scripts/diagnose_outside_zone.py)",
+      "Bash(Get-Content \"C:\\\\Users\\\\AZHARJ~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\f--MT5--ML\\\\272e777a-596a-467c-9731-0358318f05e5\\\\tasks\\\\bk687fb3u.output\")",
+      "Bash(python -X utf8 -u scripts/backtest_be_analysis.py)",
+      "Bash(python -X utf8 -u scripts/backtest_reentry_analysis.py)",
+      "Bash(python -X utf8 -u scripts/diagnose_outside_zone.py)",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\AZHARJ~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\f--MT5--ML\\\\272e777a-596a-467c-9731-0358318f05e5\\\\tasks\\\\b9juwlg5t.output\" -Raw | Select-String -Pattern \"ENTRY-OUTSIDE|ROOT CAUSE|CODE FIX|Retroactive|FIXED ENGINE|Post-hoc\" -SimpleMatch -Context 0,50 | ForEach-Object { $_.Line; $_.Context.PostContext } | Select-Object -First 300)",
+      "Bash(python -X utf8 scripts/monthly_equity_curve.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML",
