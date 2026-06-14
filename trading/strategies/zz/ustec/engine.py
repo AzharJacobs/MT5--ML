@@ -274,6 +274,18 @@ def run_backtest(
             filters["conf_failed"] += 1
             continue
 
+        # Close-containment: signal bar (bar i) must close inside the zone.
+        # Catches Pattern A — bars that wicked into the zone but closed outside.
+        # zone_guard below handles Pattern B (genuine between-bar session gaps).
+        _sig_close = float(df_15m_w["close"].iloc[-1])
+        _close_tol = 0.001
+        if direction == "buy"  and _sig_close > active_zone.top    * (1 + _close_tol):
+            filters["conf_failed"] += 1
+            continue
+        if direction == "sell" and _sig_close < active_zone.bottom * (1 - _close_tol):
+            filters["conf_failed"] += 1
+            continue
+
         zk = _zone_key(active_zone)
         if zone_cooldown.get(zk, -1) >= i:
             filters["zone_cooldown"] += 1

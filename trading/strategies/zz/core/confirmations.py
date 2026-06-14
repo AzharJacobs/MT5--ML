@@ -567,9 +567,15 @@ def check_all_confirmations(
     """
     Evaluate all four confirmations for the given direction at bar `idx`.
 
-    Precondition enforced here (not in individual functions):
-      The bar at idx must overlap the H4 zone (high/low range touches zone).
-      If not, all confirmations return False and confirmed=False.
+    Preconditions enforced here (not in individual functions):
+      1. The bar at idx must overlap the H4 zone (high/low range touches zone).
+         If not, all confirmations return False and confirmed=False.
+      2. The signal bar's close must be inside the zone (with tolerance).
+         Buy: close must be <= zone.top * (1 + tol).
+         Sell: close must be >= zone.bottom * (1 - tol).
+         If not, price exited the zone on the signal bar; confirmed=False is
+         returned with price_in_zone=True so callers can distinguish the two
+         failure modes in logs.
 
     Parameters
     ----------
@@ -606,6 +612,24 @@ def check_all_confirmations(
 
     if not in_zone:
         return _false
+
+    # ── Close-containment gate ───────────────────────────────────────────────
+    # Catch the case where the bar range touched the zone but the close has
+    # already exited: the fill on the next bar would be geometrically outside,
+    # producing an invalid SL distance.  Overnight gaps are still caught by
+    # zone_guard at fill time (signal close was valid; gap happened between bars).
+    bar_c = float(df_m15["close"].iloc[idx])
+    close_left_zone = (
+        (direction == "buy"  and bar_c > zone.top    * (1 + cfg.zone_tolerance_pct)) or
+        (direction == "sell" and bar_c < zone.bottom * (1 - cfg.zone_tolerance_pct))
+    )
+    if close_left_zone:
+        return ConfirmationResult(
+            direction=direction, price_in_zone=True,
+            engulfing=False, rejection_wick=False,
+            bos_msb=False, structure_shift=False, choch=False,
+            count=0, signals=[], confirmed=False,
+        )
 
     # ── Fire each confirmation independently (Step 2 pre-filter not included) ──
     if direction == "buy":
