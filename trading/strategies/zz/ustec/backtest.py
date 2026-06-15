@@ -49,12 +49,16 @@ def main() -> None:
     parser.add_argument("--exclude_signals", default="",
                         help="Comma-separated signal names to exclude from count")
     parser.add_argument("--zone_max_losses", type=int, default=0)
+    parser.add_argument("--dir_max_losses",   type=int, default=0)
+    parser.add_argument("--dir_cooldown",     type=int, default=48)
+    parser.add_argument("--h4_regime_filter", action="store_true")
+    parser.add_argument("--n_consec_ll",      type=int, default=2)
     # Step 4
     parser.add_argument("--aggressive_entry", action="store_true")
     parser.add_argument("--midline_tp",  action="store_true")
     parser.add_argument("--midline_pct", type=float, default=0.50)
     parser.add_argument("--sl_buffer",   type=float, default=0.002)
-    parser.add_argument("--min_sl_pct",  type=float, default=0.25)
+    parser.add_argument("--min_sl_pct",  type=float, default=0.10)
     # Cooldown
     parser.add_argument("--no_leave_return", action="store_true")
     parser.add_argument("--cooldown_bars",   type=int, default=15)
@@ -88,6 +92,10 @@ def main() -> None:
         require_leave_and_return=not args.no_leave_return,
         cooldown_bars=args.cooldown_bars,
         zone_max_losses=args.zone_max_losses,
+        dir_max_losses=args.dir_max_losses,
+        dir_cooldown_bars=args.dir_cooldown,
+        h4_regime_filter=args.h4_regime_filter,
+        n_consec_ll=args.n_consec_ll,
         min_sl_pct=args.min_sl_pct,
         realistic=args.realistic,
         save_path=args.save,

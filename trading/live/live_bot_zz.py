@@ -58,6 +58,7 @@ from trading.strategies.zz.ustec.strategy import (
 from trading.strategies.zz.core.timeframe_structure import analyse_timeframes
 from trading.strategies.zz.core.confirmations import check_confirmations_at_last_bar
 from trading.strategies.zz.core.trade_setup import setup_from_analysis
+from trading.strategies.zz.core.swing_structure import detect_swings as _detect_swings_m15
 
 # ── Infrastructure ─────────────────────────────────────────────────────────────
 from trading.shared.data_loader import get_connection
@@ -430,10 +431,33 @@ class ZZLiveBot:
             return
 
         signal_price = float(df_15m_w["close"].iloc[-1])
+        log.info("Confirmation passed (count=%d signals=%s signal_price=%.2f)",
+                 conf.count, conf.signals, signal_price)
+
+        # Change 3: zone exhausted — signal bar closed above demand top (buy) or below supply bottom (sell)
+        if direction == "buy" and signal_price > active_zone.top * 1.001:
+            self.zlog.log_skip(now, "zone_exhausted", tf_result)
+            log.info("Zone exhausted — price %.2f above demand top %.2f", signal_price, active_zone.top)
+            return
+        if direction == "sell" and signal_price < active_zone.bottom * 0.999:
+            self.zlog.log_skip(now, "zone_exhausted", tf_result)
+            log.info("Zone exhausted — price %.2f below supply bottom %.2f", signal_price, active_zone.bottom)
+            return
+
         setup = setup_from_analysis(tf_result, signal_price, self.setup_cfg)
         if not setup.valid:
             self.zlog.log_skip(now, f"setup_invalid: {setup.reason}", tf_result)
             log.info("Setup invalid: %s", setup.reason)
+            return
+
+        # Change 4: TP headroom — require at least 30 pts of reward vs current price
+        if direction == "buy" and setup.tp < signal_price + 30.0:
+            self.zlog.log_skip(now, "tp_too_close", tf_result)
+            log.info("TP too close — tp=%.2f signal=%.2f headroom=%.1f pts", setup.tp, signal_price, setup.tp - signal_price)
+            return
+        if direction == "sell" and setup.tp > signal_price - 30.0:
+            self.zlog.log_skip(now, "tp_too_close", tf_result)
+            log.info("TP too close — tp=%.2f signal=%.2f headroom=%.1f pts", setup.tp, signal_price, signal_price - setup.tp)
             return
 
         self._enter_trade(
@@ -445,9 +469,10 @@ class ZZLiveBot:
             zid=zid,
             tf_result=tf_result,
             conf=conf,
+            df_15m_w=df_15m_w,
         )
 
-    def _enter_trade(self, now, direction, setup, active_zone, zk, zid, tf_result, conf) -> None:
+    def _enter_trade(self, now, direction, setup, active_zone, zk, zid, tf_result, conf, df_15m_w=None) -> None:
         signal_price = setup.entry
         entry = setup.entry
         sl    = setup.sl
@@ -459,6 +484,22 @@ class ZZLiveBot:
         sl_dist = abs(setup.entry - sl)
         sl = (entry - sl_dist) if direction == "buy" else (entry + sl_dist)
 
+        # Change 1: structural SL — tighten to nearest M15 swing point inside zone
+        if df_15m_w is not None:
+            _m15_sw = _detect_swings_m15(df_15m_w, left=3, right=2)
+            if direction == "buy":
+                _sw_lows = [p for _, p, k in _m15_sw if k == "L" and sl < p < entry]
+                if _sw_lows:
+                    _cand = max(_sw_lows) * (1.0 - 0.001)
+                    if sl < _cand < entry:
+                        sl = _cand
+            else:
+                _sw_highs = [p for _, p, k in _m15_sw if k == "H" and entry < p < sl]
+                if _sw_highs:
+                    _cand = min(_sw_highs) * (1.0 + 0.001)
+                    if entry < _cand < sl:
+                        sl = _cand
+
         if direction == "buy" and (sl >= entry or tp <= entry):
             log.warning("Geometry invalid after spread adjust — skip")
             return
@@ -467,6 +508,9 @@ class ZZLiveBot:
             return
 
         sl_dist_pct = abs(entry - sl) / entry * 100.0
+        _rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
+        log.info("Geometry: entry=%.2f sl=%.2f tp=%.2f rr=%.2f sl_pct=%.3f%%",
+                 entry, sl, tp, _rr, sl_dist_pct)
         if sl_dist_pct < MIN_SL_PCT:
             log.info("SL too tight (%.3f%% < %.2f%%) — skip", sl_dist_pct, MIN_SL_PCT)
             return

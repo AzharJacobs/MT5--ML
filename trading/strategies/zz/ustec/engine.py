@@ -20,6 +20,10 @@ import pandas as pd
 from trading.strategies.zz.core.zones import ZoneConfig
 from trading.strategies.zz.core.timeframe_structure import TFConfig, analyse_timeframes
 from trading.strategies.zz.core.confirmations import ConfirmationConfig, check_confirmations_at_last_bar
+from trading.strategies.zz.core.swing_structure import (
+    detect_swings as _detect_swings_h4,
+    label_structure as _label_structure_h4,
+)
 from trading.strategies.zz.core.trade_setup import TradeSetupConfig, setup_from_analysis
 from trading.shared.backtest.report import print_report, save_report
 from trading.shared.backtest.chart import plot_trades
@@ -86,6 +90,27 @@ def _lot_size(equity: float, sl_dist: float, contract_size: float) -> float:
     return max(round(lot, 2), 0.01)
 
 
+def _h4_bearish_regime(
+    df_h4: pd.DataFrame,
+    n_consec_ll: int = 2,
+    swing_left: int = 2,
+    swing_right: int = 2,
+) -> bool:
+    """
+    True when the last n_consec_ll confirmed H4 swing lows are all Lower Lows,
+    indicating a sustained bearish structural regime.  No lookahead beyond df_h4.
+    swing_right bars of confirmation lag is inherent and expected.
+    """
+    if len(df_h4) < swing_left + swing_right + 2:
+        return False
+    swings  = _detect_swings_h4(df_h4, left=swing_left, right=swing_right)
+    labeled = _label_structure_h4(swings)
+    sl_seq  = [lbl for _, _, lbl in labeled if lbl in ("HL", "LL")]
+    if len(sl_seq) < n_consec_ll:
+        return False
+    return all(lbl == "LL" for lbl in sl_seq[-n_consec_ll:])
+
+
 # ── Main backtest ─────────────────────────────────────────────────────────────
 
 def run_backtest(
@@ -111,6 +136,10 @@ def run_backtest(
     require_leave_and_return: bool = True,
     cooldown_bars: int = 15,
     zone_max_losses: int = 0,
+    dir_max_losses: int = 0,
+    dir_cooldown_bars: int = 48,
+    h4_regime_filter: bool = False,
+    n_consec_ll: int = 2,
     min_sl_pct: float = 0.0,
     realistic: bool = False,
     contract_size_override: Optional[float] = None,
@@ -210,6 +239,8 @@ def run_backtest(
     zone_outcome_history: dict = {}
     zone_consec_losses:   dict = {}
     zone_blacklist:       set  = set()
+    dir_consec_losses: dict = {"buy": 0, "sell": 0}
+    dir_cooldown:      dict = {"buy": None, "sell": None}
     stopout_occurred:     bool = False
     total_swap_pnl:       float = 0.0
     total_slippage:       float = 0.0
@@ -223,6 +254,8 @@ def run_backtest(
         "setup_invalid": 0,
         "zone_cooldown": 0,
         "zone_blacklist": 0,
+        "dir_breaker":   0,
+        "regime_filter": 0,
         "sl_too_tight":  0,
         "margin_call":   0,
     }
@@ -269,6 +302,22 @@ def run_backtest(
 
         active_zone = tf_result["active_zone"]
         direction   = tf_result["direction"]
+
+        if h4_regime_filter and direction == "buy":
+            if _h4_bearish_regime(df_h4_w, n_consec_ll, h4_swing_left, h4_swing_right):
+                filters["regime_filter"] += 1
+                continue
+
+        if dir_max_losses > 0:
+            _dcd = dir_cooldown[direction]
+            if _dcd is not None:
+                if i >= _dcd:
+                    dir_cooldown[direction] = None
+                    dir_consec_losses[direction] = 0
+                else:
+                    filters["dir_breaker"] += 1
+                    continue
+
         conf = check_confirmations_at_last_bar(df_15m_w, active_zone, direction, conf_cfg)
         if not conf.confirmed:
             filters["conf_failed"] += 1
@@ -316,6 +365,14 @@ def run_backtest(
             filters["setup_invalid"] += 1
             continue
 
+        # Change 4: TP headroom — require at least 30 pts of reward vs current price
+        if direction == "buy" and setup.tp < signal_price + 30.0:
+            filters["setup_invalid"] += 1
+            continue
+        if direction == "sell" and setup.tp > signal_price - 30.0:
+            filters["setup_invalid"] += 1
+            continue
+
         raw_open = float(df_15m["open"].iloc[i + 1])
         entry    = raw_open
         bar_spread = _dynamic_spread(ts_now, base_spread_pts) if realistic else eff_spread
@@ -337,6 +394,21 @@ def run_backtest(
 
         sl_dist = abs(signal_price - setup.sl)
         sl = entry - sl_dist if direction == "buy" else entry + sl_dist
+
+        # Change 1: structural SL — tighten to nearest M15 swing point inside zone
+        _m15_sw = _detect_swings_h4(df_15m_w, left=3, right=2)
+        if direction == "buy":
+            _sw_lows = [p for _, p, k in _m15_sw if k == "L" and sl < p < entry]
+            if _sw_lows:
+                _cand = max(_sw_lows) * (1.0 - 0.001)
+                if sl < _cand < entry:
+                    sl = _cand
+        else:
+            _sw_highs = [p for _, p, k in _m15_sw if k == "H" and entry < p < sl]
+            if _sw_highs:
+                _cand = min(_sw_highs) * (1.0 + 0.001)
+                if entry < _cand < sl:
+                    sl = _cand
 
         if setup.tp_mode == "midline" and setup.tp_zone is not None:
             full_tp = (setup.tp_zone.bottom if direction == "buy" else setup.tp_zone.top)
@@ -436,6 +508,9 @@ def run_backtest(
         if outcome == 1:
             won_zones.add(zk)
             zone_consec_losses[zid] = 0
+            if dir_max_losses > 0:
+                dir_consec_losses[direction] = 0
+                dir_cooldown[direction] = None
             if require_leave_and_return:
                 zone_reentry[zk] = {
                     "phase":            "exit",
@@ -452,6 +527,11 @@ def run_backtest(
                 zone_consec_losses[zid] = new_count
                 if new_count >= zone_max_losses:
                     zone_blacklist.add(zid)
+            if dir_max_losses > 0:
+                new_dir = dir_consec_losses[direction] + 1
+                dir_consec_losses[direction] = new_dir
+                if new_dir >= dir_max_losses:
+                    dir_cooldown[direction] = exit_bar + dir_cooldown_bars
         else:
             zone_consec_losses[zid] = 0
 
@@ -539,6 +619,10 @@ def run_backtest(
         "excluded_from_count": ",".join(excluded_from_count) if excluded_from_count else "none",
         "zone_max_losses":     zone_max_losses if zone_max_losses > 0 else "disabled",
         "zones_blacklisted":   len(zone_blacklist),
+        "dir_max_losses":      dir_max_losses if dir_max_losses > 0 else "disabled",
+        "dir_cooldown_bars":   dir_cooldown_bars if dir_max_losses > 0 else "n/a",
+        "h4_regime_filter":    h4_regime_filter,
+        "n_consec_ll":         n_consec_ll if h4_regime_filter else "n/a",
         "min_sl_pct":          min_sl_pct if min_sl_pct > 0 else "disabled",
         "realistic_mode":      realistic,
         "contract_size":       contract_size,
@@ -628,6 +712,10 @@ def main() -> None:
     parser.add_argument("--aggressive_boundary", action="store_true")
     parser.add_argument("--exclude_signals", default="")
     parser.add_argument("--zone_max_losses", type=int, default=0)
+    parser.add_argument("--dir_max_losses",   type=int, default=0)
+    parser.add_argument("--dir_cooldown",     type=int, default=48)
+    parser.add_argument("--h4_regime_filter", action="store_true")
+    parser.add_argument("--n_consec_ll",      type=int, default=2)
     parser.add_argument("--aggressive_entry", action="store_true")
     parser.add_argument("--midline_tp",  action="store_true")
     parser.add_argument("--midline_pct", type=float, default=0.50)
@@ -664,6 +752,10 @@ def main() -> None:
         require_leave_and_return=not args.no_leave_return,
         cooldown_bars=args.cooldown_bars,
         zone_max_losses=args.zone_max_losses,
+        dir_max_losses=args.dir_max_losses,
+        dir_cooldown_bars=args.dir_cooldown,
+        h4_regime_filter=args.h4_regime_filter,
+        n_consec_ll=args.n_consec_ll,
         min_sl_pct=args.min_sl_pct,
         realistic=args.realistic,
         save_path=args.save,

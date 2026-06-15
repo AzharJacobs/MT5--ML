@@ -1,0 +1,1 @@
+[OK] Connected to PostgreSQL database: ustech_ohlcv

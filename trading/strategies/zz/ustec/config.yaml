@@ -12,7 +12,7 @@ spread_pts: 2.0         # applied at fill in paper mode; MT5 uses real fill
 fixed_lot: 0.05         # fixed lot size per trade
 risk_pct: 0.01          # 1% equity risk (used only with dynamic lot sizing)
 min_rr: 1.5
-min_sl_pct: 0.25        # skip trade if SL < 0.25% from entry (noise filter)
+min_sl_pct: 0.10        # skip trade if SL < 0.10% from entry (noise filter)
 max_positions: 2
 h4_window: 150
 m15_window: 80
