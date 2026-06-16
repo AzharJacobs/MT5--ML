@@ -29,6 +29,12 @@ from trading.shared.backtest.report import print_report, save_report
 from trading.shared.backtest.chart import plot_trades
 from trading.shared.data_loader import get_connection
 
+# Pull USTEC config defaults so run_backtest() parameters match config.yaml out-of-the-box
+from trading.strategies.zz.ustec.strategy import (
+    ZONE_MAX_LOSSES as _CFG_ZONE_MAX_LOSSES,
+    MAX_SL_PCT      as _CFG_MAX_SL_PCT,
+)
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -135,12 +141,13 @@ def run_backtest(
     fixed_lot: float = 0.0,
     require_leave_and_return: bool = True,
     cooldown_bars: int = 15,
-    zone_max_losses: int = 0,
+    zone_max_losses: int = _CFG_ZONE_MAX_LOSSES,
     dir_max_losses: int = 0,
     dir_cooldown_bars: int = 48,
     h4_regime_filter: bool = False,
     n_consec_ll: int = 2,
     min_sl_pct: float = 0.0,
+    max_sl_pct: float = _CFG_MAX_SL_PCT,
     realistic: bool = False,
     contract_size_override: Optional[float] = None,
     base_spread_pts: float = 4.0,
@@ -257,6 +264,7 @@ def run_backtest(
         "dir_breaker":   0,
         "regime_filter": 0,
         "sl_too_tight":  0,
+        "sl_too_wide":   0,
         "margin_call":   0,
     }
 
@@ -429,6 +437,12 @@ def run_backtest(
             sl_dist_pct = abs(entry - sl) / entry * 100.0
             if sl_dist_pct < min_sl_pct:
                 filters["sl_too_tight"] += 1
+                continue
+
+        if max_sl_pct > 0.0:
+            _sl_pct = abs(entry - sl) / entry * 100.0
+            if _sl_pct > max_sl_pct:
+                filters["sl_too_wide"] += 1
                 continue
 
         lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size)

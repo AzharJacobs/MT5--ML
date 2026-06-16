@@ -41,6 +41,7 @@ FIXED_LOTS           = float(_cfg["fixed_lot"])
 RISK_PCT             = float(_cfg["risk_pct"])
 MIN_RR               = float(_cfg["min_rr"])
 MIN_SL_PCT           = float(_cfg.get("min_sl_pct", 0.0))
+MAX_SL_PCT           = float(_cfg.get("max_sl_pct", 0.0))
 MAX_POSITIONS        = int(_cfg["max_positions"])
 H4_WINDOW            = int(_cfg["h4_window"])
 M15_WINDOW           = int(_cfg["m15_window"])
@@ -50,6 +51,7 @@ COOLDOWN_BARS        = int(_cool["cooldown_bars"])
 COOLDOWN_LOSS_H      = float(_cool["cooldown_loss_h"])
 COOLDOWN_WIN_FLOOR_H = float(_cool["cooldown_win_floor_h"])
 MAX_FORWARD_BARS     = int(_cool["max_forward_bars"])
+ZONE_MAX_LOSSES      = int(_cool.get("zone_max_losses", 0))
 
 TAP_TOL              = float(_cfg["zone"]["tap_tolerance_pct"])
 
@@ -88,6 +90,7 @@ def make_configs() -> tuple[TFConfig, ConfirmationConfig, TradeSetupConfig]:
     )
     conf_cfg = ConfirmationConfig(
         min_confirmations=int(_c["min_confirmations"]),
+        excluded_from_count=list(_c.get("excluded_from_count", [])),
         aggressive_boundary=bool(_c.get("aggressive_boundary", False)),
         engulf_full_body=bool(_c.get("engulf_full_body", True)),
         wick_ratio_min=float(_c.get("wick_ratio_min", 0.60)),

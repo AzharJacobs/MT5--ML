@@ -48,9 +48,10 @@ load_dotenv(_PROJECT_ROOT / ".env")
 # ── All symbol constants + config factory from the single source of truth ─────
 from trading.strategies.zz.ustec.strategy import (
     SYMBOL, DB_NAME, TABLE, CONTRACT_SIZE,
-    SPREAD_PTS, FIXED_LOTS, RISK_PCT, MIN_RR, MIN_SL_PCT,
+    SPREAD_PTS, FIXED_LOTS, RISK_PCT, MIN_RR, MIN_SL_PCT, MAX_SL_PCT,
     MAX_POSITIONS, H4_WINDOW, M15_WINDOW,
     COOLDOWN_LOSS_H, COOLDOWN_WIN_FLOOR_H, TAP_TOL,
+    ZONE_MAX_LOSSES,
     make_configs,
 )
 
@@ -260,6 +261,8 @@ class ZZLiveBot:
         self.zone_reentry:  dict = {}
         self.won_zones:     set  = set()
         self.zone_outcome_history: dict = {}
+        self.zone_blacklist:       set  = set()   # Change 1: permanent post-loss blacklist
+        self.zone_consec_losses:   dict = {}      # Change 1: consecutive SL count per zone_id
 
         self.open_positions: list = []
 
@@ -422,6 +425,11 @@ class ZZLiveBot:
             log.info("Zone %s blocked (cooldown)", zk)
             return
 
+        if ZONE_MAX_LOSSES > 0 and zid in self.zone_blacklist:
+            self.zlog.log_skip(now, "zone_blacklisted", tf_result)
+            log.info("Zone %s permanently blacklisted — skipping", zid)
+            return
+
         conf = check_confirmations_at_last_bar(
             df_15m_w, active_zone, direction, self.conf_cfg
         )
@@ -513,6 +521,10 @@ class ZZLiveBot:
                  entry, sl, tp, _rr, sl_dist_pct)
         if sl_dist_pct < MIN_SL_PCT:
             log.info("SL too tight (%.3f%% < %.2f%%) — skip", sl_dist_pct, MIN_SL_PCT)
+            return
+
+        if MAX_SL_PCT > 0.0 and sl_dist_pct > MAX_SL_PCT:
+            log.info("SL too wide (%.3f%% > %.2f%%) — skip", sl_dist_pct, MAX_SL_PCT)
             return
 
         if self.mode == "mt5":
@@ -663,6 +675,8 @@ class ZZLiveBot:
 
         if outcome == 1:
             self.won_zones.add(zk)
+            if ZONE_MAX_LOSSES > 0:
+                self.zone_consec_losses[zid] = 0
             earliest = now + timedelta(hours=COOLDOWN_WIN_FLOOR_H)
             self.zone_reentry[zk] = {
                 "phase":    "exit",
@@ -675,6 +689,15 @@ class ZZLiveBot:
             until = now + timedelta(hours=COOLDOWN_LOSS_H)
             self.zone_cooldown[zk] = until
             log.info("LOSS — zone %s blocked until %s", zk, until.strftime("%H:%M UTC"))
+            if ZONE_MAX_LOSSES > 0:
+                new_count = self.zone_consec_losses.get(zid, 0) + 1
+                self.zone_consec_losses[zid] = new_count
+                if new_count >= ZONE_MAX_LOSSES:
+                    self.zone_blacklist.add(zid)
+                    log.info(
+                        "Zone %s blacklisted after %d consecutive SL hits",
+                        zid, new_count,
+                    )
 
         record = {**pos["record"]}
         record["outcome"]     = outcome

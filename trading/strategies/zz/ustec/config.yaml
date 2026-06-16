@@ -12,7 +12,8 @@ spread_pts: 2.0         # applied at fill in paper mode; MT5 uses real fill
 fixed_lot: 0.05         # fixed lot size per trade
 risk_pct: 0.01          # 1% equity risk (used only with dynamic lot sizing)
 min_rr: 1.5
-min_sl_pct: 0.10        # skip trade if SL < 0.10% from entry (noise filter)
+min_sl_pct: 0.10        # skip trade if SL distance < 0.10% of entry (noise filter)
+max_sl_pct: 0.50        # skip trade if SL distance > 0.50% of entry (blow-up guard)
 max_positions: 2
 h4_window: 150
 m15_window: 80
@@ -41,6 +42,9 @@ timeframe:
 confirmations:
   min_confirmations: 1
   aggressive_boundary: false
+  # structure_shift has poor standalone WR — excluded so it cannot satisfy
+  # min_confirmations alone.  It still fires and is logged for analysis.
+  excluded_from_count: [structure_shift]
   active_signals: [engulfing, rejection_wick, bos_msb, structure_shift, choch]
   engulf_full_body: true
   wick_ratio_min: 0.60
@@ -71,3 +75,4 @@ cooldown:
   cooldown_loss_h: 12          # hours to block zone after a loss (≈48 × M15 bars)
   cooldown_win_floor_h: 3.75   # minimum hours after win before leave-and-return eligible
   max_forward_bars: 350        # 350 × 15 min ≈ 87 h ≈ 4 trading days
+  zone_max_losses: 2           # permanently blacklist a zone after this many consecutive SL hits
