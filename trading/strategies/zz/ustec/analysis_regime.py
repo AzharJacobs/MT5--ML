@@ -399,8 +399,8 @@ def _time_analysis(groups):
 
 def _zone_quality(groups):
     print(f"\n  Win rate by confirmation count × regime (H4 EMA200)\n")
-    print(f"  {'Confs':>6} {'Regime':>8} {'Groups':>7} {'Profitable':>11} {'WR%':>6}  {'Net PnL':>12}")
-    print(f"  {DASH[:65]}")
+    print(f"  {'Confs':>6} {'Regime':>8} {'n':>6} {'Profitable':>11} {'WR%':>6}  {'Net PnL':>12}  {'Avg$/trade':>11}")
+    print(f"  {DASH[:72]}")
     for confs in sorted(groups["conf_count"].unique()):
         for regime in ("up", "down"):
             sub = groups[(groups["conf_count"] == confs) & (groups["regime_h4"] == regime)]
@@ -409,7 +409,46 @@ def _zone_quality(groups):
             n    = len(sub)
             prof = sub["profitable"].sum()
             pnl  = sub["net_pnl"].sum()
-            print(f"  {confs:>6}  {regime:>8} {n:>7} {prof:>11} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}")
+            avg  = pnl / n
+            flag = "  [LOW SAMPLE]" if n < 15 else ""
+            print(f"  {confs:>6}  {regime:>8} {n:>6} {prof:>11} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}  ${avg:>+9,.2f}{flag}")
+
+    # ── Regime × confirmation interaction ─────────────────────────────────────
+    print(f"\n  Regime × confirmation rule test")
+    print(f"  Rule: keep up+1conf and down+2+conf; drop up+2+conf and down+1conf\n")
+    print(f"  {'Bucket':<30} {'n':>6} {'WR%':>6}  {'Net PnL':>12}  {'Avg$/trade':>11}")
+    print(f"  {DASH[:72]}")
+
+    buckets = [
+        ("KEEP  up   + 1 conf",  (groups["regime_h4"] == "up")   & (groups["conf_count"] == 1)),
+        ("KEEP  down + 2+ conf", (groups["regime_h4"] == "down") & (groups["conf_count"] >= 2)),
+        ("DROP  up   + 2+ conf", (groups["regime_h4"] == "up")   & (groups["conf_count"] >= 2)),
+        ("DROP  down + 1 conf",  (groups["regime_h4"] == "down") & (groups["conf_count"] == 1)),
+    ]
+    keep_pnl = drop_pnl = 0.0
+    keep_n   = drop_n   = 0
+    keep_prof = drop_prof = 0
+    for label, mask in buckets:
+        sub = groups[mask]
+        if sub.empty:
+            print(f"  {label:<30} {'0':>6} {'—':>6}  {'$0':>12}  {'$0':>11}")
+            continue
+        n    = len(sub)
+        prof = sub["profitable"].sum()
+        pnl  = sub["net_pnl"].sum()
+        avg  = pnl / n
+        flag = "  [LOW SAMPLE]" if n < 15 else ""
+        print(f"  {label:<30} {n:>6} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}  ${avg:>+9,.2f}{flag}")
+        if label.startswith("KEEP"):
+            keep_pnl  += pnl;  keep_n  += n;  keep_prof += prof
+        else:
+            drop_pnl  += pnl;  drop_n  += n;  drop_prof += prof
+
+    print(f"  {DASH[:72]}")
+    if keep_n:
+        print(f"  {'KEEP total':<30} {keep_n:>6} {keep_prof/keep_n*100:>5.1f}%  ${keep_pnl:>+10,.2f}  ${keep_pnl/keep_n:>+9,.2f}")
+    if drop_n:
+        print(f"  {'DROP total':<30} {drop_n:>6} {drop_prof/drop_n*100:>5.1f}%  ${drop_pnl:>+10,.2f}  ${drop_pnl/drop_n:>+9,.2f}")
 
 
 def _clustering(groups, df_15m, bad_periods):

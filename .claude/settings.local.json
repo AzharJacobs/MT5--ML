@@ -286,7 +286,18 @@
       "PowerShell(Get-Process -Name \"terminal64\" -ErrorAction SilentlyContinue)",
       "PowerShell(f:\\\\MT5--ML\\\\.venv\\\\Scripts\\\\pip.exe install MetaTrader5 --quiet 2>&1)",
       "PowerShell(f:\\\\MT5--ML\\\\.venv\\\\Scripts\\\\python.exe -c \"import MetaTrader5 as mt5; print\\('Installed:', mt5.__version__\\)\")",
-      "PowerShell(Get-Process -Id 29880 -ErrorAction SilentlyContinue)"
+      "PowerShell(Get-Process -Id 29880 -ErrorAction SilentlyContinue)",
+      "Bash(python trading/strategies/zz/ustec/analysis_regime.py --start 2023-01-01 --end 2025-12-31)",
+      "Bash(python3 trading/strategies/zz/ustec/analysis_regime.py --start 2023-01-01 --end 2025-12-31)",
+      "Bash(conda info *)",
+      "Bash(find /usr /opt /Library -name \"python3*\" -type f 2>/dev/null | head -10; ls /Users/azhar.jacobs/Documents/MT5--ML/.venv/bin/ 2>/dev/null | head -5)",
+      "Read(//opt/**)",
+      "Bash(pip3 show *)",
+      "Bash(pip3.9 show *)",
+      "Bash(/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -c \"import numpy; print\\('found at', numpy.__file__\\)\")",
+      "Bash(pyenv versions *)",
+      "Bash(brew list *)",
+      "Bash(xargs -I{} sh -c '{} -c \"import numpy\" 2>/dev/null && echo {}')"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML",
