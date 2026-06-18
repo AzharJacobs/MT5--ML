@@ -422,11 +422,12 @@ def _zone_quality(groups):
         n    = len(sub)
         if n == 0:
             print(f"  {label:<32} {'0':>5}   —       —             —")
-            return
+            return 0, 0, 0.0
         prof = sub["profitable"].sum()
         pnl  = sub["net_pnl"].sum()
         flag = "  [LOW SAMPLE]" if n < 15 else ""
         print(f"  {label:<32} {n:>5} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}  ${pnl/n:>+8,.2f}{flag}")
+        return n, prof, pnl
 
     up   = groups["regime_h4"] == "up"
     down = groups["regime_h4"] == "down"
@@ -434,12 +435,21 @@ def _zone_quality(groups):
     c2p  = groups["conf_count"] >= 2
 
     print(f"\n  KEEP (proposed rule):")
-    _bucket("up   regime + 1 conf only",  up   & c1)
-    _bucket("down regime + 2+ confs",     down & c2p)
+    kn1, kp1, kpnl1 = _bucket("up   regime + 1 conf only",  up   & c1)
+    kn2, kp2, kpnl2 = _bucket("down regime + 2+ confs",     down & c2p)
 
     print(f"\n  DROP (proposed rule):")
-    _bucket("up   regime + 2+ confs",     up   & c2p)
-    _bucket("down regime + 1 conf only",  down & c1)
+    dn1, dp1, dpnl1 = _bucket("up   regime + 2+ confs",     up   & c2p)
+    dn2, dp2, dpnl2 = _bucket("down regime + 1 conf only",  down & c1)
+
+    keep_n, keep_prof, keep_pnl = kn1+kn2, kp1+kp2, kpnl1+kpnl2
+    drop_n, drop_prof, drop_pnl = dn1+dn2, dp1+dp2, dpnl1+dpnl2
+
+    print(f"  {DASH[:70]}")
+    if keep_n:
+        print(f"  {'KEEP total':<32} {keep_n:>5} {keep_prof/keep_n*100:>5.1f}%  ${keep_pnl:>+10,.2f}  ${keep_pnl/keep_n:>+8,.2f}")
+    if drop_n:
+        print(f"  {'DROP total':<32} {drop_n:>5} {drop_prof/drop_n*100:>5.1f}%  ${drop_pnl:>+10,.2f}  ${drop_pnl/drop_n:>+8,.2f}")
 
 
 def _clustering(groups, df_15m, bad_periods):
