@@ -55,6 +55,11 @@ ZONE_MAX_LOSSES      = int(_cool.get("zone_max_losses", 0))
 
 TAP_TOL              = float(_cfg["zone"]["tap_tolerance_pct"])
 
+_trail               = _cfg.get("trailing", {})
+ENABLE_TRAILING      = bool(_trail.get("enable_trailing", False))
+BE_BUFFER_PTS        = float(_trail.get("be_buffer_pts", 5.0))
+ATR_TRAIL_MULT       = float(_trail.get("atr_trail_mult", 1.5))
+
 
 def make_configs() -> tuple[TFConfig, ConfirmationConfig, TradeSetupConfig]:
     """

@@ -250,7 +250,7 @@ def build_trade_setup(
     # In confirmation mode entry = signal_price (M15 bar close). If price has
     # already exited the zone in the adverse direction, the SL anchored to the
     # zone edge becomes dangerously tight. Uses same 0.1% tolerance as M15 tap.
-    _ZONE_ENTRY_TOL = 0.001
+    _ZONE_ENTRY_TOL = 0.0
     if entry_mode == "confirmation":
         if direction == "sell" and signal_price > entry_zone.top * (1.0 + _ZONE_ENTRY_TOL):
             return _invalid(direction, entry_zone, entry_mode,
@@ -267,10 +267,10 @@ def build_trade_setup(
         # Widen if sl_min_points requires it
         if cfg.sl_min_points > 0:
             sl = min(sl, entry - cfg.sl_min_points)
-        # Hard guard: SL must be below zone bottom
-        if sl >= entry_zone.bottom:
+        # Hard guard: SL must be at or below zone bottom
+        if sl > entry_zone.bottom:
             return _invalid(direction, entry_zone, entry_mode,
-                            f"SL {sl:.4f} not below zone bottom {entry_zone.bottom:.4f}")
+                            f"SL {sl:.4f} not at/below zone bottom {entry_zone.bottom:.4f}")
         if sl >= entry:
             return _invalid(direction, entry_zone, entry_mode,
                             f"SL {sl:.4f} >= entry {entry:.4f}")
@@ -278,9 +278,9 @@ def build_trade_setup(
         sl = entry_zone.top * (1.0 + cfg.sl_buffer_pct)
         if cfg.sl_min_points > 0:
             sl = max(sl, entry + cfg.sl_min_points)
-        if sl <= entry_zone.top:
+        if sl < entry_zone.top:
             return _invalid(direction, entry_zone, entry_mode,
-                            f"SL {sl:.4f} not above zone top {entry_zone.top:.4f}")
+                            f"SL {sl:.4f} not at/above zone top {entry_zone.top:.4f}")
         if sl <= entry:
             return _invalid(direction, entry_zone, entry_mode,
                             f"SL {sl:.4f} <= entry {entry:.4f}")

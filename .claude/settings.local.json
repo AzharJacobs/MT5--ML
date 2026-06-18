@@ -286,7 +286,8 @@
       "PowerShell(Get-Process -Name \"terminal64\" -ErrorAction SilentlyContinue)",
       "PowerShell(f:\\\\MT5--ML\\\\.venv\\\\Scripts\\\\pip.exe install MetaTrader5 --quiet 2>&1)",
       "PowerShell(f:\\\\MT5--ML\\\\.venv\\\\Scripts\\\\python.exe -c \"import MetaTrader5 as mt5; print\\('Installed:', mt5.__version__\\)\")",
-      "PowerShell(Get-Process -Id 29880 -ErrorAction SilentlyContinue)"
+      "PowerShell(Get-Process -Id 29880 -ErrorAction SilentlyContinue)",
+      "Bash(python -X utf8 scripts/backtest_yearly_breakdown.py --cash 150 --fixed_lot 0.01)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML",

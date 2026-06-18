@@ -52,6 +52,7 @@ from trading.strategies.zz.ustec.strategy import (
     MAX_POSITIONS, H4_WINDOW, M15_WINDOW,
     COOLDOWN_LOSS_H, COOLDOWN_WIN_FLOOR_H, TAP_TOL,
     ZONE_MAX_LOSSES,
+    ENABLE_TRAILING, BE_BUFFER_PTS, ATR_TRAIL_MULT,
     make_configs,
 )
 

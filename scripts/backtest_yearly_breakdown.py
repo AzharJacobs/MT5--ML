@@ -4,6 +4,7 @@ ZZ USTEC backtest: 2023, 2024, 2025 — month-by-month breakdown.
 Runs as one continuous simulation (equity carries between years).
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -68,8 +69,9 @@ def _print_year_table(df_year: pd.DataFrame, year: int, prev_equity: float) -> f
         pnl_s   = f"{sign}${abs(r['pnl']):.2f}"
         eq_s    = f"${r['equity']:,.2f}"
         lot_rng = f"{r['min_lot']:.2f}-{r['max_lot']:.2f}"
+        low_flag = "  *** LOW EQ ***" if r["equity"] < 50.0 else ""
         print(f"  {r['month']:<6} {r['trades']:>7} {r['wins']:>5} {r['wr']:>6.1f}% "
-              f"{pnl_s:>12} {eq_s:>12} {r['avg_lot']:>9.3f} {lot_rng:>14}")
+              f"{pnl_s:>12} {eq_s:>12} {r['avg_lot']:>9.3f} {lot_rng:>14}{low_flag}")
     print(f"{'─'*W}")
     sign  = "+" if total_pnl >= 0 else "-"
     pnl_s = f"{sign}${abs(total_pnl):.2f}"
@@ -99,20 +101,39 @@ def _print_trade_detail(df_all: pd.DataFrame) -> None:
 
 
 def main():
-    cash = 150.0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cash",      type=float, default=150.0)
+    parser.add_argument("--fixed_lot", type=float, default=0.0)
+    parser.add_argument("--start",     default="2023-01-01")
+    parser.add_argument("--end",       default="2025-12-31")
+    parser.add_argument("--regime_conf_filter", action="store_true")
+    parser.add_argument("--exclude_signals", default="")
+    parser.add_argument("--trailing",    dest="enable_trailing", action="store_true",  default=True)
+    parser.add_argument("--no_trailing", dest="enable_trailing", action="store_false")
+    args = parser.parse_args()
+
+    cash = args.cash
+    excl = [s.strip() for s in args.exclude_signals.split(",") if s.strip()]
+    lot_label = f"fixed {args.fixed_lot:.3f}" if args.fixed_lot > 0 else "dynamic 1% risk"
+    filter_label = " | regime_conf_filter=ON" if args.regime_conf_filter else ""
+    if excl:
+        filter_label += f" | excluded={','.join(excl)}"
 
     print("\n" + "="*82)
-    print(f"  ZZ Strategy Backtest  |  USTEC  |  2023–2025  |  ${cash:.2f} starting cash")
-    print(f"  Lot sizing: dynamic 1% risk (fixed_lot=0 → scales with equity)")
+    print(f"  ZZ Strategy Backtest  |  USTEC  |  {args.start[:4]}–{args.end[:4]}  |  ${cash:.2f} starting cash")
+    print(f"  Lot sizing: {lot_label}{filter_label}")
     print("="*82)
     print("  Running simulation... (this may take a few minutes)")
 
     result = run_backtest(
-        start="2023-01-01",
-        end="2025-12-31",
+        start=args.start,
+        end=args.end,
         cash=cash,
         symbol="ustech",
-        fixed_lot=0.0,   # dynamic 1% risk sizing — lot grows as equity grows
+        fixed_lot=args.fixed_lot,
+        regime_conf_filter=args.regime_conf_filter,
+        excluded_from_count=excl,
+        enable_trailing=args.enable_trailing,
     )
 
     if not isinstance(result, tuple) or len(result) < 2:

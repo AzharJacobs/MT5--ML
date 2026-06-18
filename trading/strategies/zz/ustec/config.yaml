@@ -12,8 +12,8 @@ spread_pts: 2.0         # applied at fill in paper mode; MT5 uses real fill
 fixed_lot: 0.05         # fixed lot size per trade
 risk_pct: 0.01          # 1% equity risk (used only with dynamic lot sizing)
 min_rr: 1.5
-min_sl_pct: 0.10        # skip trade if SL distance < 0.10% of entry (noise filter)
-max_sl_pct: 0.50        # skip trade if SL distance > 0.50% of entry (blow-up guard)
+min_sl_pct: 0.0         # disabled
+max_sl_pct: 0.0         # disabled
 max_positions: 2
 h4_window: 150
 m15_window: 80
@@ -62,7 +62,7 @@ confirmations:
 # Trade setup
 trade_setup:
   aggressive_entry: false
-  sl_buffer_pct: 0.002
+  sl_buffer_pct: 0.0
   sl_min_points: 0.0
   midline_tp: false
   midline_pct: 0.50
@@ -76,3 +76,10 @@ cooldown:
   cooldown_win_floor_h: 3.75   # minimum hours after win before leave-and-return eligible
   max_forward_bars: 350        # 350 × 15 min ≈ 87 h ≈ 4 trading days
   zone_max_losses: 2           # permanently blacklist a zone after this many consecutive SL hits
+
+# Trailing stop (USTEC only — not shared with gold)
+trailing:
+  enable_trailing: false
+  be_buffer_pts: 5.0           # pts above/below entry for break-even SL
+  atr_trail_mult: 1.5          # ATR backstop: SL stays within mult×ATR of price
+  trail_on_confirmed_swing_only: true

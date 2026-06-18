@@ -31,8 +31,11 @@ from trading.shared.data_loader import get_connection
 
 # Pull USTEC config defaults so run_backtest() parameters match config.yaml out-of-the-box
 from trading.strategies.zz.ustec.strategy import (
-    ZONE_MAX_LOSSES as _CFG_ZONE_MAX_LOSSES,
-    MAX_SL_PCT      as _CFG_MAX_SL_PCT,
+    ZONE_MAX_LOSSES  as _CFG_ZONE_MAX_LOSSES,
+    MAX_SL_PCT       as _CFG_MAX_SL_PCT,
+    ENABLE_TRAILING  as _CFG_ENABLE_TRAILING,
+    BE_BUFFER_PTS    as _CFG_BE_BUFFER_PTS,
+    ATR_TRAIL_MULT   as _CFG_ATR_TRAIL_MULT,
 )
 
 
@@ -146,8 +149,14 @@ def run_backtest(
     dir_cooldown_bars: int = 48,
     h4_regime_filter: bool = False,
     n_consec_ll: int = 2,
+    regime_conf_filter: bool = False,
     min_sl_pct: float = 0.0,
     max_sl_pct: float = _CFG_MAX_SL_PCT,
+    enable_trailing:   bool  = _CFG_ENABLE_TRAILING,
+    be_buffer_pts:     float = _CFG_BE_BUFFER_PTS,
+    atr_trail_mult:    float = _CFG_ATR_TRAIL_MULT,
+    trail_swing_left:  int   = 2,
+    trail_swing_right: int   = 2,
     realistic: bool = False,
     contract_size_override: Optional[float] = None,
     base_spread_pts: float = 4.0,
@@ -198,6 +207,7 @@ def run_backtest(
         print(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
 
     print(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
+    df_4h["ema200"] = df_4h["close"].ewm(span=200, adjust=False).mean()
 
     tf_cfg = TFConfig(
         directional_filter=directional_filter,
@@ -263,6 +273,7 @@ def run_backtest(
         "zone_blacklist": 0,
         "dir_breaker":   0,
         "regime_filter": 0,
+        "regime_conf_skip": 0,
         "sl_too_tight":  0,
         "sl_too_wide":   0,
         "margin_call":   0,
@@ -342,6 +353,12 @@ def run_backtest(
         if direction == "sell" and _sig_close < active_zone.bottom * (1 - _close_tol):
             filters["conf_failed"] += 1
             continue
+
+        if regime_conf_filter and conf.count >= 2:
+            _h4_ema200 = float(df_h4_w["ema200"].iloc[-1])
+            if _sig_close > _h4_ema200:
+                filters["regime_conf_skip"] += 1
+                continue
 
         zk = _zone_key(active_zone)
         if zone_cooldown.get(zk, -1) >= i:
@@ -466,6 +483,22 @@ def run_backtest(
         else:
             stopout_price_buy = stopout_price_sell = None
 
+        # ── Trailing stop state ───────────────────────────────────────────────
+        _be_triggered = False
+        _trail_sl     = sl
+        if enable_trailing:
+            _midline    = (entry + tp) / 2
+            _atr_trs    = []
+            for _ak in range(max(1, i - 13), i + 1):
+                _h  = float(df_15m["high"].iloc[_ak])
+                _l  = float(df_15m["low"].iloc[_ak])
+                _pc = float(df_15m["close"].iloc[_ak - 1])
+                _atr_trs.append(max(_h - _l, abs(_h - _pc), abs(_l - _pc)))
+            _atr14 = sum(_atr_trs) / max(len(_atr_trs), 1)
+        else:
+            _midline = 0.0
+            _atr14   = 0.0
+
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
             fl = float(df_15m["low"].iloc[j])
@@ -473,18 +506,54 @@ def run_backtest(
             adverse = (entry - fl) if direction == "buy" else (fh - entry)
             max_favourable = max(max_favourable, favour)
             max_adverse    = max(max_adverse,    adverse)
+            # ── Trailing stop update ──────────────────────────────────────────
+            if enable_trailing:
+                fc = float(df_15m["close"].iloc[j])
+                # 1. Break-even trigger at midline
+                if not _be_triggered:
+                    if direction == "buy"  and fh >= _midline:
+                        _be_triggered = True
+                        _trail_sl = max(_trail_sl, entry + be_buffer_pts)
+                    elif direction == "sell" and fl <= _midline:
+                        _be_triggered = True
+                        _trail_sl = min(_trail_sl, entry - be_buffer_pts)
+                if _be_triggered:
+                    # 2. Ratchet behind newly confirmed M15 swing (O(1) per bar)
+                    _sb = j - trail_swing_right
+                    if _sb > i + trail_swing_left:
+                        _sb_l = float(df_15m["low"].iloc[_sb])
+                        _sb_h = float(df_15m["high"].iloc[_sb])
+                        _ll = all(float(df_15m["low"].iloc[_sb - m])  > _sb_l for m in range(1, trail_swing_left  + 1))
+                        _rl = all(float(df_15m["low"].iloc[_sb + m])  > _sb_l for m in range(1, trail_swing_right + 1))
+                        _lh = all(float(df_15m["high"].iloc[_sb - m]) < _sb_h for m in range(1, trail_swing_left  + 1))
+                        _rh = all(float(df_15m["high"].iloc[_sb + m]) < _sb_h for m in range(1, trail_swing_right + 1))
+                        if direction == "buy" and _ll and _rl:
+                            _cand = _sb_l - be_buffer_pts
+                            if _cand > _trail_sl:
+                                _trail_sl = _cand
+                        elif direction == "sell" and _lh and _rh:
+                            _cand = _sb_h + be_buffer_pts
+                            if _cand < _trail_sl:
+                                _trail_sl = _cand
+                    # 3. ATR backstop: SL can't lag more than mult×ATR from price
+                    if atr_trail_mult > 0 and _atr14 > 0:
+                        if direction == "buy":
+                            _trail_sl = max(_trail_sl, fc - atr_trail_mult * _atr14)
+                        else:
+                            _trail_sl = min(_trail_sl, fc + atr_trail_mult * _atr14)
+            # ─────────────────────────────────────────────────────────────────
             if direction == "buy":
                 if stopout_price_buy is not None and fl <= stopout_price_buy:
                     outcome = -1; exit_price = stopout_price_buy; exit_bar = j
                     stopout_occurred = True; break
                 if fh >= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                if fl <= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
+                if fl <= _trail_sl:  outcome = -1; exit_price = _trail_sl; exit_bar = j; break
             else:
                 if stopout_price_sell is not None and fh >= stopout_price_sell:
                     outcome = -1; exit_price = stopout_price_sell; exit_bar = j
                     stopout_occurred = True; break
                 if fl <= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                if fh >= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
+                if fh >= _trail_sl:  outcome = -1; exit_price = _trail_sl; exit_bar = j; break
 
         slip = 0.0
         if realistic and outcome == -1 and not stopout_occurred:
@@ -637,6 +706,10 @@ def run_backtest(
         "dir_cooldown_bars":   dir_cooldown_bars if dir_max_losses > 0 else "n/a",
         "h4_regime_filter":    h4_regime_filter,
         "n_consec_ll":         n_consec_ll if h4_regime_filter else "n/a",
+        "regime_conf_filter":  regime_conf_filter,
+        "enable_trailing":     enable_trailing,
+        "be_buffer_pts":       be_buffer_pts  if enable_trailing else "disabled",
+        "atr_trail_mult":      atr_trail_mult if enable_trailing else "disabled",
         "min_sl_pct":          min_sl_pct if min_sl_pct > 0 else "disabled",
         "realistic_mode":      realistic,
         "contract_size":       contract_size,
@@ -730,6 +803,7 @@ def main() -> None:
     parser.add_argument("--dir_cooldown",     type=int, default=48)
     parser.add_argument("--h4_regime_filter", action="store_true")
     parser.add_argument("--n_consec_ll",      type=int, default=2)
+    parser.add_argument("--regime_conf_filter", action="store_true")
     parser.add_argument("--aggressive_entry", action="store_true")
     parser.add_argument("--midline_tp",  action="store_true")
     parser.add_argument("--midline_pct", type=float, default=0.50)
@@ -741,6 +815,10 @@ def main() -> None:
     parser.add_argument("--no_leave_return", action="store_true")
     parser.add_argument("--min_sl_pct",  type=float, default=0.0)
     parser.add_argument("--realistic",   action="store_true")
+    parser.add_argument("--trailing",    dest="enable_trailing", action="store_true",  default=_CFG_ENABLE_TRAILING)
+    parser.add_argument("--no_trailing", dest="enable_trailing", action="store_false")
+    parser.add_argument("--be_buffer",   type=float, default=_CFG_BE_BUFFER_PTS)
+    parser.add_argument("--atr_mult",    type=float, default=_CFG_ATR_TRAIL_MULT)
     args = parser.parse_args()
 
     run_backtest(
@@ -770,8 +848,12 @@ def main() -> None:
         dir_cooldown_bars=args.dir_cooldown,
         h4_regime_filter=args.h4_regime_filter,
         n_consec_ll=args.n_consec_ll,
+        regime_conf_filter=args.regime_conf_filter,
         min_sl_pct=args.min_sl_pct,
         realistic=args.realistic,
+        enable_trailing=args.enable_trailing,
+        be_buffer_pts=args.be_buffer,
+        atr_trail_mult=args.atr_mult,
         save_path=args.save,
         chart=args.chart,
     )

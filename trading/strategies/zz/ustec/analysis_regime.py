@@ -399,8 +399,8 @@ def _time_analysis(groups):
 
 def _zone_quality(groups):
     print(f"\n  Win rate by confirmation count × regime (H4 EMA200)\n")
-    print(f"  {'Confs':>6} {'Regime':>8} {'Groups':>7} {'Profitable':>11} {'WR%':>6}  {'Net PnL':>12}")
-    print(f"  {DASH[:65]}")
+    print(f"  {'Confs':>6} {'Regime':>8} {'Groups':>7} {'Profitable':>11} {'WR%':>6}  {'Net PnL':>12}  {'Avg/trade':>10}")
+    print(f"  {DASH[:78]}")
     for confs in sorted(groups["conf_count"].unique()):
         for regime in ("up", "down"):
             sub = groups[(groups["conf_count"] == confs) & (groups["regime_h4"] == regime)]
@@ -409,7 +409,37 @@ def _zone_quality(groups):
             n    = len(sub)
             prof = sub["profitable"].sum()
             pnl  = sub["net_pnl"].sum()
-            print(f"  {confs:>6}  {regime:>8} {n:>7} {prof:>11} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}")
+            flag = "  [LOW SAMPLE]" if n < 15 else ""
+            print(f"  {confs:>6}  {regime:>8} {n:>7} {prof:>11} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}  ${pnl/n:>+8,.2f}{flag}")
+
+    # ── Regime × confirmation interaction summary ──────────────────────────────
+    print(f"\n  Regime × confirmation interaction (rule test: up+1conf vs down+2conf)")
+    print(f"\n  {'Bucket':<32} {'n':>5} {'WR%':>6}  {'Net PnL':>12}  {'Avg/trade':>10}")
+    print(f"  {DASH[:70]}")
+
+    def _bucket(label, mask):
+        sub  = groups[mask]
+        n    = len(sub)
+        if n == 0:
+            print(f"  {label:<32} {'0':>5}   —       —             —")
+            return
+        prof = sub["profitable"].sum()
+        pnl  = sub["net_pnl"].sum()
+        flag = "  [LOW SAMPLE]" if n < 15 else ""
+        print(f"  {label:<32} {n:>5} {prof/n*100:>5.1f}%  ${pnl:>+10,.2f}  ${pnl/n:>+8,.2f}{flag}")
+
+    up   = groups["regime_h4"] == "up"
+    down = groups["regime_h4"] == "down"
+    c1   = groups["conf_count"] == 1
+    c2p  = groups["conf_count"] >= 2
+
+    print(f"\n  KEEP (proposed rule):")
+    _bucket("up   regime + 1 conf only",  up   & c1)
+    _bucket("down regime + 2+ confs",     down & c2p)
+
+    print(f"\n  DROP (proposed rule):")
+    _bucket("up   regime + 2+ confs",     up   & c2p)
+    _bucket("down regime + 1 conf only",  down & c1)
 
 
 def _clustering(groups, df_15m, bad_periods):
