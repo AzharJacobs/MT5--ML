@@ -168,6 +168,8 @@ def run_backtest(
     save_path: Optional[str] = None,
     zone_guard: bool = True,
     chart: bool = False,
+    gradual_filter: str = "all",   # "all" | "retest_only" | "tightened"
+    silent: bool = False,
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -184,10 +186,11 @@ def run_backtest(
     db.database = db_name
     db.connect()
 
-    print(f"\nSymbol : {sym.upper()}  |  DB: {db_name}  |  Contract: ${contract_size}/pt/lot  |  Spread: {eff_spread} pts")
-    print(f"Loading 15M data  {start} → {end} ...")
+    _pr = (lambda *a, **kw: None) if silent else print
+    _pr(f"\nSymbol : {sym.upper()}  |  DB: {db_name}  |  Contract: ${contract_size}/pt/lot  |  Spread: {eff_spread} pts")
+    _pr(f"Loading 15M data  {start} → {end} ...")
     df_15m = _load_ohlcv(db, table, "15min", start, end)
-    print(f"Loading 4H  data  {start} → {end} ...")
+    _pr(f"Loading 4H  data  {start} → {end} ...")
     df_4h  = _load_ohlcv(db, table, "4H",    start, end)
 
     try:
@@ -204,9 +207,9 @@ def run_backtest(
     df_4h   = df_4h[df_4h[_ohlcv].ne(df_4h[_ohlcv].shift()).any(axis=1)].reset_index(drop=True)
     _dupes  = _before - len(df_4h)
     if _dupes:
-        print(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
+        _pr(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
 
-    print(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
+    _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
     df_4h["ema200"] = df_4h["close"].ewm(span=200, adjust=False).mean()
 
     tf_cfg = TFConfig(
@@ -241,7 +244,7 @@ def run_backtest(
         min_rr=min_rr,
     )
 
-    print(
+    _pr(
         f"Config : directional_filter={directional_filter}  min_confirmations={min_confirmations}"
         f"  aggressive_entry={aggressive_entry}  midline_tp={midline_tp}\n"
     )
@@ -256,6 +259,7 @@ def run_backtest(
     zone_outcome_history: dict = {}
     zone_consec_losses:   dict = {}
     zone_blacklist:       set  = set()
+    zone_touch_tracker:   dict = {}   # zk → {bottom, top, exited}
     dir_consec_losses: dict = {"buy": 0, "sell": 0}
     dir_cooldown:      dict = {"buy": None, "sell": None}
     stopout_occurred:     bool = False
@@ -274,16 +278,23 @@ def run_backtest(
         "dir_breaker":   0,
         "regime_filter": 0,
         "regime_conf_skip": 0,
-        "sl_too_tight":  0,
-        "sl_too_wide":   0,
-        "margin_call":   0,
+        "sl_too_tight":   0,
+        "sl_too_wide":    0,
+        "margin_call":    0,
+        "gradual_filter": 0,
     }
 
     for i in range(warmup, n - max_forward_bars):
 
+        bar_h = float(df_15m["high"].iloc[i])
+        bar_l = float(df_15m["low"].iloc[i])
+
+        for _zkt, _zks in zone_touch_tracker.items():
+            if not _zks["exited"]:
+                if bar_h < _zks["bottom"] or bar_l > _zks["top"]:
+                    _zks["exited"] = True
+
         if require_leave_and_return and zone_reentry:
-            bar_h = float(df_15m["high"].iloc[i])
-            bar_l = float(df_15m["low"].iloc[i])
             tol   = 0.001
             ready = []
             for zk, state in zone_reentry.items():
@@ -361,6 +372,13 @@ def run_backtest(
                 continue
 
         zk = _zone_key(active_zone)
+        if zk not in zone_touch_tracker:
+            zone_touch_tracker[zk] = {
+                "bottom": active_zone.bottom,
+                "top":    active_zone.top,
+                "exited": False,
+            }
+
         if zone_cooldown.get(zk, -1) >= i:
             filters["zone_cooldown"] += 1
             continue
@@ -383,6 +401,15 @@ def run_backtest(
             prior_bucket = "post_loss"
         else:
             prior_bucket = "post_expired"
+
+        arrival_type = "retest" if zone_touch_tracker.get(zk, {}).get("exited", False) else "gradual"
+
+        if arrival_type == "gradual" and gradual_filter != "all":
+            if gradual_filter == "retest_only" or (
+                gradual_filter == "tightened" and (conf.count < 2 or not active_zone.fresh)
+            ):
+                filters["gradual_filter"] += 1
+                continue
 
         signal_price = float(df_15m_w["close"].iloc[-1])
         setup = setup_from_analysis(tf_result, signal_price, setup_cfg)
@@ -640,6 +667,8 @@ def run_backtest(
             "tp_mode":       setup.tp_mode,
             "is_retest":     is_retest,
             "prior_bucket":  prior_bucket,
+            "arrival_type":  arrival_type,
+            "zone_fresh":    active_zone.fresh,
             "zone_bottom":   active_zone.bottom,
             "zone_top":      active_zone.top,
             "zone_strength": active_zone.strength,
@@ -648,6 +677,7 @@ def run_backtest(
             "signal_close":    signal_price,
             "raw_open":        raw_open,
         })
+        zone_touch_tracker.pop(zk, None)
 
     if not trades:
         print("No trades generated. Widen date range, lower min_rr, or reduce min_confirmations.")
@@ -718,53 +748,78 @@ def run_backtest(
         "stopout_occurred":    stopout_occurred if realistic else "n/a",
     }
 
-    print_report(metrics, run_label="Zone Strategy")
+    if not silent:
+        print_report(metrics, run_label="Zone Strategy")
 
-    evaluated = n - warmup - max_forward_bars
-    print(f"\n{'─'*48}")
-    print(f"  Filter breakdown  ({evaluated:,} bars evaluated)")
-    print(f"{'─'*48}")
-    for label, count in sorted(filters.items(), key=lambda x: -x[1]):
-        if count == 0:
-            continue
-        pct = count / max(evaluated, 1) * 100
-        print(f"  {label:<25} {count:>8,}  ({pct:.1f}%)")
-    print(f"  {'signals fired':<25} {total:>8,}")
-    print(f"{'─'*48}")
+        evaluated = n - warmup - max_forward_bars
+        print(f"\n{'─'*48}")
+        print(f"  Filter breakdown  ({evaluated:,} bars evaluated)")
+        print(f"{'─'*48}")
+        for label, count in sorted(filters.items(), key=lambda x: -x[1]):
+            if count == 0:
+                continue
+            pct = count / max(evaluated, 1) * 100
+            print(f"  {label:<25} {count:>8,}  ({pct:.1f}%)")
+        print(f"  {'signals fired':<25} {total:>8,}")
+        print(f"{'─'*48}")
 
-    print(f"\n  Confirmation stacking (out of 5):")
-    for cnt, freq in stack_counts.items():
-        wr_stack = df_t[df_t["confirmations"] == cnt]
-        wr_pct   = (wr_stack["outcome"] == 1).mean() * 100
-        print(f"    {cnt} confirmations : {freq:>4} trades  WR={wr_pct:.0f}%")
+        print(f"\n  Confirmation stacking (out of 5):")
+        for cnt, freq in stack_counts.items():
+            wr_stack = df_t[df_t["confirmations"] == cnt]
+            wr_pct   = (wr_stack["outcome"] == 1).mean() * 100
+            print(f"    {cnt} confirmations : {freq:>4} trades  WR={wr_pct:.0f}%")
 
-    print(f"\n  H4 bias at entry:")
-    for bias_val, grp in df_t.groupby("h4_bias"):
-        wr_b = (grp["outcome"] == 1).mean() * 100
-        print(f"    {bias_val:<14} : {len(grp):>4} trades  WR={wr_b:.0f}%")
-    print()
+        print(f"\n  H4 bias at entry:")
+        for bias_val, grp in df_t.groupby("h4_bias"):
+            wr_b = (grp["outcome"] == 1).mean() * 100
+            print(f"    {bias_val:<14} : {len(grp):>4} trades  WR={wr_b:.0f}%")
+        print()
 
-    def _pb_stats(bucket):
-        g = df_t[df_t["prior_bucket"] == bucket]
-        if len(g) == 0:
-            return 0, 0, 0.0, 0.0
-        wr  = (g["outcome"] == 1).mean() * 100
-        net = g["pnl"].sum()
-        return len(g), int((g["outcome"] == 1).sum()), wr, net
+        def _pb_stats(bucket):
+            g = df_t[df_t["prior_bucket"] == bucket]
+            if len(g) == 0:
+                return 0, 0, 0.0, 0.0
+            wr  = (g["outcome"] == 1).mean() * 100
+            net = g["pnl"].sum()
+            return len(g), int((g["outcome"] == 1).sum()), wr, net
 
-    print(f"\n  Prior-outcome split (exact zone_id):")
-    for pb in ("first_attempt", "post_win", "post_loss", "post_expired"):
-        n_pb, w_pb, wr_pb, net_pb = _pb_stats(pb)
-        if n_pb == 0:
-            continue
-        print(f"    {pb:<16} : {n_pb:>3} trades  W={w_pb:>2}  "
-              f"WR={wr_pb:.0f}%  net=${net_pb:+.2f}")
-    print()
+        print(f"\n  Prior-outcome split (exact zone_id):")
+        for pb in ("first_attempt", "post_win", "post_loss", "post_expired"):
+            n_pb, w_pb, wr_pb, net_pb = _pb_stats(pb)
+            if n_pb == 0:
+                continue
+            print(f"    {pb:<16} : {n_pb:>3} trades  W={w_pb:>2}  "
+                  f"WR={wr_pb:.0f}%  net=${net_pb:+.2f}")
+        print()
 
-    cols = ["date", "side", "h4_bias", "signals", "confirmations",
-            "is_retest", "prior_bucket", "entry", "sl", "tp", "exit", "pnl", "outcome"]
-    print(df_t[cols].to_string(index=False))
-    print()
+        # ── Arrival-type split ────────────────────────────────────────────────
+        print(f"  {'─'*62}")
+        print(f"  Arrival-type split")
+        print(f"  {'─'*62}")
+        print(f"  {'Type':<10} {'Trades':>7} {'Wins':>5} {'WR%':>6} {'Net PnL':>10} {'Avg PnL':>10}")
+        print(f"  {'─'*62}")
+        _at_rows = []
+        for atype in ("retest", "gradual"):
+            _g = df_t[df_t["arrival_type"] == atype]
+            if len(_g) == 0:
+                _at_rows.append((atype, 0, 0, 0.0, 0.0, 0.0))
+                continue
+            _wr  = (_g["outcome"] == 1).mean() * 100
+            _net = _g["pnl"].sum()
+            _avg = _g["pnl"].mean()
+            _at_rows.append((atype, len(_g), int((_g["outcome"] == 1).sum()), _wr, _net, _avg))
+            print(f"  {atype:<10} {len(_g):>7} {int((_g['outcome']==1).sum()):>5} "
+                  f"{_wr:>5.1f}% {_net:>+10.2f} {_avg:>+10.2f}")
+        _retest_net  = next((r[4] for r in _at_rows if r[0] == "retest"),  0.0)
+        print(f"  {'─'*62}")
+        print(f"  Net PnL excl. gradual : ${_retest_net:+.2f}")
+        print(f"  {'─'*62}")
+        print()
+
+        cols = ["date", "side", "h4_bias", "signals", "confirmations",
+                "arrival_type", "is_retest", "prior_bucket", "entry", "sl", "tp", "exit", "pnl", "outcome"]
+        print(df_t[cols].to_string(index=False))
+        print()
 
     if save_path:
         save_report(metrics, save_path)
