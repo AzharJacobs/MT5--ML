@@ -52,7 +52,7 @@ from trading.strategies.zz.ustec.strategy import (
     MAX_POSITIONS, H4_WINDOW, M15_WINDOW,
     COOLDOWN_LOSS_H, COOLDOWN_WIN_FLOOR_H, TAP_TOL,
     ZONE_MAX_LOSSES,
-    ENABLE_TRAILING, BE_BUFFER_PTS, ATR_TRAIL_MULT,
+    ENABLE_TRAILING, BE_TRIGGER_PTS, BE_BUFFER_PTS, ATR_TRAIL_MULT,
     H4_REGIME_FILTER,
     make_configs,
 )
@@ -406,6 +406,7 @@ class ZZLiveBot:
 
         bar_h = float(df_15m_w["high"].iloc[-1])
         bar_l = float(df_15m_w["low"].iloc[-1])
+        bar_c = float(df_15m_w["close"].iloc[-1])
 
         for _zks in self.zone_touch_tracker.values():
             if not _zks["exited"]:
@@ -415,7 +416,7 @@ class ZZLiveBot:
         self._update_zone_reentry(now, bar_h, bar_l)
 
         for pos in list(self.open_positions):
-            self._check_open_position(pos, bar_h, bar_l, now)
+            self._check_open_position(pos, bar_h, bar_l, bar_c, now)
 
         if len(self.open_positions) >= MAX_POSITIONS:
             log.info("Max positions (%d) reached — skipping entry evaluation", MAX_POSITIONS)
@@ -647,27 +648,39 @@ class ZZLiveBot:
         self.zlog.log_trade_open(record)
 
         self.open_positions.append({
-            "ticket":    ticket,
-            "direction": direction,
-            "entry":     entry,
-            "sl":        sl,
-            "tp":        tp,
-            "lots":      lots,
-            "zk":        zk,
-            "zid":       zid,
-            "zone":      active_zone,
-            "open_time": now,
-            "record":    record,
+            "ticket":       ticket,
+            "direction":    direction,
+            "entry":        entry,
+            "sl":           sl,
+            "tp":           tp,
+            "lots":         lots,
+            "zk":           zk,
+            "zid":          zid,
+            "zone":         active_zone,
+            "open_time":    now,
+            "record":       record,
+            "be_triggered": False,
         })
 
-    def _check_open_position(self, pos: dict, bar_h: float, bar_l: float, now: datetime) -> None:
+    def _check_open_position(self, pos: dict, bar_h: float, bar_l: float, bar_c: float, now: datetime) -> None:
         if self.mode == "mt5":
-            self._check_position_mt5(pos, now)
+            self._check_position_mt5(pos, bar_c, now)
             return
 
         outcome     = None
         close_price = None
         direction   = pos["direction"]
+
+        if ENABLE_TRAILING and not pos["be_triggered"]:
+            midline = (pos["entry"] + pos["tp"]) / 2
+            if direction == "buy" and bar_c >= midline:
+                pos["be_triggered"] = True
+                pos["sl"] = max(pos["sl"], pos["entry"] + BE_BUFFER_PTS)
+                log.info("BE midline — buy SL → %.2f (midline=%.2f entry=%.2f)", pos["sl"], midline, pos["entry"])
+            elif direction == "sell" and bar_c <= midline:
+                pos["be_triggered"] = True
+                pos["sl"] = min(pos["sl"], pos["entry"] - BE_BUFFER_PTS)
+                log.info("BE midline — sell SL → %.2f (midline=%.2f entry=%.2f)", pos["sl"], midline, pos["entry"])
 
         if direction == "buy":
             if bar_h >= pos["tp"]:
@@ -688,10 +701,26 @@ class ZZLiveBot:
             )
             self._on_position_close(pos, outcome, close_price, pnl, now)
 
-    def _check_position_mt5(self, pos: dict, now: datetime) -> None:
+    def _check_position_mt5(self, pos: dict, bar_c: float, now: datetime) -> None:
         try:
             import MetaTrader5 as mt5
-            if mt5.positions_get(ticket=pos["ticket"]):
+            open_pos = mt5.positions_get(ticket=pos["ticket"])
+            if open_pos:
+                if ENABLE_TRAILING and not pos["be_triggered"]:
+                    midline = (pos["entry"] + pos["tp"]) / 2
+                    direction = pos["direction"]
+                    if direction == "buy" and bar_c >= midline:
+                        new_sl = round(max(pos["sl"], pos["entry"] + BE_BUFFER_PTS), 2)
+                        if self.broker.modify_sl(pos["ticket"], new_sl):
+                            pos["be_triggered"] = True
+                            pos["sl"] = new_sl
+                            log.info("BE midline — buy SL → %.2f (midline=%.2f entry=%.2f)", new_sl, midline, pos["entry"])
+                    elif direction == "sell" and bar_c <= midline:
+                        new_sl = round(min(pos["sl"], pos["entry"] - BE_BUFFER_PTS), 2)
+                        if self.broker.modify_sl(pos["ticket"], new_sl):
+                            pos["be_triggered"] = True
+                            pos["sl"] = new_sl
+                            log.info("BE midline — sell SL → %.2f (midline=%.2f entry=%.2f)", new_sl, midline, pos["entry"])
                 return
             deal = self.broker.get_closed_deal_info(pos["ticket"])
             close_price = float(deal.get("exit_price", pos["entry"]))
@@ -723,13 +752,14 @@ class ZZLiveBot:
             until = now + timedelta(hours=COOLDOWN_LOSS_H)
             self.zone_cooldown[zk] = until
             log.info("LOSS — zone %s blocked until %s", zk, until.strftime("%H:%M UTC"))
-            if ZONE_MAX_LOSSES > 0:
+            # Only blacklist on real money losses — profitable trailing exits are outcome=-1 but pnl>0
+            if pnl < 0 and ZONE_MAX_LOSSES > 0:
                 new_count = self.zone_consec_losses.get(zid, 0) + 1
                 self.zone_consec_losses[zid] = new_count
                 if new_count >= ZONE_MAX_LOSSES:
                     self.zone_blacklist.add(zid)
                     log.info(
-                        "Zone %s blacklisted after %d consecutive SL hits",
+                        "Zone %s blacklisted after %d consecutive losses",
                         zid, new_count,
                     )
 

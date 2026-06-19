@@ -83,7 +83,8 @@ regime:
 
 # Trailing stop (USTEC only — not shared with gold)
 trailing:
-  enable_trailing: false
-  be_buffer_pts: 5.0           # pts above/below entry for break-even SL
-  atr_trail_mult: 1.5          # ATR backstop: SL stays within mult×ATR of price
+  enable_trailing: true
+  be_trigger_pts: 30.0         # move SL to BE once price moves this many pts in profit
+  be_buffer_pts: 5.0           # pts above/below entry for the BE stop (entry + buffer)
+  atr_trail_mult: 0.0          # ATR backstop disabled — swing trail handles SL progression
   trail_on_confirmed_swing_only: true

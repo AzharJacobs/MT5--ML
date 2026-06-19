@@ -24,6 +24,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from trading.strategies.zz.ustec.strategy import (
     MIN_RR, SPREAD_PTS, FIXED_LOTS, MAX_FORWARD_BARS, MIN_SL_PCT,
     ZONE_MAX_LOSSES, H4_REGIME_FILTER,
+    ENABLE_TRAILING, BE_TRIGGER_PTS, BE_BUFFER_PTS, ATR_TRAIL_MULT,
 )
 from trading.strategies.zz.ustec.engine import run_backtest
 
@@ -63,6 +64,12 @@ def main() -> None:
     # Cooldown
     parser.add_argument("--no_leave_return", action="store_true")
     parser.add_argument("--cooldown_bars",   type=int, default=15)
+    # Trailing stop
+    parser.add_argument("--trailing",    dest="enable_trailing", action="store_true",  default=ENABLE_TRAILING)
+    parser.add_argument("--no_trailing", dest="enable_trailing", action="store_false")
+    parser.add_argument("--be_trigger",  type=float, default=BE_TRIGGER_PTS)
+    parser.add_argument("--be_buffer",   type=float, default=BE_BUFFER_PTS)
+    parser.add_argument("--atr_mult",    type=float, default=ATR_TRAIL_MULT)
     # Output
     parser.add_argument("--save",  default=None)
     parser.add_argument("--chart", action="store_true")
@@ -97,6 +104,10 @@ def main() -> None:
         dir_cooldown_bars=args.dir_cooldown,
         h4_regime_filter=args.h4_regime_filter,
         min_sl_pct=args.min_sl_pct,
+        enable_trailing=args.enable_trailing,
+        be_trigger_pts=args.be_trigger,
+        be_buffer_pts=args.be_buffer,
+        atr_trail_mult=args.atr_mult,
         realistic=args.realistic,
         save_path=args.save,
         chart=args.chart,

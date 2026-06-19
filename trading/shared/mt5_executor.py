@@ -48,6 +48,32 @@ class MT5Executor(BrokerInterface):
             )
         return tick
 
+    def modify_sl(self, ticket: int, new_sl: float) -> bool:
+        import MetaTrader5 as mt5
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.warning("modify_sl: ticket=%d not found in open positions", ticket)
+            return False
+        pos = positions[0]
+        request = {
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol":   pos.symbol,
+            "sl":       new_sl,
+            "tp":       pos.tp,
+        }
+        result = mt5.order_send(request)
+        if result is None:
+            logger.error("modify_sl: order_send returned None ticket=%d last_error=%s",
+                         ticket, mt5.last_error())
+            return False
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error("modify_sl failed: ticket=%d retcode=%s %s",
+                         ticket, result.retcode, result.comment)
+            return False
+        logger.info("SL modified: ticket=%d new_sl=%.2f", ticket, new_sl)
+        return True
+
     def place_order(
         self,
         symbol: str,

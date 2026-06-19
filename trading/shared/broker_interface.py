@@ -24,6 +24,9 @@ class BrokerInterface(ABC):
     ) -> Optional[int]: ...
 
     @abstractmethod
+    def modify_sl(self, ticket: int, new_sl: float) -> bool: ...
+
+    @abstractmethod
     def close_order(self, ticket: int) -> bool: ...
 
     @abstractmethod

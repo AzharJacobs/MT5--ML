@@ -38,6 +38,9 @@ class PaperTrader(BrokerInterface):
         logger.info("[PAPER] %s %s %.2f lots | SL=%.5f TP=%.5f ticket=%d", direction, symbol, volume, sl, tp, ticket)
         return ticket
 
+    def modify_sl(self, ticket: int, new_sl: float) -> bool:
+        return False
+
     def close_order(self, ticket: int) -> bool:
         if ticket in self._positions:
             pos = self._positions.pop(ticket)

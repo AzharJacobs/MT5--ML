@@ -35,6 +35,7 @@ from trading.strategies.zz.ustec.strategy import (
     MAX_SL_PCT       as _CFG_MAX_SL_PCT,
     ENABLE_TRAILING  as _CFG_ENABLE_TRAILING,
     BE_BUFFER_PTS    as _CFG_BE_BUFFER_PTS,
+    BE_TRIGGER_PTS   as _CFG_BE_TRIGGER_PTS,
     ATR_TRAIL_MULT   as _CFG_ATR_TRAIL_MULT,
     H4_REGIME_FILTER as _CFG_H4_REGIME_FILTER,
 )
@@ -154,6 +155,7 @@ def run_backtest(
     max_sl_pct: float = _CFG_MAX_SL_PCT,
     enable_trailing:   bool  = _CFG_ENABLE_TRAILING,
     be_buffer_pts:     float = _CFG_BE_BUFFER_PTS,
+    be_trigger_pts:    float = _CFG_BE_TRIGGER_PTS,
     atr_trail_mult:    float = _CFG_ATR_TRAIL_MULT,
     trail_swing_left:  int   = 2,
     trail_swing_right: int   = 2,
@@ -515,8 +517,15 @@ def run_backtest(
         _be_triggered = False
         _trail_sl     = sl
         if enable_trailing:
-            _midline    = (entry + tp) / 2
-            _atr_trs    = []
+            _midline = (entry + tp) / 2
+            # be_trigger_pts > 0 → trigger BE at fixed pts offset; else use midline
+            if be_trigger_pts > 0:
+                _be_trig_buy  = entry + be_trigger_pts
+                _be_trig_sell = entry - be_trigger_pts
+            else:
+                _be_trig_buy  = _midline
+                _be_trig_sell = _midline
+            _atr_trs = []
             for _ak in range(max(1, i - 13), i + 1):
                 _h  = float(df_15m["high"].iloc[_ak])
                 _l  = float(df_15m["low"].iloc[_ak])
@@ -524,8 +533,8 @@ def run_backtest(
                 _atr_trs.append(max(_h - _l, abs(_h - _pc), abs(_l - _pc)))
             _atr14 = sum(_atr_trs) / max(len(_atr_trs), 1)
         else:
-            _midline = 0.0
-            _atr14   = 0.0
+            _be_trig_buy = _be_trig_sell = _midline = 0.0
+            _atr14 = 0.0
 
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
@@ -537,16 +546,18 @@ def run_backtest(
             # ── Trailing stop update ──────────────────────────────────────────
             if enable_trailing:
                 fc = float(df_15m["close"].iloc[j])
-                # 1. Break-even trigger at midline
+                # 1. Break-even at midline: trigger on bar close, not high/low
                 if not _be_triggered:
-                    if direction == "buy"  and fh >= _midline:
+                    if direction == "buy"  and fc >= _midline:
                         _be_triggered = True
                         _trail_sl = max(_trail_sl, entry + be_buffer_pts)
-                    elif direction == "sell" and fl <= _midline:
+                    elif direction == "sell" and fc <= _midline:
                         _be_triggered = True
                         _trail_sl = min(_trail_sl, entry - be_buffer_pts)
-                if _be_triggered:
-                    # 2. Ratchet behind newly confirmed M15 swing (O(1) per bar)
+                if _be_triggered and be_trigger_pts == 0:
+                    # 2. Ratchet behind newly confirmed M15 swing — legacy midline mode only.
+                    # When be_trigger_pts > 0 (pure BE stop), we skip swing trailing so the
+                    # SL stays fixed at entry+buffer and doesn't generate premature extra exits.
                     _sb = j - trail_swing_right
                     if _sb > i + trail_swing_left:
                         _sb_l = float(df_15m["low"].iloc[_sb])
@@ -633,16 +644,19 @@ def run_backtest(
                 zone_cooldown[zk] = exit_bar + cooldown_bars
         elif outcome == -1:
             zone_cooldown[zk] = exit_bar + COOLDOWN_LOSS
-            if zone_max_losses > 0:
-                new_count = zone_consec_losses.get(zid, 0) + 1
-                zone_consec_losses[zid] = new_count
-                if new_count >= zone_max_losses:
-                    zone_blacklist.add(zid)
-            if dir_max_losses > 0:
-                new_dir = dir_consec_losses[direction] + 1
-                dir_consec_losses[direction] = new_dir
-                if new_dir >= dir_max_losses:
-                    dir_cooldown[direction] = exit_bar + dir_cooldown_bars
+            # Only blacklist / count losses when the trade actually lost money.
+            # A trailing-stop exit at BE+buffer is outcome=-1 but pnl > 0; don't penalise the zone.
+            if pnl < 0:
+                if zone_max_losses > 0:
+                    new_count = zone_consec_losses.get(zid, 0) + 1
+                    zone_consec_losses[zid] = new_count
+                    if new_count >= zone_max_losses:
+                        zone_blacklist.add(zid)
+                if dir_max_losses > 0:
+                    new_dir = dir_consec_losses[direction] + 1
+                    dir_consec_losses[direction] = new_dir
+                    if new_dir >= dir_max_losses:
+                        dir_cooldown[direction] = exit_bar + dir_cooldown_bars
         else:
             zone_consec_losses[zid] = 0
 
@@ -739,6 +753,7 @@ def run_backtest(
         "h4_regime_filter":    h4_regime_filter,
         "regime_conf_filter":  regime_conf_filter,
         "enable_trailing":     enable_trailing,
+        "be_trigger_pts":      be_trigger_pts if enable_trailing else "disabled",
         "be_buffer_pts":       be_buffer_pts  if enable_trailing else "disabled",
         "atr_trail_mult":      atr_trail_mult if enable_trailing else "disabled",
         "min_sl_pct":          min_sl_pct if min_sl_pct > 0 else "disabled",
@@ -872,6 +887,7 @@ def main() -> None:
     parser.add_argument("--realistic",   action="store_true")
     parser.add_argument("--trailing",    dest="enable_trailing", action="store_true",  default=_CFG_ENABLE_TRAILING)
     parser.add_argument("--no_trailing", dest="enable_trailing", action="store_false")
+    parser.add_argument("--be_trigger",  type=float, default=_CFG_BE_TRIGGER_PTS)
     parser.add_argument("--be_buffer",   type=float, default=_CFG_BE_BUFFER_PTS)
     parser.add_argument("--atr_mult",    type=float, default=_CFG_ATR_TRAIL_MULT)
     args = parser.parse_args()
@@ -906,6 +922,7 @@ def main() -> None:
         min_sl_pct=args.min_sl_pct,
         realistic=args.realistic,
         enable_trailing=args.enable_trailing,
+        be_trigger_pts=args.be_trigger,
         be_buffer_pts=args.be_buffer,
         atr_trail_mult=args.atr_mult,
         save_path=args.save,
