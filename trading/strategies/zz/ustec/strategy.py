@@ -60,6 +60,9 @@ ENABLE_TRAILING      = bool(_trail.get("enable_trailing", False))
 BE_BUFFER_PTS        = float(_trail.get("be_buffer_pts", 5.0))
 ATR_TRAIL_MULT       = float(_trail.get("atr_trail_mult", 1.5))
 
+_regime              = _cfg.get("regime", {})
+H4_REGIME_FILTER     = bool(_regime.get("h4_regime_filter", False))
+
 
 def make_configs() -> tuple[TFConfig, ConfirmationConfig, TradeSetupConfig]:
     """

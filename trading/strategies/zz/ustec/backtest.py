@@ -22,7 +22,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from trading.strategies.zz.ustec.strategy import (
-    MIN_RR, SPREAD_PTS, FIXED_LOTS, MAX_FORWARD_BARS,
+    MIN_RR, SPREAD_PTS, FIXED_LOTS, MAX_FORWARD_BARS, MIN_SL_PCT,
+    ZONE_MAX_LOSSES, H4_REGIME_FILTER,
 )
 from trading.strategies.zz.ustec.engine import run_backtest
 
@@ -48,17 +49,17 @@ def main() -> None:
     parser.add_argument("--aggressive_boundary", action="store_true")
     parser.add_argument("--exclude_signals", default="",
                         help="Comma-separated signal names to exclude from count")
-    parser.add_argument("--zone_max_losses", type=int, default=0)
+    parser.add_argument("--zone_max_losses", type=int, default=ZONE_MAX_LOSSES)
     parser.add_argument("--dir_max_losses",   type=int, default=0)
     parser.add_argument("--dir_cooldown",     type=int, default=48)
-    parser.add_argument("--h4_regime_filter", action="store_true")
-    parser.add_argument("--n_consec_ll",      type=int, default=2)
+    parser.add_argument("--h4_regime_filter",    dest="h4_regime_filter", action="store_true",  default=H4_REGIME_FILTER)
+    parser.add_argument("--no_h4_regime_filter", dest="h4_regime_filter", action="store_false")
     # Step 4
     parser.add_argument("--aggressive_entry", action="store_true")
     parser.add_argument("--midline_tp",  action="store_true")
     parser.add_argument("--midline_pct", type=float, default=0.50)
     parser.add_argument("--sl_buffer",   type=float, default=0.002)
-    parser.add_argument("--min_sl_pct",  type=float, default=0.10)
+    parser.add_argument("--min_sl_pct",  type=float, default=MIN_SL_PCT)
     # Cooldown
     parser.add_argument("--no_leave_return", action="store_true")
     parser.add_argument("--cooldown_bars",   type=int, default=15)
@@ -95,7 +96,6 @@ def main() -> None:
         dir_max_losses=args.dir_max_losses,
         dir_cooldown_bars=args.dir_cooldown,
         h4_regime_filter=args.h4_regime_filter,
-        n_consec_ll=args.n_consec_ll,
         min_sl_pct=args.min_sl_pct,
         realistic=args.realistic,
         save_path=args.save,

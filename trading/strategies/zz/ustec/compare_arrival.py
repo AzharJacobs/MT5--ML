@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-compare_arrival.py — Compare three gradual-filter modes over the 3-year USTEC backtest.
+compare_arrival.py — Compare gradual-filter modes over the 3-year USTEC backtest.
 
 Modes
 -----
   baseline         — all trades (arrival_type = retest | gradual)
   full_filter      — retest only (all gradual entries dropped)
+  no_multi_conf    — retest + gradual with 1 conf only (drop gradual 2+conf)
   tightened        — retest + gradual with 2+ confirmations AND fresh zone
 
 Tables printed
@@ -28,17 +29,18 @@ _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from trading.strategies.zz.ustec.strategy import MIN_RR, SPREAD_PTS, FIXED_LOTS, MAX_FORWARD_BARS
+from trading.strategies.zz.ustec.strategy import (
+    MIN_RR, MIN_SL_PCT, SPREAD_PTS, FIXED_LOTS, MAX_FORWARD_BARS,
+)
 from trading.strategies.zz.ustec.engine import run_backtest
 
 
 def _mode_stats(metrics: dict, df_t) -> dict:
-    import pandas as pd
     n   = len(df_t)
     wr  = (df_t["outcome"] == 1).mean() * 100 if n else 0.0
     net = df_t["pnl"].sum() if n else 0.0
     avg = df_t["pnl"].mean() if n else 0.0
-    dd  = float(metrics.get("max_drawdown_%", "0").replace("%", "")) if isinstance(metrics.get("max_drawdown_%"), str) else float(metrics.get("max_drawdown_%", 0))
+    dd  = float(str(metrics.get("max_drawdown_%", "0")).replace("%", ""))
     return {"trades": n, "wr": wr, "net": net, "avg": avg, "dd": dd}
 
 
@@ -47,69 +49,70 @@ def run_comparison(start: str, end: str, cash: float, spread: float, fixed_lot: 
     shared = dict(
         start=start, end=end, cash=cash,
         symbol="ustech", spread=spread, fixed_lot=fixed_lot,
-        min_rr=MIN_RR, max_forward_bars=MAX_FORWARD_BARS,
+        min_rr=MIN_RR, min_sl_pct=MIN_SL_PCT, max_forward_bars=MAX_FORWARD_BARS,
         silent=True,
     )
 
-    print(f"\nRunning 3-year backtest  {start} → {end}  (3 modes) …")
+    modes = [
+        ("baseline",      "all"),
+        ("full_filter",   "retest_only"),
+        ("no_multi_conf", "no_multi_conf"),
+        ("tightened",     "tightened"),
+    ]
 
-    print("  [1/3] baseline …", end="", flush=True)
-    m_base, df_base = run_backtest(gradual_filter="all", **shared)
-    print(" done")
+    print(f"\nRunning backtest  {start} → {end}  ({len(modes)} modes)  min_sl_pct={MIN_SL_PCT} …")
+    results = {}
+    for idx, (label, gf) in enumerate(modes, 1):
+        print(f"  [{idx}/{len(modes)}] {label} …", end="", flush=True)
+        m, df = run_backtest(gradual_filter=gf, **shared)
+        results[label] = (m, df)
+        print(" done")
+    print()
 
-    print("  [2/3] full_filter (retest only) …", end="", flush=True)
-    m_full, df_full = run_backtest(gradual_filter="retest_only", **shared)
-    print(" done")
-
-    print("  [3/3] tightened (retest + gradual 2+conf & fresh) …", end="", flush=True)
-    m_tight, df_tight = run_backtest(gradual_filter="tightened", **shared)
-    print(" done\n")
-
-    s_base  = _mode_stats(m_base,  df_base)
-    s_full  = _mode_stats(m_full,  df_full)
-    s_tight = _mode_stats(m_tight, df_tight)
+    stats = {label: _mode_stats(m, df) for label, (m, df) in results.items()}
 
     # ── Table 1: side-by-side comparison ─────────────────────────────────────
-    W = 16
-    sep = "─" * (W * 4 + 3)
+    cols   = [label for label, _ in modes]
+    W      = 15
+    sep    = "─" * (22 + W * len(cols) + len(cols))
+    header = f"  {'Metric':<22}" + "".join(f" {c:>{W}}" for c in cols)
+
     print(sep)
-    print(f"  Mode Comparison  ({start} → {end})")
+    print(f"  Mode Comparison  ({start} → {end})  min_sl_pct={MIN_SL_PCT}")
     print(sep)
-    print(f"  {'Metric':<22} {'Baseline':>{W}} {'Full Filter':>{W}} {'Tightened':>{W}}")
+    print(header)
     print(sep)
 
-    rows = [
-        ("Trades",    f"{s_base['trades']}",          f"{s_full['trades']}",          f"{s_tight['trades']}"),
-        ("Win Rate",  f"{s_base['wr']:.1f}%",         f"{s_full['wr']:.1f}%",         f"{s_tight['wr']:.1f}%"),
-        ("Net PnL",   f"${s_base['net']:+.2f}",       f"${s_full['net']:+.2f}",       f"${s_tight['net']:+.2f}"),
-        ("Avg PnL",   f"${s_base['avg']:+.2f}",       f"${s_full['avg']:+.2f}",       f"${s_tight['avg']:+.2f}"),
-        ("Max DD%",   f"{s_base['dd']:.2f}%",         f"{s_full['dd']:.2f}%",         f"{s_tight['dd']:.2f}%"),
+    metric_rows = [
+        ("Trades",   lambda s: f"{s['trades']}"),
+        ("Win Rate", lambda s: f"{s['wr']:.1f}%"),
+        ("Net PnL",  lambda s: f"${s['net']:+.2f}"),
+        ("Avg PnL",  lambda s: f"${s['avg']:+.2f}"),
+        ("Max DD%",  lambda s: f"{s['dd']:.2f}%"),
     ]
-    for label, v1, v2, v3 in rows:
-        print(f"  {label:<22} {v1:>{W}} {v2:>{W}} {v3:>{W}}")
+    for row_label, fn in metric_rows:
+        line = f"  {row_label:<22}" + "".join(f" {fn(stats[c]):>{W}}" for c in cols)
+        print(line)
     print(sep)
     print()
 
-    # ── Table 2: gradual breakdown (from baseline df) ─────────────────────────
-    g_all = df_base[df_base["arrival_type"] == "gradual"].copy()
+    # ── Table 2: gradual breakdown from baseline ──────────────────────────────
+    df_base = results["baseline"][1]
+    g_all   = df_base[df_base["arrival_type"] == "gradual"].copy()
 
     if g_all.empty:
         print("  No gradual trades in baseline — breakdown not applicable.")
         return
 
-    def _grp_stats(sub):
+    def _grp(sub):
         if sub.empty:
             return 0, 0.0, 0.0
-        wr  = (sub["outcome"] == 1).mean() * 100
-        net = sub["pnl"].sum()
-        return len(sub), wr, net
+        return len(sub), (sub["outcome"] == 1).mean() * 100, sub["pnl"].sum()
 
-    conf_1   = g_all[g_all["confirmations"] < 2]
-    conf_2p  = g_all[g_all["confirmations"] >= 2]
-    fresh    = g_all[g_all["zone_fresh"] == True]
-    tapped   = g_all[g_all["zone_fresh"] == False]
-
-    # cross-cut: conf × freshness (4 cells)
+    conf_1    = g_all[g_all["confirmations"] < 2]
+    conf_2p   = g_all[g_all["confirmations"] >= 2]
+    fresh     = g_all[g_all["zone_fresh"] == True]
+    tapped    = g_all[g_all["zone_fresh"] == False]
     c1_fresh  = g_all[(g_all["confirmations"] < 2)  & (g_all["zone_fresh"] == True)]
     c1_tapped = g_all[(g_all["confirmations"] < 2)  & (g_all["zone_fresh"] == False)]
     c2_fresh  = g_all[(g_all["confirmations"] >= 2) & (g_all["zone_fresh"] == True)]
@@ -117,22 +120,22 @@ def run_comparison(start: str, end: str, cash: float, spread: float, fixed_lot: 
 
     sep2 = "─" * 68
     print(sep2)
-    print(f"  Gradual trades breakdown  (baseline, n={len(g_all)})")
+    print(f"  Gradual breakdown  (baseline, n={len(g_all)})")
     print(sep2)
     print(f"  {'Slice':<28} {'Count':>6} {'WR%':>7} {'Net PnL':>12} {'Avg PnL':>10}")
     print(sep2)
 
     slices = [
-        ("1 confirmation",   *_grp_stats(conf_1)),
-        ("2+ confirmations", *_grp_stats(conf_2p)),
+        ("1 confirmation",   *_grp(conf_1)),
+        ("2+ confirmations", *_grp(conf_2p)),
         ("─── by freshness", None, None, None),
-        ("fresh zone",       *_grp_stats(fresh)),
-        ("tapped zone",      *_grp_stats(tapped)),
+        ("fresh zone",       *_grp(fresh)),
+        ("tapped zone",      *_grp(tapped)),
         ("─── cross-cut",    None, None, None),
-        ("1-conf + fresh",   *_grp_stats(c1_fresh)),
-        ("1-conf + tapped",  *_grp_stats(c1_tapped)),
-        ("2+-conf + fresh",  *_grp_stats(c2_fresh)),
-        ("2+-conf + tapped", *_grp_stats(c2_tapped)),
+        ("1-conf + fresh",   *_grp(c1_fresh)),
+        ("1-conf + tapped",  *_grp(c1_tapped)),
+        ("2+-conf + fresh",  *_grp(c2_fresh)),
+        ("2+-conf + tapped", *_grp(c2_tapped)),
     ]
     for row in slices:
         label, cnt, wr, net = row
@@ -142,16 +145,16 @@ def run_comparison(start: str, end: str, cash: float, spread: float, fixed_lot: 
         avg = net / cnt if cnt > 0 else 0.0
         print(f"  {label:<28} {cnt:>6} {wr:>6.1f}% {net:>+12.2f} {avg:>+10.2f}")
     print(sep2)
-    print()
 
-    # ── Tightened: which graduals survive ─────────────────────────────────────
-    surviving = g_all[(g_all["confirmations"] >= 2) & (g_all["zone_fresh"] == True)]
-    dropped   = g_all[~((g_all["confirmations"] >= 2) & (g_all["zone_fresh"] == True))]
-    sv_n, sv_wr, sv_net = _grp_stats(surviving)
-    dr_n, dr_wr, dr_net = _grp_stats(dropped)
-    print(f"  Tightened filter — of {len(g_all)} gradual trades:")
-    print(f"    kept  (2+conf AND fresh): {sv_n:>3}  WR={sv_wr:.1f}%  net=${sv_net:+.2f}")
-    print(f"    dropped                 : {dr_n:>3}  WR={dr_wr:.1f}%  net=${dr_net:+.2f}")
+    # ── no_multi_conf filter summary ──────────────────────────────────────────
+    kept_nmc    = g_all[g_all["confirmations"] < 2]
+    dropped_nmc = g_all[g_all["confirmations"] >= 2]
+    kn, kwr, knet = _grp(kept_nmc)
+    dn, dwr, dnet = _grp(dropped_nmc)
+    print()
+    print(f"  no_multi_conf filter — of {len(g_all)} gradual trades:")
+    print(f"    kept  (1 conf)  : {kn:>3}  WR={kwr:.1f}%  net=${knet:+.2f}  avg=${knet/kn:+.2f}" if kn else f"    kept  (1 conf)  :   0")
+    print(f"    dropped (2+conf): {dn:>3}  WR={dwr:.1f}%  net=${dnet:+.2f}  avg=${dnet/dn:+.2f}" if dn else f"    dropped (2+conf):   0")
     print()
 
 

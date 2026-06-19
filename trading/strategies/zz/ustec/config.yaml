@@ -75,7 +75,11 @@ cooldown:
   cooldown_loss_h: 12          # hours to block zone after a loss (≈48 × M15 bars)
   cooldown_win_floor_h: 3.75   # minimum hours after win before leave-and-return eligible
   max_forward_bars: 350        # 350 × 15 min ≈ 87 h ≈ 4 trading days
-  zone_max_losses: 2           # permanently blacklist a zone after this many consecutive SL hits
+  zone_max_losses: 1           # retire a zone after its first SL hit — seek fresher zones
+
+# Regime filter — blocks buys when price is below both H4 EMA50 and EMA200
+regime:
+  h4_regime_filter: true
 
 # Trailing stop (USTEC only — not shared with gold)
 trailing:

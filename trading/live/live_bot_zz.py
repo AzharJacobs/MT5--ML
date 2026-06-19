@@ -53,6 +53,7 @@ from trading.strategies.zz.ustec.strategy import (
     COOLDOWN_LOSS_H, COOLDOWN_WIN_FLOOR_H, TAP_TOL,
     ZONE_MAX_LOSSES,
     ENABLE_TRAILING, BE_BUFFER_PTS, ATR_TRAIL_MULT,
+    H4_REGIME_FILTER,
     make_configs,
 )
 
@@ -86,6 +87,7 @@ LOG_DIR.mkdir(exist_ok=True)
 TRADE_FIELDS = [
     "timestamp", "symbol", "mode",
     "zone_id", "zone_bottom", "zone_top", "zone_kind", "zone_strength", "zone_fresh",
+    "arrival_type",
     "h4_bias", "direction",
     "signals_fired", "confirmation_count", "choch_fired",
     "entry_mode", "tp_mode",
@@ -247,7 +249,7 @@ def _lot_size_mt5(symbol: str, sl_dist: float, fallback: float = 0.01) -> float:
 
 class ZZLiveBot:
 
-    def __init__(self, broker: BrokerInterface, mode: str):
+    def __init__(self, broker: BrokerInterface, mode: str, starting_equity: float = 10_000.0):
         self.broker = broker
         self.mode   = mode
         self.zlog   = ZZLogger(mode)
@@ -265,7 +267,13 @@ class ZZLiveBot:
         self.zone_blacklist:       set  = set()   # Change 1: permanent post-loss blacklist
         self.zone_consec_losses:   dict = {}      # Change 1: consecutive SL count per zone_id
 
+        # Arrival-type tracking — per zone, did price exit after first touch?
+        self.zone_touch_tracker: dict = {}  # {zk: {"bottom", "top", "exited"}}
+
         self.open_positions: list = []
+
+        # Running equity for paper-mode fixed-fractional sizing
+        self._equity: float = starting_equity
 
         self.db = get_connection()
         self.db.database = DB_NAME
@@ -380,6 +388,8 @@ class ZZLiveBot:
 
         df_15m_w = df_15m.tail(M15_WINDOW).reset_index(drop=True)
         df_4h_w  = df_4h.tail(H4_WINDOW).reset_index(drop=True)
+        df_4h_w["ema50"]  = df_4h_w["close"].ewm(span=50,  adjust=False).mean()
+        df_4h_w["ema200"] = df_4h_w["close"].ewm(span=200, adjust=False).mean()
 
         if self.mode == "paper":
             last_bar_ts = df_15m_w["timestamp"].iloc[-1]
@@ -396,6 +406,12 @@ class ZZLiveBot:
 
         bar_h = float(df_15m_w["high"].iloc[-1])
         bar_l = float(df_15m_w["low"].iloc[-1])
+
+        for _zks in self.zone_touch_tracker.values():
+            if not _zks["exited"]:
+                if bar_h < _zks["bottom"] or bar_l > _zks["top"]:
+                    _zks["exited"] = True
+
         self._update_zone_reentry(now, bar_h, bar_l)
 
         for pos in list(self.open_positions):
@@ -420,6 +436,22 @@ class ZZLiveBot:
         direction   = tf_result["direction"]
         zk          = self._zk(active_zone)
         zid         = active_zone.zone_id
+
+        if H4_REGIME_FILTER and direction == "buy":
+            _price  = float(df_15m_w["close"].iloc[-1])
+            _ema50  = float(df_4h_w["ema50"].iloc[-1])
+            _ema200 = float(df_4h_w["ema200"].iloc[-1])
+            if _price < _ema50 and _price < _ema200:
+                self.zlog.log_skip(now, "regime_filter_buy_blocked", tf_result)
+                log.info("Buy blocked — price below H4 EMA50 and EMA200 (downtrend regime)")
+                return
+
+        if zk not in self.zone_touch_tracker:
+            self.zone_touch_tracker[zk] = {
+                "bottom": active_zone.bottom,
+                "top":    active_zone.top,
+                "exited": False,
+            }
 
         if self._zone_blocked(zk, now):
             self.zlog.log_skip(now, "zone_cooldown", tf_result)
@@ -469,6 +501,15 @@ class ZZLiveBot:
             log.info("TP too close — tp=%.2f signal=%.2f headroom=%.1f pts", setup.tp, signal_price, signal_price - setup.tp)
             return
 
+        arrival_type = "retest" if self.zone_touch_tracker.get(zk, {}).get("exited", False) else "gradual"
+
+        # Gradual (first-touch) entries only allowed with strong reversal confirmation.
+        _STRONG_SIGNALS = {"rejection_wick", "engulfing", "bos_msb", "choch"}
+        if arrival_type == "gradual" and not _STRONG_SIGNALS.intersection(conf.signals):
+            self.zlog.log_skip(now, "gradual_no_confirm", tf_result)
+            log.info("Gradual entry skipped — no strong reversal signal on first touch")
+            return
+
         self._enter_trade(
             now=now,
             direction=direction,
@@ -479,9 +520,10 @@ class ZZLiveBot:
             tf_result=tf_result,
             conf=conf,
             df_15m_w=df_15m_w,
+            arrival_type=arrival_type,
         )
 
-    def _enter_trade(self, now, direction, setup, active_zone, zk, zid, tf_result, conf, df_15m_w=None) -> None:
+    def _enter_trade(self, now, direction, setup, active_zone, zk, zid, tf_result, conf, df_15m_w=None, arrival_type: str = "gradual") -> None:
         signal_price = setup.entry
         entry = setup.entry
         sl    = setup.sl
@@ -493,21 +535,7 @@ class ZZLiveBot:
         sl_dist = abs(setup.entry - sl)
         sl = (entry - sl_dist) if direction == "buy" else (entry + sl_dist)
 
-        # Change 1: structural SL — tighten to nearest M15 swing point inside zone
-        if df_15m_w is not None:
-            _m15_sw = _detect_swings_m15(df_15m_w, left=3, right=2)
-            if direction == "buy":
-                _sw_lows = [p for _, p, k in _m15_sw if k == "L" and sl < p < entry]
-                if _sw_lows:
-                    _cand = max(_sw_lows) * (1.0 - 0.001)
-                    if sl < _cand < entry:
-                        sl = _cand
-            else:
-                _sw_highs = [p for _, p, k in _m15_sw if k == "H" and entry < p < sl]
-                if _sw_highs:
-                    _cand = min(_sw_highs) * (1.0 + 0.001)
-                    if entry < _cand < sl:
-                        sl = _cand
+        # SL is placed outside the zone by trade_setup.py — no tightening applied.
 
         if direction == "buy" and (sl >= entry or tp <= entry):
             log.warning("Geometry invalid after spread adjust — skip")
@@ -552,8 +580,12 @@ class ZZLiveBot:
                 )
                 return
 
-        lots = FIXED_LOTS
-        rr   = abs(tp - entry) / abs(entry - sl)
+        sl_dist = abs(entry - sl)
+        if self.mode == "mt5":
+            lots = _lot_size_mt5(SYMBOL, sl_dist)
+        else:
+            lots = _lot_size_formula(self._equity, sl_dist)
+        rr = abs(tp - entry) / sl_dist if sl_dist > 0 else 0.0
 
         ticket = self.broker.place_order(
             symbol    = SYMBOL,
@@ -590,6 +622,7 @@ class ZZLiveBot:
             "zone_kind":          active_zone.kind,
             "zone_strength":      round(active_zone.strength, 2),
             "zone_fresh":         active_zone.fresh,
+            "arrival_type":       arrival_type,
             "h4_bias":            tf_result["h4_bias"],
             "direction":          direction,
             "signals_fired":      "|".join(conf.signals),
@@ -700,6 +733,11 @@ class ZZLiveBot:
                         zid, new_count,
                     )
 
+        self.zone_touch_tracker.pop(pos["zk"], None)
+
+        if self.mode == "paper":
+            self._equity = max(self._equity + pnl, 0.0)
+
         record = {**pos["record"]}
         record["outcome"]     = outcome
         record["close_price"] = round(close_price, 2)
@@ -741,6 +779,8 @@ def main() -> None:
     parser.add_argument("--mode", default="paper", choices=["paper", "mt5"])
     parser.add_argument("--once", action="store_true",
                         help="Evaluate one bar then exit (for testing)")
+    parser.add_argument("--equity", type=float, default=10_000.0,
+                        help="Starting equity for paper-mode fixed-fractional sizing")
     parser.add_argument("--login",    type=int)
     parser.add_argument("--password")
     parser.add_argument("--server")
@@ -761,11 +801,11 @@ def main() -> None:
         log.info("MT5 connected | login=%d server=%s", login, server)
     else:
         from trading.shared.paper_trader import PaperTrader
-        broker = PaperTrader(starting_equity=10_000.0)
+        broker = PaperTrader(starting_equity=args.equity)
         broker.connect()
-        log.info("Paper trader initialised (equity=$10,000)")
+        log.info("Paper trader initialised (equity=$%.2f)", args.equity)
 
-    bot = ZZLiveBot(broker=broker, mode=args.mode)
+    bot = ZZLiveBot(broker=broker, mode=args.mode, starting_equity=args.equity)
 
     if args.once:
         bot.run_once()

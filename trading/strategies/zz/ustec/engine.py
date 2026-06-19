@@ -36,6 +36,7 @@ from trading.strategies.zz.ustec.strategy import (
     ENABLE_TRAILING  as _CFG_ENABLE_TRAILING,
     BE_BUFFER_PTS    as _CFG_BE_BUFFER_PTS,
     ATR_TRAIL_MULT   as _CFG_ATR_TRAIL_MULT,
+    H4_REGIME_FILTER as _CFG_H4_REGIME_FILTER,
 )
 
 
@@ -92,10 +93,10 @@ def _count_overnights(ts_entry: pd.Timestamp, ts_exit: pd.Timestamp) -> int:
     return max(0, (ts_exit.date() - ts_entry.date()).days)
 
 
-def _lot_size(equity: float, sl_dist: float, contract_size: float) -> float:
+def _lot_size(equity: float, sl_dist: float, contract_size: float, risk_pct: float = RISK_PCT) -> float:
     if sl_dist <= 0:
         return 0.01
-    lot = (equity * RISK_PCT) / (sl_dist * contract_size)
+    lot = (equity * risk_pct) / (sl_dist * contract_size)
     return max(round(lot, 2), 0.01)
 
 
@@ -147,8 +148,7 @@ def run_backtest(
     zone_max_losses: int = _CFG_ZONE_MAX_LOSSES,
     dir_max_losses: int = 0,
     dir_cooldown_bars: int = 48,
-    h4_regime_filter: bool = False,
-    n_consec_ll: int = 2,
+    h4_regime_filter: bool = _CFG_H4_REGIME_FILTER,
     regime_conf_filter: bool = False,
     min_sl_pct: float = 0.0,
     max_sl_pct: float = _CFG_MAX_SL_PCT,
@@ -168,8 +168,9 @@ def run_backtest(
     save_path: Optional[str] = None,
     zone_guard: bool = True,
     chart: bool = False,
-    gradual_filter: str = "all",   # "all" | "retest_only" | "tightened"
+    gradual_filter: str = "all",   # "all" | "retest_only" | "tightened" | "no_multi_conf"
     silent: bool = False,
+    risk_pct: Optional[float] = None,   # overrides RISK_PCT; ignored when fixed_lot > 0
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -181,6 +182,7 @@ def run_backtest(
     eff_spread = spread if spread is not None else SYMBOL_SPREAD.get(sym, 0.0)
     if realistic and spread is None:
         eff_spread = base_spread_pts
+    _risk_pct = risk_pct if risk_pct is not None else RISK_PCT
 
     db = get_connection()
     db.database = db_name
@@ -210,6 +212,7 @@ def run_backtest(
         _pr(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
 
     _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
+    df_4h["ema50"]  = df_4h["close"].ewm(span=50,  adjust=False).mean()
     df_4h["ema200"] = df_4h["close"].ewm(span=200, adjust=False).mean()
 
     tf_cfg = TFConfig(
@@ -334,7 +337,10 @@ def run_backtest(
         direction   = tf_result["direction"]
 
         if h4_regime_filter and direction == "buy":
-            if _h4_bearish_regime(df_h4_w, n_consec_ll, h4_swing_left, h4_swing_right):
+            _price  = float(df_15m_w["close"].iloc[-1])
+            _ema50  = float(df_h4_w["ema50"].iloc[-1])
+            _ema200 = float(df_h4_w["ema200"].iloc[-1])
+            if _price < _ema50 and _price < _ema200:
                 filters["regime_filter"] += 1
                 continue
 
@@ -404,9 +410,19 @@ def run_backtest(
 
         arrival_type = "retest" if zone_touch_tracker.get(zk, {}).get("exited", False) else "gradual"
 
+        # Gradual (first-touch) entries are only allowed when at least one
+        # strong reversal signal confirms the zone is reacting — otherwise wait
+        # for a proper retest of the zone.
+        _STRONG_SIGNALS = {"rejection_wick", "engulfing", "bos_msb", "choch"}
+        if arrival_type == "gradual" and not _STRONG_SIGNALS.intersection(conf.signals):
+            filters["gradual_filter"] += 1
+            continue
+
         if arrival_type == "gradual" and gradual_filter != "all":
-            if gradual_filter == "retest_only" or (
-                gradual_filter == "tightened" and (conf.count < 2 or not active_zone.fresh)
+            if (
+                gradual_filter == "retest_only"
+                or (gradual_filter == "tightened" and (conf.count < 2 or not active_zone.fresh))
+                or (gradual_filter == "no_multi_conf" and conf.count >= 2)
             ):
                 filters["gradual_filter"] += 1
                 continue
@@ -447,21 +463,6 @@ def run_backtest(
         sl_dist = abs(signal_price - setup.sl)
         sl = entry - sl_dist if direction == "buy" else entry + sl_dist
 
-        # Change 1: structural SL — tighten to nearest M15 swing point inside zone
-        _m15_sw = _detect_swings_h4(df_15m_w, left=3, right=2)
-        if direction == "buy":
-            _sw_lows = [p for _, p, k in _m15_sw if k == "L" and sl < p < entry]
-            if _sw_lows:
-                _cand = max(_sw_lows) * (1.0 - 0.001)
-                if sl < _cand < entry:
-                    sl = _cand
-        else:
-            _sw_highs = [p for _, p, k in _m15_sw if k == "H" and entry < p < sl]
-            if _sw_highs:
-                _cand = min(_sw_highs) * (1.0 + 0.001)
-                if entry < _cand < sl:
-                    sl = _cand
-
         if setup.tp_mode == "midline" and setup.tp_zone is not None:
             full_tp = (setup.tp_zone.bottom if direction == "buy" else setup.tp_zone.top)
             tp = entry + midline_pct * (full_tp - entry)
@@ -489,7 +490,7 @@ def run_backtest(
                 filters["sl_too_wide"] += 1
                 continue
 
-        lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size)
+        lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size, _risk_pct)
 
         if realistic:
             margin_needed = lot * contract_size * entry * margin_rate
@@ -722,6 +723,7 @@ def run_backtest(
         "largest_win_$":   f"${df_t['pnl'].max():.2f}",
         "largest_loss_$":  f"${df_t['pnl'].min():.2f}",
         "max_drawdown_%":  f"{max_dd_pct:.2f}",
+        "lowest_equity":   min(equity_curve),
         "spread_pts":      eff_spread,
         "min_rr":          min_rr,
         "min_confirmations": min_confirmations,
@@ -735,7 +737,6 @@ def run_backtest(
         "dir_max_losses":      dir_max_losses if dir_max_losses > 0 else "disabled",
         "dir_cooldown_bars":   dir_cooldown_bars if dir_max_losses > 0 else "n/a",
         "h4_regime_filter":    h4_regime_filter,
-        "n_consec_ll":         n_consec_ll if h4_regime_filter else "n/a",
         "regime_conf_filter":  regime_conf_filter,
         "enable_trailing":     enable_trailing,
         "be_buffer_pts":       be_buffer_pts  if enable_trailing else "disabled",
@@ -857,7 +858,6 @@ def main() -> None:
     parser.add_argument("--dir_max_losses",   type=int, default=0)
     parser.add_argument("--dir_cooldown",     type=int, default=48)
     parser.add_argument("--h4_regime_filter", action="store_true")
-    parser.add_argument("--n_consec_ll",      type=int, default=2)
     parser.add_argument("--regime_conf_filter", action="store_true")
     parser.add_argument("--aggressive_entry", action="store_true")
     parser.add_argument("--midline_tp",  action="store_true")
@@ -902,7 +902,6 @@ def main() -> None:
         dir_max_losses=args.dir_max_losses,
         dir_cooldown_bars=args.dir_cooldown,
         h4_regime_filter=args.h4_regime_filter,
-        n_consec_ll=args.n_consec_ll,
         regime_conf_filter=args.regime_conf_filter,
         min_sl_pct=args.min_sl_pct,
         realistic=args.realistic,
