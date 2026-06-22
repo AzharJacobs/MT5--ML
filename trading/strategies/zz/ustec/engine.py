@@ -177,6 +177,8 @@ def run_backtest(
     use_m15_sl: bool = False,
     m15_sl_atr_floor_mult: float = 0.5,
     max_zone_height_atr: float = 0.0,
+    skip_hours: Optional[list] = None,      # e.g. list(range(0,7)) + list(range(21,24))
+    skip_weekdays: Optional[list] = None,   # e.g. ["Monday", "Sunday"]
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -341,6 +343,9 @@ def run_backtest(
             continue
 
         ts_now = df_15m["timestamp"].iloc[i]
+
+        if skip_hours    and ts_now.hour              in skip_hours:    continue
+        if skip_weekdays and ts_now.day_name()        in skip_weekdays: continue
 
         df_h4_w = df_4h[df_4h["timestamp"] <= ts_now].tail(H4_WINDOW).reset_index(drop=True)
         if len(df_h4_w) < 20:

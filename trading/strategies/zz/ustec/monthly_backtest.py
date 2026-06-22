@@ -39,6 +39,7 @@ def run_monthly(start: str, end: str, cash: float, spread: float, risk_pct: floa
         fixed_lot=0, risk_pct=risk_pct,
         min_rr=MIN_RR, min_sl_pct=MIN_SL_PCT, max_forward_bars=MAX_FORWARD_BARS,
         gradual_filter="all",
+        min_confirmations=2,
         silent=True,
     )
 
