@@ -27,6 +27,7 @@ zone:
   base_lookback: 5
   min_strength: 1.5
   tap_tolerance_pct: 0.001
+  max_zone_height_atr: 2.5   # discard H4 zones wider than 2.5×ATR (cuts ~400pt+ monstrosities)
 
 # Timeframe (H4 bias + M15 entry)
 timeframe:
@@ -67,6 +68,8 @@ trade_setup:
   midline_tp: false
   midline_pct: 0.50
   tp_prefer_fresh: true
+  use_m15_sl: true            # use M15 structural swing as SL anchor instead of zone bottom
+  m15_sl_atr_floor_mult: 0.5  # SL must be >= 0.5×ATR14 from entry (noise guard)
 
 # Cooldown
 cooldown:

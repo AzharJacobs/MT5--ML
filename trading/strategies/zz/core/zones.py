@@ -61,6 +61,14 @@ class ZoneConfig:
     # ±0.1 % around zone edges counts as a tap.
     # Price does not need to close inside; any bar whose range overlaps counts.
 
+    # ── Zone height filter ───────────────────────────────────────────────────
+    max_zone_height_atr: float = 0.0
+    # Zones wider than max_zone_height_atr × ATR at the origin bar are
+    # discarded before they reach zone selection.
+    # 0.0 = disabled.  Tune against zone-width distribution; 3.0 cuts the
+    # widest ~10% of USTEC H4 zones (the 400-700pt monstrosities that make
+    # zone-bottom SL impossible to trade with good RR).
+
 
 # ---------------------------------------------------------------------------
 # Zone data object
@@ -252,14 +260,17 @@ def detect_zones(
                     z_top = float(highs[base_idx])
                     z_bot = float(lows[base_idx])
                     if z_top > z_bot:
-                        zones.append(Zone(
-                            kind="demand",
-                            top=z_top,
-                            bottom=z_bot,
-                            origin_bar=base_idx,
-                            strength=strength,
-                        ))
-                        used_demand.add(base_idx)
+                        if cfg.max_zone_height_atr > 0 and (z_top - z_bot) > cfg.max_zone_height_atr * cur_atr:
+                            pass  # zone too wide — discard
+                        else:
+                            zones.append(Zone(
+                                kind="demand",
+                                top=z_top,
+                                bottom=z_bot,
+                                origin_bar=base_idx,
+                                strength=strength,
+                            ))
+                            used_demand.add(base_idx)
 
         # ── Supply zone (impulsive DOWN) ───────────────────────────────────
         if (net_down >= cfg.impulse_atr_mult * cur_atr
@@ -271,14 +282,17 @@ def detect_zones(
                     z_top = float(highs[base_idx])
                     z_bot = float(lows[base_idx])
                     if z_top > z_bot:
-                        zones.append(Zone(
-                            kind="supply",
-                            top=z_top,
-                            bottom=z_bot,
-                            origin_bar=base_idx,
-                            strength=strength,
-                        ))
-                        used_supply.add(base_idx)
+                        if cfg.max_zone_height_atr > 0 and (z_top - z_bot) > cfg.max_zone_height_atr * cur_atr:
+                            pass  # zone too wide — discard
+                        else:
+                            zones.append(Zone(
+                                kind="supply",
+                                top=z_top,
+                                bottom=z_bot,
+                                origin_bar=base_idx,
+                                strength=strength,
+                            ))
+                            used_supply.add(base_idx)
 
     return zones
 

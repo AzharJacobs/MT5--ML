@@ -410,8 +410,17 @@ class ZZLiveBot:
 
         for _zks in self.zone_touch_tracker.values():
             if not _zks["exited"]:
-                if bar_h < _zks["bottom"] or bar_l > _zks["top"]:
-                    _zks["exited"] = True
+                kind = _zks["kind"]
+                if kind == "demand":
+                    if bar_l > _zks["top"]:
+                        _zks["exited"] = True; _zks["exit_kind"] = "favorable"
+                    elif bar_h < _zks["bottom"]:
+                        _zks["exited"] = True; _zks["exit_kind"] = "violation"
+                else:  # supply
+                    if bar_h < _zks["bottom"]:
+                        _zks["exited"] = True; _zks["exit_kind"] = "favorable"
+                    elif bar_l > _zks["top"]:
+                        _zks["exited"] = True; _zks["exit_kind"] = "violation"
 
         self._update_zone_reentry(now, bar_h, bar_l)
 
@@ -449,9 +458,11 @@ class ZZLiveBot:
 
         if zk not in self.zone_touch_tracker:
             self.zone_touch_tracker[zk] = {
-                "bottom": active_zone.bottom,
-                "top":    active_zone.top,
-                "exited": False,
+                "bottom":    active_zone.bottom,
+                "top":       active_zone.top,
+                "kind":      active_zone.kind,
+                "exited":    False,
+                "exit_kind": None,
             }
 
         if self._zone_blocked(zk, now):
@@ -476,17 +487,31 @@ class ZZLiveBot:
         log.info("Confirmation passed (count=%d signals=%s signal_price=%.2f)",
                  conf.count, conf.signals, signal_price)
 
-        # Change 3: zone exhausted — signal bar closed above demand top (buy) or below supply bottom (sell)
-        if direction == "buy" and signal_price > active_zone.top * 1.001:
+        # Zone-containment (strict): signal bar must close inside zone boundaries.
+        # Same rule as engine.py and confirmations.py — no percentage tolerance.
+        if direction == "buy" and signal_price > active_zone.top:
             self.zlog.log_skip(now, "zone_exhausted", tf_result)
             log.info("Zone exhausted — price %.2f above demand top %.2f", signal_price, active_zone.top)
             return
-        if direction == "sell" and signal_price < active_zone.bottom * 0.999:
+        if direction == "sell" and signal_price < active_zone.bottom:
             self.zlog.log_skip(now, "zone_exhausted", tf_result)
             log.info("Zone exhausted — price %.2f below supply bottom %.2f", signal_price, active_zone.bottom)
             return
 
-        setup = setup_from_analysis(tf_result, signal_price, self.setup_cfg)
+        # M15 ATR14 for the SL floor — mirrors engine.py computation
+        _atr_vals = []
+        for _ak in range(max(1, len(df_15m_w) - 14), len(df_15m_w)):
+            _fh  = float(df_15m_w["high"].iloc[_ak])
+            _fl  = float(df_15m_w["low"].iloc[_ak])
+            _fpc = float(df_15m_w["close"].iloc[_ak - 1])
+            _atr_vals.append(max(_fh - _fl, abs(_fh - _fpc), abs(_fl - _fpc)))
+        _m15_atr14 = sum(_atr_vals) / max(len(_atr_vals), 1) if _atr_vals else 0.0
+
+        setup = setup_from_analysis(
+            tf_result, signal_price, self.setup_cfg,
+            m15_sl_anchor=conf.m15_sl_anchor,
+            m15_atr14=_m15_atr14,
+        )
         if not setup.valid:
             self.zlog.log_skip(now, f"setup_invalid: {setup.reason}", tf_result)
             log.info("Setup invalid: %s", setup.reason)
@@ -502,7 +527,15 @@ class ZZLiveBot:
             log.info("TP too close — tp=%.2f signal=%.2f headroom=%.1f pts", setup.tp, signal_price, signal_price - setup.tp)
             return
 
-        arrival_type = "retest" if self.zone_touch_tracker.get(zk, {}).get("exited", False) else "gradual"
+        _tracker = self.zone_touch_tracker.get(zk, {})
+        if _tracker.get("exited", False):
+            if _tracker.get("exit_kind") == "violation":
+                self.zlog.log_skip(now, "zone_violated", tf_result)
+                log.info("Zone violated — price broke through zone boundary; re-entry blocked")
+                return
+            arrival_type = "retest"
+        else:
+            arrival_type = "gradual"
 
         # Gradual (first-touch) entries only allowed with strong reversal confirmation.
         _STRONG_SIGNALS = {"rejection_wick", "engulfing", "bos_msb", "choch"}

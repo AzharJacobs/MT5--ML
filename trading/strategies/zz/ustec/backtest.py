@@ -25,6 +25,7 @@ from trading.strategies.zz.ustec.strategy import (
     MIN_RR, SPREAD_PTS, FIXED_LOTS, MAX_FORWARD_BARS, MIN_SL_PCT,
     ZONE_MAX_LOSSES, H4_REGIME_FILTER,
     ENABLE_TRAILING, BE_TRIGGER_PTS, BE_BUFFER_PTS, ATR_TRAIL_MULT,
+    EXCLUDED_FROM_COUNT,
 )
 from trading.strategies.zz.ustec.engine import run_backtest
 
@@ -48,7 +49,8 @@ def main() -> None:
     # Step 3
     parser.add_argument("--min_confirmations", type=int, default=1)
     parser.add_argument("--aggressive_boundary", action="store_true")
-    parser.add_argument("--exclude_signals", default="",
+    parser.add_argument("--exclude_signals",
+                        default=",".join(EXCLUDED_FROM_COUNT),
                         help="Comma-separated signal names to exclude from count")
     parser.add_argument("--zone_max_losses", type=int, default=ZONE_MAX_LOSSES)
     parser.add_argument("--dir_max_losses",   type=int, default=0)

@@ -72,6 +72,19 @@ class TradeSetupConfig:
     # When finding the TP zone, rank fresh opposite zones before stale ones.
     # Both kinds are always searched — freshness only affects tie-breaking.
 
+    # ── M15 structural SL ─────────────────────────────────────────────────────
+    use_m15_sl: bool = False
+    # When True, replace the zone-bottom SL with the most recent M15 swing
+    # low (buy) or swing high (sell) passed in as m15_sl_anchor.  Only
+    # applied when the anchor is strictly between zone bottom and entry
+    # (buy) or zone top and entry (sell) — never loosens the zone SL.
+
+    m15_sl_atr_floor_mult: float = 0.5
+    # Hard minimum SL distance expressed as a multiple of the M15 ATR14.
+    # Prevents the structural anchor from sitting so close to entry that
+    # normal wick noise instantly stops the trade.
+    # e.g. 0.5 → SL must be at least 0.5 × ATR14 away from entry.
+
     # ── Validation ────────────────────────────────────────────────────────────
     min_rr: float = 1.5
     # Minimum risk:reward.  Setup is invalid when RR < min_rr.
@@ -217,6 +230,8 @@ def build_trade_setup(
     h4_zones: List[Zone],
     signal_price: float,
     cfg: Optional[TradeSetupConfig] = None,
+    m15_sl_anchor: Optional[float] = None,
+    m15_atr14: float = 0.0,
 ) -> TradeSetup:
     """
     Build a fully-validated trade setup from zone-based analysis.
@@ -285,6 +300,29 @@ def build_trade_setup(
             return _invalid(direction, entry_zone, entry_mode,
                             f"SL {sl:.4f} <= entry {entry:.4f}")
 
+    # ── M15 structural SL override ───────────────────────────────────────────
+    # Replace zone-bottom/top SL with the M15 swing anchor when it is:
+    #   • strictly tighter than the zone-based SL (closer to entry), AND
+    #   • strictly between zone boundary and entry (valid structural level).
+    # An ATR floor ensures the structural anchor isn't so tight that normal
+    # wick noise stops the trade immediately.
+    if cfg.use_m15_sl and m15_sl_anchor is not None:
+        if direction == "buy" and m15_sl_anchor > entry_zone.bottom and m15_sl_anchor < entry:
+            candidate_sl = m15_sl_anchor * (1.0 - cfg.sl_buffer_pct)
+            # ATR floor: SL must be at least floor_mult × ATR14 below entry
+            if m15_atr14 > 0 and cfg.m15_sl_atr_floor_mult > 0:
+                max_sl_for_floor = entry - cfg.m15_sl_atr_floor_mult * m15_atr14
+                candidate_sl = min(candidate_sl, max_sl_for_floor)
+            if candidate_sl < entry and candidate_sl > entry_zone.bottom * (1.0 - cfg.sl_buffer_pct):
+                sl = candidate_sl
+        elif direction == "sell" and m15_sl_anchor < entry_zone.top and m15_sl_anchor > entry:
+            candidate_sl = m15_sl_anchor * (1.0 + cfg.sl_buffer_pct)
+            if m15_atr14 > 0 and cfg.m15_sl_atr_floor_mult > 0:
+                min_sl_for_floor = entry + cfg.m15_sl_atr_floor_mult * m15_atr14
+                candidate_sl = max(candidate_sl, min_sl_for_floor)
+            if candidate_sl > entry and candidate_sl < entry_zone.top * (1.0 + cfg.sl_buffer_pct):
+                sl = candidate_sl
+
     # ── Take profit — next opposite zone ─────────────────────────────────────
     tp_zone = _find_tp_zone(h4_zones, direction, entry, cfg.tp_prefer_fresh)
     if tp_zone is None:
@@ -340,6 +378,8 @@ def setup_from_analysis(
     tf_result: dict,
     signal_price: float,
     cfg: Optional[TradeSetupConfig] = None,
+    m15_sl_anchor: Optional[float] = None,
+    m15_atr14: float = 0.0,
 ) -> TradeSetup:
     """
     One-call wrapper for the common backtest loop pattern.
@@ -349,9 +389,11 @@ def setup_from_analysis(
 
     Parameters
     ----------
-    tf_result    : dict from analyse_timeframes with keys: direction, active_zone, h4_zones
-    signal_price : close of the M15 confirmation bar (from Step 3 check)
-    cfg          : TradeSetupConfig (defaults applied when None)
+    tf_result      : dict from analyse_timeframes with keys: direction, active_zone, h4_zones
+    signal_price   : close of the M15 confirmation bar (from Step 3 check)
+    cfg            : TradeSetupConfig (defaults applied when None)
+    m15_sl_anchor  : most recent M15 swing low/high from ConfirmationResult (optional)
+    m15_atr14      : M15 ATR14 at signal time — used for ATR floor on M15 SL
     """
     direction  = tf_result["direction"]
     entry_zone = tf_result["active_zone"]
@@ -361,4 +403,5 @@ def setup_from_analysis(
         dummy_zone = Zone(kind="demand", top=0, bottom=0, origin_bar=0, strength=0)
         return _invalid("neutral", dummy_zone, "", "no active zone from timeframe analysis")
 
-    return build_trade_setup(direction, entry_zone, h4_zones, signal_price, cfg)
+    return build_trade_setup(direction, entry_zone, h4_zones, signal_price, cfg,
+                             m15_sl_anchor=m15_sl_anchor, m15_atr14=m15_atr14)

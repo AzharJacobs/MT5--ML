@@ -156,6 +156,12 @@ class ConfirmationResult:
     signals: List[str]      # names of fired confirmations, for logging
     confirmed: bool         # meets entry gate (count >= min or aggressive)
 
+    # ── Structural SL anchor ─────────────────────────────────────────────────
+    m15_sl_anchor: Optional[float] = None
+    # Most recent M15 swing low (buy) or swing high (sell) found in the
+    # structure_lookback window before the signal bar.  Available regardless
+    # of which confirmations fired.  Used by trade_setup when use_m15_sl=True.
+
     def __repr__(self) -> str:
         gate = "CONFIRMED" if self.confirmed else "pending"
         return (
@@ -554,6 +560,38 @@ def bearish_choch(
 
 
 # ---------------------------------------------------------------------------
+# M15 structural SL anchor helper
+# ---------------------------------------------------------------------------
+
+def _find_m15_sl_anchor(
+    df: pd.DataFrame,
+    idx: int,
+    direction: str,
+    lookback: int,
+    swing_n: int,
+) -> Optional[float]:
+    """
+    Most recent M15 swing low (buy) or swing high (sell) in the
+    `lookback` bars immediately before signal bar `idx`.
+
+    This is the structural level from which the current impulse originated —
+    the natural SL anchor when using M15 structure instead of zone bottom.
+    Returns None when fewer than two confirmed swings are found.
+    """
+    if idx < swing_n * 2 + 2:
+        return None
+    start  = max(0, idx - lookback)
+    window = df.iloc[start:idx].reset_index(drop=True)
+    if len(window) < swing_n * 2 + 1:
+        return None
+    if direction == "buy":
+        prices = _swing_lows_in_window(window, swing_n)
+    else:
+        prices = _swing_highs_in_window(window, swing_n)
+    return prices[-1] if prices else None
+
+
+# ---------------------------------------------------------------------------
 # Aggregate: check all confirmations at a specific bar
 # ---------------------------------------------------------------------------
 
@@ -613,15 +651,15 @@ def check_all_confirmations(
     if not in_zone:
         return _false
 
-    # ── Close-containment gate ───────────────────────────────────────────────
-    # Catch the case where the bar range touched the zone but the close has
-    # already exited: the fill on the next bar would be geometrically outside,
-    # producing an invalid SL distance.  Overnight gaps are still caught by
-    # zone_guard at fill time (signal close was valid; gap happened between bars).
+    # ── Close-containment gate (strict — no tolerance) ───────────────────────
+    # A bar whose range wicked into the zone but whose close is already outside
+    # means entry on the next bar is geometrically outside the zone; the zone-
+    # bottom SL then becomes dangerously wide relative to the fill price.
+    # Strict containment (no %) matches the zone_exhausted fix in the engine.
     bar_c = float(df_m15["close"].iloc[idx])
     close_left_zone = (
-        (direction == "buy"  and bar_c > zone.top    * (1 + cfg.zone_tolerance_pct)) or
-        (direction == "sell" and bar_c < zone.bottom * (1 - cfg.zone_tolerance_pct))
+        (direction == "buy"  and bar_c > zone.top) or
+        (direction == "sell" and bar_c < zone.bottom)
     )
     if close_left_zone:
         return ConfirmationResult(
@@ -687,6 +725,12 @@ def check_all_confirmations(
     else:
         confirmed = count_effective >= cfg.min_confirmations
 
+    m15_sl_anchor = _find_m15_sl_anchor(
+        df_m15, idx, direction,
+        lookback=cfg.structure_lookback,
+        swing_n=cfg.structure_swing_n,
+    )
+
     return ConfirmationResult(
         direction=direction,
         price_in_zone=True,
@@ -698,6 +742,7 @@ def check_all_confirmations(
         count=count,
         signals=fired,
         confirmed=confirmed,
+        m15_sl_anchor=m15_sl_anchor,
     )
 
 

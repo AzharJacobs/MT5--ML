@@ -1,0 +1,2 @@
+timestamp,symbol,reason,h4_bias,zone_tapped,active_zone
+2026-06-22T06:56:23.612258+00:00,USTECm,setup_invalid: RR 0.42 below min 1.5,neutral_up,True,Zone(demand 30302.22–30453.55 str=2.5 bar=63 tapped×1)

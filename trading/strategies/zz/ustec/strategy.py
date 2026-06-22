@@ -54,6 +54,7 @@ MAX_FORWARD_BARS     = int(_cool["max_forward_bars"])
 ZONE_MAX_LOSSES      = int(_cool.get("zone_max_losses", 0))
 
 TAP_TOL              = float(_cfg["zone"]["tap_tolerance_pct"])
+EXCLUDED_FROM_COUNT  = list(_cfg["confirmations"].get("excluded_from_count", []))
 
 _trail               = _cfg.get("trailing", {})
 ENABLE_TRAILING      = bool(_trail.get("enable_trailing", False))
@@ -91,6 +92,7 @@ def make_configs() -> tuple[TFConfig, ConfirmationConfig, TradeSetupConfig]:
             base_lookback=int(_z["base_lookback"]),
             min_strength=float(_z["min_strength"]),
             tap_tolerance_pct=float(_z["tap_tolerance_pct"]),
+            max_zone_height_atr=float(_z.get("max_zone_height_atr", 0.0)),
         ),
         prefer_fresh_h4=bool(_tf.get("prefer_fresh_h4", True)),
         m15_tap_lookback=int(_tf.get("m15_tap_lookback", 20)),
@@ -123,5 +125,7 @@ def make_configs() -> tuple[TFConfig, ConfirmationConfig, TradeSetupConfig]:
         midline_pct=float(_s.get("midline_pct", 0.50)),
         tp_prefer_fresh=bool(_s.get("tp_prefer_fresh", True)),
         min_rr=MIN_RR,
+        use_m15_sl=bool(_s.get("use_m15_sl", False)),
+        m15_sl_atr_floor_mult=float(_s.get("m15_sl_atr_floor_mult", 0.5)),
     )
     return tf_cfg, conf_cfg, setup_cfg

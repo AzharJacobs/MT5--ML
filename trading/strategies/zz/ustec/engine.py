@@ -173,6 +173,10 @@ def run_backtest(
     gradual_filter: str = "all",   # "all" | "retest_only" | "tightened" | "no_multi_conf"
     silent: bool = False,
     risk_pct: Optional[float] = None,   # overrides RISK_PCT; ignored when fixed_lot > 0
+    # ── New feature params ────────────────────────────────────────────────────
+    use_m15_sl: bool = False,
+    m15_sl_atr_floor_mult: float = 0.5,
+    max_zone_height_atr: float = 0.0,
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -230,6 +234,7 @@ def run_backtest(
             departure_window=6,
             base_lookback=5,
             min_strength=1.5,
+            max_zone_height_atr=max_zone_height_atr,
         ),
         m15_tap_lookback=20,
         require_m15_directional_close=True,
@@ -247,6 +252,8 @@ def run_backtest(
         midline_tp=midline_tp,
         midline_pct=midline_pct,
         min_rr=min_rr,
+        use_m15_sl=use_m15_sl,
+        m15_sl_atr_floor_mult=m15_sl_atr_floor_mult,
     )
 
     _pr(
@@ -287,6 +294,7 @@ def run_backtest(
         "sl_too_wide":    0,
         "margin_call":    0,
         "gradual_filter": 0,
+        "zone_violated":  0,
     }
 
     for i in range(warmup, n - max_forward_bars):
@@ -296,8 +304,21 @@ def run_backtest(
 
         for _zkt, _zks in zone_touch_tracker.items():
             if not _zks["exited"]:
-                if bar_h < _zks["bottom"] or bar_l > _zks["top"]:
-                    _zks["exited"] = True
+                kind = _zks["kind"]
+                if kind == "demand":
+                    if bar_l > _zks["top"]:      # price fully above demand = clean bounce up
+                        _zks["exited"]    = True
+                        _zks["exit_kind"] = "favorable"
+                    elif bar_h < _zks["bottom"]:  # price fully below demand = zone broken
+                        _zks["exited"]    = True
+                        _zks["exit_kind"] = "violation"
+                else:  # supply
+                    if bar_h < _zks["bottom"]:   # price fully below supply = clean drop
+                        _zks["exited"]    = True
+                        _zks["exit_kind"] = "favorable"
+                    elif bar_l > _zks["top"]:    # price fully above supply = zone broken
+                        _zks["exited"]    = True
+                        _zks["exit_kind"] = "violation"
 
         if require_leave_and_return and zone_reentry:
             tol   = 0.001
@@ -361,15 +382,15 @@ def run_backtest(
             filters["conf_failed"] += 1
             continue
 
-        # Close-containment: signal bar (bar i) must close inside the zone.
-        # Catches Pattern A — bars that wicked into the zone but closed outside.
-        # zone_guard below handles Pattern B (genuine between-bar session gaps).
+        # Close-containment: signal bar close must be strictly inside the zone
+        # (no tolerance — same class of fix as confirmations.py close_left_zone).
+        # Pattern A (wick-through, close outside) is blocked here.
+        # Pattern B (genuine session-gap outside zone) is blocked by zone_guard below.
         _sig_close = float(df_15m_w["close"].iloc[-1])
-        _close_tol = 0.001
-        if direction == "buy"  and _sig_close > active_zone.top    * (1 + _close_tol):
+        if direction == "buy"  and _sig_close > active_zone.top:
             filters["conf_failed"] += 1
             continue
-        if direction == "sell" and _sig_close < active_zone.bottom * (1 - _close_tol):
+        if direction == "sell" and _sig_close < active_zone.bottom:
             filters["conf_failed"] += 1
             continue
 
@@ -382,9 +403,11 @@ def run_backtest(
         zk = _zone_key(active_zone)
         if zk not in zone_touch_tracker:
             zone_touch_tracker[zk] = {
-                "bottom": active_zone.bottom,
-                "top":    active_zone.top,
-                "exited": False,
+                "bottom":    active_zone.bottom,
+                "top":       active_zone.top,
+                "kind":      active_zone.kind,
+                "exited":    False,
+                "exit_kind": None,
             }
 
         if zone_cooldown.get(zk, -1) >= i:
@@ -410,7 +433,16 @@ def run_backtest(
         else:
             prior_bucket = "post_expired"
 
-        arrival_type = "retest" if zone_touch_tracker.get(zk, {}).get("exited", False) else "gradual"
+        _tracker = zone_touch_tracker.get(zk, {})
+        if _tracker.get("exited", False):
+            if _tracker.get("exit_kind") == "violation":
+                # Zone was broken in the adverse direction — price passed completely
+                # through the zone.  Any re-entry is into damaged territory; skip.
+                filters["zone_violated"] += 1
+                continue
+            arrival_type = "retest"
+        else:
+            arrival_type = "gradual"
 
         # Gradual (first-touch) entries are only allowed when at least one
         # strong reversal signal confirms the zone is reacting — otherwise wait
@@ -430,7 +462,24 @@ def run_backtest(
                 continue
 
         signal_price = float(df_15m_w["close"].iloc[-1])
-        setup = setup_from_analysis(tf_result, signal_price, setup_cfg)
+
+        # M15 ATR14 for SL floor validation (only computed when needed)
+        if use_m15_sl:
+            _atr_vals = []
+            for _ak in range(max(1, len(df_15m_w) - 14), len(df_15m_w)):
+                _fh  = float(df_15m_w["high"].iloc[_ak])
+                _fl  = float(df_15m_w["low"].iloc[_ak])
+                _fpc = float(df_15m_w["close"].iloc[_ak - 1])
+                _atr_vals.append(max(_fh - _fl, abs(_fh - _fpc), abs(_fl - _fpc)))
+            _m15_atr14 = sum(_atr_vals) / max(len(_atr_vals), 1)
+        else:
+            _m15_atr14 = 0.0
+
+        setup = setup_from_analysis(
+            tf_result, signal_price, setup_cfg,
+            m15_sl_anchor=conf.m15_sl_anchor,
+            m15_atr14=_m15_atr14,
+        )
         if not setup.valid:
             filters["setup_invalid"] += 1
             continue
