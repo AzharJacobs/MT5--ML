@@ -80,6 +80,8 @@ def main() -> None:
                         help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
     parser.add_argument("--h4_bias_gate_1h", action="store_true",
                         help="Require 4H bias to agree before taking a 1H-sourced signal")
+    parser.add_argument("--retest_buys_only", action="store_true",
+                        help="Block all gradual (first-touch) long entries; only retest buys allowed")
 
     args = parser.parse_args()
 
@@ -119,6 +121,7 @@ def main() -> None:
         chart=args.chart,
         dual_tf=args.dual_tf,
         h4_bias_gate_1h=args.h4_bias_gate_1h,
+        retest_buys_only=args.retest_buys_only,
     )
 
 

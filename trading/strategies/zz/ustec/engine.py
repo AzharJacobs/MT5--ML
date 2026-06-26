@@ -187,6 +187,7 @@ def run_backtest(
     skip_weekdays: Optional[list] = None,   # e.g. ["Monday", "Sunday"]
     dual_tf: bool = False,                  # also run 1H zones in parallel with 4H
     h4_bias_gate_1h: bool = False,          # require 4H bias to agree before taking a 1H signal
+    retest_buys_only: bool = False,         # block all gradual (first-touch) long entries
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -343,6 +344,7 @@ def run_backtest(
         "zone_violated":  0,
         "1h_overlap_skipped": 0,
         "1h_bias_gated":      0,
+        "retest_only_skip":   0,   # gradual long entries blocked by retest_buys_only
     }
 
     for i in range(warmup, n - max_forward_bars):
@@ -528,6 +530,12 @@ def run_backtest(
             arrival_type = "retest"
         else:
             arrival_type = "gradual"
+
+        # Hard block: skip all first-touch long entries when retest_buys_only is on.
+        # Sells are unaffected — short zones react differently on first touch.
+        if retest_buys_only and direction == "buy" and arrival_type == "gradual":
+            filters["retest_only_skip"] += 1
+            continue
 
         # Gradual (first-touch) entries are only allowed when at least one
         # strong reversal signal confirms the zone is reacting — otherwise wait
@@ -1030,6 +1038,8 @@ def main() -> None:
                         help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
     parser.add_argument("--h4_bias_gate_1h", action="store_true",
                         help="Require 4H bias to agree before taking a 1H-sourced signal")
+    parser.add_argument("--retest_buys_only", action="store_true",
+                        help="Block all gradual (first-touch) long entries; only retest buys allowed")
     args = parser.parse_args()
 
     run_backtest(
@@ -1069,6 +1079,7 @@ def main() -> None:
         chart=args.chart,
         dual_tf=args.dual_tf,
         h4_bias_gate_1h=args.h4_bias_gate_1h,
+        retest_buys_only=args.retest_buys_only,
     )
 
 
