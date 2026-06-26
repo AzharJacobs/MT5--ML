@@ -76,6 +76,10 @@ def main() -> None:
     parser.add_argument("--save",  default=None)
     parser.add_argument("--chart", action="store_true")
     parser.add_argument("--realistic", action="store_true")
+    parser.add_argument("--dual_tf",          action="store_true",
+                        help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
+    parser.add_argument("--h4_bias_gate_1h", action="store_true",
+                        help="Require 4H bias to agree before taking a 1H-sourced signal")
 
     args = parser.parse_args()
 
@@ -113,6 +117,8 @@ def main() -> None:
         realistic=args.realistic,
         save_path=args.save,
         chart=args.chart,
+        dual_tf=args.dual_tf,
+        h4_bias_gate_1h=args.h4_bias_gate_1h,
     )
 
 

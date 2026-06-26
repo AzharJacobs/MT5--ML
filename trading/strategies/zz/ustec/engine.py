@@ -44,6 +44,7 @@ from trading.strategies.zz.ustec.strategy import (
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 H4_WINDOW  = 150
+H1_WINDOW  = 300   # ~18 trading days of 1H context (same coverage as H4_WINDOW on H4)
 M15_WINDOW = 80
 MAX_FORWARD_BARS = 350
 
@@ -79,6 +80,11 @@ def _load_ohlcv(db, table: str, timeframe: str, start: str, end: str) -> pd.Data
 
 def _zone_key(zone) -> tuple:
     return (round(zone.bottom, 1), round(zone.top, 1))
+
+
+def _zones_overlap(z1, z2) -> bool:
+    """True when two zones share any price overlap."""
+    return max(z1.bottom, z2.bottom) < min(z1.top, z2.top)
 
 
 def _dynamic_spread(ts: pd.Timestamp, base: float = 4.0) -> float:
@@ -179,6 +185,8 @@ def run_backtest(
     max_zone_height_atr: float = 0.0,
     skip_hours: Optional[list] = None,      # e.g. list(range(0,7)) + list(range(21,24))
     skip_weekdays: Optional[list] = None,   # e.g. ["Monday", "Sunday"]
+    dual_tf: bool = False,                  # also run 1H zones in parallel with 4H
+    h4_bias_gate_1h: bool = False,          # require 4H bias to agree before taking a 1H signal
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -202,6 +210,18 @@ def run_backtest(
     df_15m = _load_ohlcv(db, table, "15min", start, end)
     _pr(f"Loading 4H  data  {start} → {end} ...")
     df_4h  = _load_ohlcv(db, table, "4H",    start, end)
+    df_1h  = pd.DataFrame()
+    if dual_tf:
+        _pr(f"Loading 1H  data  {start} → {end} ...")
+        df_1h = _load_ohlcv(db, table, "1H", start, end)
+        if df_1h.empty:
+            print("ERROR: dual_tf=True but no 1H bars found in DB — stopping.")
+            print("  Confirm the DB has timeframe='1H' rows before using --dual_tf.")
+            try:
+                db.connection.close()
+            except Exception:
+                pass
+            return {}
 
     try:
         db.connection.close()
@@ -219,7 +239,8 @@ def run_backtest(
     if _dupes:
         _pr(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
 
-    _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
+    _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}" +
+        (f" | 1H bars: {len(df_1h)}" if dual_tf else ""))
     df_4h["ema50"]  = df_4h["close"].ewm(span=50,  adjust=False).mean()
     df_4h["ema200"] = df_4h["close"].ewm(span=200, adjust=False).mean()
 
@@ -258,9 +279,32 @@ def run_backtest(
         m15_sl_atr_floor_mult=m15_sl_atr_floor_mult,
     )
 
+    # 1H TFConfig — identical zone/bias parameters as 4H path, just fed 1H data
+    tf_cfg_1h = None
+    if dual_tf:
+        tf_cfg_1h = TFConfig(
+            directional_filter=directional_filter,
+            allow_neutral_up=allow_neutral,
+            allow_neutral_down=allow_neutral,
+            h4_swing_left=h4_swing_left,
+            h4_swing_right=h4_swing_right,
+            h4_zone_cfg=ZoneConfig(
+                impulse_atr_mult=2.0,
+                body_ratio_min=0.50,
+                min_departure_candles=2,
+                departure_window=6,
+                base_lookback=5,
+                min_strength=1.5,
+                max_zone_height_atr=max_zone_height_atr,
+            ),
+            m15_tap_lookback=20,
+            require_m15_directional_close=True,
+        )
+
     _pr(
         f"Config : directional_filter={directional_filter}  min_confirmations={min_confirmations}"
-        f"  aggressive_entry={aggressive_entry}  midline_tp={midline_tp}\n"
+        f"  aggressive_entry={aggressive_entry}  midline_tp={midline_tp}"
+        + (f"  dual_tf=True (1H+4H)" if dual_tf else "") + "\n"
     )
 
     equity         = cash
@@ -297,6 +341,8 @@ def run_backtest(
         "margin_call":    0,
         "gradual_filter": 0,
         "zone_violated":  0,
+        "1h_overlap_skipped": 0,
+        "1h_bias_gated":      0,
     }
 
     for i in range(warmup, n - max_forward_bars):
@@ -356,6 +402,40 @@ def run_backtest(
 
         h4_up_to  = len(df_h4_w) - 1
         tf_result = analyse_timeframes(df_h4_w, df_15m_w, cfg=tf_cfg, h4_up_to_bar=h4_up_to)
+
+        # ── Dual-timeframe: merge 1H signal with 4H ───────────────────────────
+        # Priority: 4H always wins when both fire with overlapping zones.
+        # Non-overlapping same-bar tie: 4H still wins (macro > micro).
+        # If only 1H fires: use the 1H signal.
+        _tf_source = "4H"
+        if dual_tf and not df_1h.empty:
+            df_1h_w = df_1h[df_1h["timestamp"] <= ts_now].tail(H1_WINDOW).reset_index(drop=True)
+            if len(df_1h_w) >= 20:
+                h1_up_to      = len(df_1h_w) - 1
+                _tf_result_1h = analyse_timeframes(
+                    df_1h_w, df_15m_w, cfg=tf_cfg_1h, h4_up_to_bar=h1_up_to
+                )
+                if _tf_result_1h["signal"] != "neutral":
+                    if tf_result["signal"] == "neutral":
+                        # Only 1H fires — optionally gate on 4H macro bias
+                        _1h_ok = True
+                        if h4_bias_gate_1h:
+                            _h4_bias = tf_result["h4_bias"]   # bias from the 4H analysis
+                            _1h_dir  = _tf_result_1h["direction"]
+                            if _1h_dir == "buy"  and _h4_bias not in ("bullish", "neutral_up"):
+                                _1h_ok = False
+                            elif _1h_dir == "sell" and _h4_bias not in ("bearish", "neutral_down"):
+                                _1h_ok = False
+                        if _1h_ok:
+                            tf_result  = _tf_result_1h
+                            _tf_source = "1H"
+                        else:
+                            filters["1h_bias_gated"] += 1
+                    elif _zones_overlap(tf_result["active_zone"], _tf_result_1h["active_zone"]):
+                        # Both fire, same price area — 4H wins, log dropped 1H
+                        filters["1h_overlap_skipped"] += 1
+                    # else: both fire, different areas — 4H still wins same-bar tie
+        # ─────────────────────────────────────────────────────────────────────
 
         if tf_result["signal"] == "neutral":
             filters["tf_neutral"] += 1
@@ -742,6 +822,7 @@ def run_backtest(
             "zone_top":      active_zone.top,
             "zone_strength": active_zone.strength,
             "zone_kind":     active_zone.kind,
+            "tf_source":     _tf_source,
             "structure":       {"zone": (active_zone.bottom, active_zone.top)},
             "signal_close":    signal_price,
             "raw_open":        raw_open,
@@ -772,6 +853,7 @@ def run_backtest(
 
     metrics = {
         "strategy":        "Zone-Based Strategy (Steps 1–4)",
+        "dual_tf":         dual_tf,
         "symbol":          sym.upper(),
         "period":          f"{start} to {end}",
         "start_cash":      f"${cash:,.2f}",
@@ -944,6 +1026,10 @@ def main() -> None:
     parser.add_argument("--be_trigger",  type=float, default=_CFG_BE_TRIGGER_PTS)
     parser.add_argument("--be_buffer",   type=float, default=_CFG_BE_BUFFER_PTS)
     parser.add_argument("--atr_mult",    type=float, default=_CFG_ATR_TRAIL_MULT)
+    parser.add_argument("--dual_tf",          action="store_true",
+                        help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
+    parser.add_argument("--h4_bias_gate_1h", action="store_true",
+                        help="Require 4H bias to agree before taking a 1H-sourced signal")
     args = parser.parse_args()
 
     run_backtest(
@@ -981,6 +1067,8 @@ def main() -> None:
         atr_trail_mult=args.atr_mult,
         save_path=args.save,
         chart=args.chart,
+        dual_tf=args.dual_tf,
+        h4_bias_gate_1h=args.h4_bias_gate_1h,
     )
 
 
