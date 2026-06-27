@@ -128,6 +128,37 @@ def _h4_bearish_regime(
     return all(lbl == "LL" for lbl in sl_seq[-n_consec_ll:])
 
 
+def _h4_bullish_structure(
+    df_h4: pd.DataFrame,
+    ma_period: int = 20,
+    swing_left: int = 2,
+    swing_right: int = 2,
+) -> bool:
+    """
+    True when H4 shows genuine upward structure — either:
+      (a) current close is above the rolling ma_period MA, OR
+      (b) the most recent confirmed H4 swing low was a Higher Low (not LL).
+    A buy is blocked only when BOTH checks fail (price below MA AND last swing was LL),
+    meaning the structure is unambiguously bearish.
+    Returns True (allow) when there is insufficient data to judge.
+    """
+    min_bars = ma_period + swing_left + swing_right + 2
+    if len(df_h4) < min_bars:
+        return True  # not enough history — don't block
+    ma    = df_h4["close"].rolling(ma_period).mean()
+    price = float(df_h4["close"].iloc[-1])
+    price_above_ma = price >= float(ma.iloc[-1])
+    if price_above_ma:
+        return True
+    # price is below MA — check swing structure for any sign of HL
+    swings  = _detect_swings_h4(df_h4, left=swing_left, right=swing_right)
+    labeled = _label_structure_h4(swings)
+    swing_lows = [lbl for _, _, lbl in labeled if lbl in ("HL", "LL")]
+    if not swing_lows:
+        return True  # no swing lows yet — don't block
+    return swing_lows[-1] == "HL"
+
+
 # ── Main backtest ─────────────────────────────────────────────────────────────
 
 def run_backtest(
@@ -188,6 +219,8 @@ def run_backtest(
     dual_tf: bool = False,                  # also run 1H zones in parallel with 4H
     h4_bias_gate_1h: bool = False,          # require 4H bias to agree before taking a 1H signal
     retest_buys_only: bool = False,         # block all gradual (first-touch) long entries
+    block_gradual_long_hours: Optional[list] = None,  # block gradual buys at these UTC hours only
+    h4_structure_gate: bool = False,        # require H4 structure is actually bullish before buying
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -345,6 +378,8 @@ def run_backtest(
         "1h_overlap_skipped": 0,
         "1h_bias_gated":      0,
         "retest_only_skip":   0,   # gradual long entries blocked by retest_buys_only
+        "gradual_hour_skip":  0,   # gradual long entries blocked by bad-hour filter
+        "h4_structure_gate":  0,   # buy blocked because H4 structure is bearish
     }
 
     for i in range(warmup, n - max_forward_bars):
@@ -454,6 +489,14 @@ def run_backtest(
                 filters["regime_filter"] += 1
                 continue
 
+        # H4 structure gate: block buys when H4 trend is genuinely bearish.
+        # Checks price vs 20-MA AND most recent swing low label — buy blocked only
+        # when BOTH fail (price below MA AND last swing low was LL).
+        if h4_structure_gate and direction == "buy":
+            if not _h4_bullish_structure(df_h4_w):
+                filters["h4_structure_gate"] += 1
+                continue
+
         if dir_max_losses > 0:
             _dcd = dir_cooldown[direction]
             if _dcd is not None:
@@ -535,6 +578,15 @@ def run_backtest(
         # Sells are unaffected — short zones react differently on first touch.
         if retest_buys_only and direction == "buy" and arrival_type == "gradual":
             filters["retest_only_skip"] += 1
+            continue
+
+        # Hour-based gradual long filter: block first-touch buys at low-quality sessions.
+        # Retest buys and all sell entries are untouched regardless of hour.
+        if (block_gradual_long_hours
+                and direction == "buy"
+                and arrival_type == "gradual"
+                and ts_now.hour in block_gradual_long_hours):
+            filters["gradual_hour_skip"] += 1
             continue
 
         # Gradual (first-touch) entries are only allowed when at least one
@@ -1040,6 +1092,10 @@ def main() -> None:
                         help="Require 4H bias to agree before taking a 1H-sourced signal")
     parser.add_argument("--retest_buys_only", action="store_true",
                         help="Block all gradual (first-touch) long entries; only retest buys allowed")
+    parser.add_argument("--gradual_long_bad_hours", default="",
+                        help="Comma-separated UTC hours to block gradual long entries e.g. 0,2,9,11,16,21,23")
+    parser.add_argument("--h4_structure_gate", action="store_true",
+                        help="Block buys when H4 is below 20-MA AND last swing low was LL")
     args = parser.parse_args()
 
     run_backtest(
@@ -1080,6 +1136,8 @@ def main() -> None:
         dual_tf=args.dual_tf,
         h4_bias_gate_1h=args.h4_bias_gate_1h,
         retest_buys_only=args.retest_buys_only,
+        block_gradual_long_hours=[int(h) for h in args.gradual_long_bad_hours.split(",") if h.strip()] or None,
+        h4_structure_gate=args.h4_structure_gate,
     )
 
 
