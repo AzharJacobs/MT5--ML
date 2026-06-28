@@ -82,6 +82,10 @@ def main() -> None:
                         help="Require 4H bias to agree before taking a 1H-sourced signal")
     parser.add_argument("--retest_buys_only", action="store_true",
                         help="Block all gradual (first-touch) long entries; only retest buys allowed")
+    parser.add_argument("--skip_months", default="",
+                        help="Comma-separated month numbers to skip entirely e.g. 11 or 6,11")
+    parser.add_argument("--max_daily_loss", type=float, default=0.0,
+                        help="Block new entries once realized daily loss reaches this amount")
 
     args = parser.parse_args()
 
@@ -122,6 +126,8 @@ def main() -> None:
         dual_tf=args.dual_tf,
         h4_bias_gate_1h=args.h4_bias_gate_1h,
         retest_buys_only=args.retest_buys_only,
+        skip_months=[int(m) for m in args.skip_months.split(",") if m.strip()] or None,
+        max_daily_loss=args.max_daily_loss if args.max_daily_loss > 0 else None,
     )
 
 

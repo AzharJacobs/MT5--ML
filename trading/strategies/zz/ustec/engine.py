@@ -225,6 +225,8 @@ def run_backtest(
     h4_structure_gate: bool = False,        # require H4 structure is actually bullish before buying
     split_exit: bool = False,               # two-trade split: scalper at partial TP + runner with swing trail
     scalper_tp_pct: float = 0.45,           # scalper exits at this fraction of full TP distance
+    skip_months: Optional[list] = None,     # e.g. [11] to skip November; [6, 11] for Jun+Nov
+    max_daily_loss: Optional[float] = None, # block new entries once realized daily loss hits this
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -361,6 +363,7 @@ def run_backtest(
     stopout_occurred:     bool = False
     total_swap_pnl:       float = 0.0
     total_slippage:       float = 0.0
+    daily_pnl:            dict  = {}
     n      = len(df_15m)
     warmup = max(M15_WINDOW, 30)
 
@@ -385,6 +388,8 @@ def run_backtest(
         "gradual_hour_skip":       0,   # gradual long entries blocked by bad-hour filter
         "gradual_sell_hour_skip":  0,   # gradual sell entries blocked by bad-hour filter
         "h4_structure_gate":       0,   # buy blocked because H4 structure is bearish
+        "month_skip":              0,   # entry in a calendar month on the skip list
+        "daily_loss_skip":         0,   # daily realized loss cap reached
     }
 
     for i in range(warmup, n - max_forward_bars):
@@ -434,6 +439,13 @@ def run_backtest(
 
         if skip_hours    and ts_now.hour              in skip_hours:    continue
         if skip_weekdays and ts_now.day_name()        in skip_weekdays: continue
+        if skip_months   and ts_now.month             in skip_months:
+            filters["month_skip"] += 1
+            continue
+        if max_daily_loss is not None:
+            if daily_pnl.get(ts_now.date(), 0.0) <= -max_daily_loss:
+                filters["daily_loss_skip"] += 1
+                continue
 
         df_h4_w = df_4h[df_4h["timestamp"] <= ts_now].tail(H4_WINDOW).reset_index(drop=True)
         if len(df_h4_w) < 20:
@@ -491,6 +503,14 @@ def run_backtest(
             _ema50  = float(df_h4_w["ema50"].iloc[-1])
             _ema200 = float(df_h4_w["ema200"].iloc[-1])
             if _price < _ema50 and _price < _ema200:
+                filters["regime_filter"] += 1
+                continue
+
+        if h4_regime_filter and direction == "sell":
+            _price  = float(df_15m_w["close"].iloc[-1])
+            _ema50  = float(df_h4_w["ema50"].iloc[-1])
+            _ema200 = float(df_h4_w["ema200"].iloc[-1])
+            if _price > _ema50 and _price > _ema200:
                 filters["regime_filter"] += 1
                 continue
 
@@ -944,6 +964,9 @@ def run_backtest(
             equity = 0.0
         equity_curve.append(equity)
         skip_until = exit_bar
+        if max_daily_loss is not None:
+            _entry_day = ts_now.date()
+            daily_pnl[_entry_day] = daily_pnl.get(_entry_day, 0.0) + pnl
 
         zone_outcome_history.setdefault(zid, []).append(outcome)
 
