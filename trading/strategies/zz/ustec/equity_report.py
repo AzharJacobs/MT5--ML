@@ -24,7 +24,8 @@ from trading.strategies.zz.ustec.strategy import (
 )
 from trading.strategies.zz.ustec.engine import run_backtest
 
-BAD_HOURS = [0, 2, 9, 11, 16, 21, 23]
+BAD_BUY_HOURS  = [0, 2, 9, 11, 16, 21, 23]
+BAD_SELL_HOURS = [1, 2, 4, 6, 11, 15, 19, 21]
 MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -35,6 +36,10 @@ def main():
     parser.add_argument("--end",       default="2025-12-31")
     parser.add_argument("--cash",      type=float, default=150.0)
     parser.add_argument("--fixed_lot", type=float, default=FIXED_LOTS)
+    parser.add_argument("--year",      type=int,   default=None,
+                        help="Only print this year's months (balance still carries from start)")
+    parser.add_argument("--max_sl_pts", type=float, default=80.0,
+                        help="Skip trades where SL distance exceeds this many points")
     args = parser.parse_args()
 
     result = run_backtest(
@@ -59,7 +64,10 @@ def main():
         be_trigger_pts=BE_TRIGGER_PTS,
         be_buffer_pts=BE_BUFFER_PTS,
         atr_trail_mult=ATR_TRAIL_MULT,
-        block_gradual_long_hours=BAD_HOURS,
+        block_gradual_long_hours=BAD_BUY_HOURS,
+        block_gradual_short_hours=BAD_SELL_HOURS,
+        split_exit=True,
+        scalper_tp_pct=0.45,
         silent=True,
     )
 
@@ -109,66 +117,41 @@ def main():
 
     print()
     print(hdiv)
-    print(f"  USTEC Bad-Hour Filter  |  {args.start} to {args.end}  |  Start: ${args.cash:.2f}  |  Lot: {args.fixed_lot}")
+    print(f"  USTEC Split-Exit + Dual-Side Hour Filter  |  {args.start} to {args.end}  |  Start: ${args.cash:.2f}  |  Lot: {args.fixed_lot}")
     print(f"  {total} trades  |  {wins}W / {total-wins}L  |  WR {wins/total*100:.1f}%  |  Net ${net:+.2f}  |  Final ${args.cash+net:.2f}")
     print(hdiv)
     print(f"  {'Month':<{C1}} {'Trades':>{C2}} {'W':>{C3}} {'L':>{C4}}   {'Month PnL':>{C5}}   {'Cumul PnL':>{C6}}   {'Balance':>{C7}}")
     print(div)
 
-    prev_year = None
-    yr_trades = yr_wins = 0
-    yr_pnl    = 0.0
+    # If year filter: only display that year's rows; balance still reflects full run
+    display_rows = rows if not args.year else [r for r in rows if r["year"] == args.year]
 
-    for r in rows:
-        if r["year"] != prev_year:
-            if prev_year is not None:
-                # year subtotal
-                print(div)
-                yl  = yr_trades - yr_wins
-                ret = r["balance"] - r["pnl"] - args.cash - (yr_pnl - r["pnl"])
-                cum = (r["balance"] - r["pnl"]) - args.cash
-                print(f"  {'  '+str(prev_year)+' TOTAL':<{C1}} {yr_trades:>{C2}} {yr_wins:>{C3}} {yl:>{C4}}"
-                      f"   {yr_pnl:>+{C5}.2f}   {cum:>+{C6}.2f}   {'':>{C7}}")
-                print(div)
-                print()
-            prev_year = r["year"]
-            yr_trades = yr_wins = 0
-            yr_pnl    = 0.0
-            print(f"  --- {r['year']} ---")
+    yr_trades = sum(r["trades"] for r in display_rows)
+    yr_wins   = sum(r["wins"]   for r in display_rows)
+    yr_pnl    = sum(r["pnl"]    for r in display_rows)
 
-        yr_trades += r["trades"]
-        yr_wins   += r["wins"]
-        yr_pnl    += r["pnl"]
-
-        lbl    = f"{MONTH_NAMES[r['month']]} {r['year']}"
-        cumul  = r["balance"] - args.cash
-        l      = r["trades"] - r["wins"]
-        wr_str = f"WR {r['wins']/max(r['trades'],1)*100:.0f}%"
-        bar    = "+" * r["wins"] + "-" * l
-        bar    = bar[:20]
-
+    for r in display_rows:
+        lbl      = f"{MONTH_NAMES[r['month']]} {r['year']}"
+        cumul    = r["balance"] - args.cash
+        l        = r["trades"] - r["wins"]
         pnl_flag = ""
-        if r["pnl"] > 200:   pnl_flag = "  <<"
+        if r["pnl"] > 200:    pnl_flag = "  <<"
         elif r["pnl"] < -200: pnl_flag = "  !!"
-
         print(f"  {lbl:<{C1}} {r['trades']:>{C2}} {r['wins']:>{C3}} {l:>{C4}}"
               f"   {r['pnl']:>+{C5}.2f}   {cumul:>+{C6}.2f}   {r['balance']:>{C7}.2f}{pnl_flag}")
 
-    # last year subtotal
-    if prev_year is not None:
-        print(div)
-        last_bal = rows[-1]["balance"]
-        yr_l     = yr_trades - yr_wins
-        cum_end  = last_bal - args.cash
-        print(f"  {'  '+str(prev_year)+' TOTAL':<{C1}} {yr_trades:>{C2}} {yr_wins:>{C3}} {yr_l:>{C4}}"
-              f"   {yr_pnl:>+{C5}.2f}   {cum_end:>+{C6}.2f}   {'':>{C7}}")
+    print(div)
+    yr_l    = yr_trades - yr_wins
+    yr_cum  = display_rows[-1]["balance"] - args.cash if display_rows else 0.0
+    print(f"  {'  TOTAL':<{C1}} {yr_trades:>{C2}} {yr_wins:>{C3}} {yr_l:>{C4}}"
+          f"   {yr_pnl:>+{C5}.2f}   {yr_cum:>+{C6}.2f}   {'':>{C7}}")
 
     print()
     print(hdiv)
     final_bal = args.cash + net
     print(f"  GRAND TOTAL  |  {total} trades  |  {wins}W/{total-wins}L  |  WR {wins/total*100:.1f}%  |  "
           f"Net ${net:+.2f}  |  Final balance ${final_bal:.2f}  |  "
-          f"Return {net/args.cash*100:.0f}x on starting cash")
+          f"Max SL filter: {args.max_sl_pts:.0f}pts")
     print(hdiv)
     print()
 

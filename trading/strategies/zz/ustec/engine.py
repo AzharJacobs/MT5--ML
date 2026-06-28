@@ -189,6 +189,7 @@ def run_backtest(
     h4_regime_filter: bool = _CFG_H4_REGIME_FILTER,
     regime_conf_filter: bool = False,
     min_sl_pct: float = 0.0,
+    max_sl_pts: float = 0.0,
     max_sl_pct: float = _CFG_MAX_SL_PCT,
     enable_trailing:   bool  = _CFG_ENABLE_TRAILING,
     be_buffer_pts:     float = _CFG_BE_BUFFER_PTS,
@@ -219,8 +220,11 @@ def run_backtest(
     dual_tf: bool = False,                  # also run 1H zones in parallel with 4H
     h4_bias_gate_1h: bool = False,          # require 4H bias to agree before taking a 1H signal
     retest_buys_only: bool = False,         # block all gradual (first-touch) long entries
-    block_gradual_long_hours: Optional[list] = None,  # block gradual buys at these UTC hours only
+    block_gradual_long_hours: Optional[list] = None,   # block gradual buys at these UTC hours only
+    block_gradual_short_hours: Optional[list] = None,  # block gradual sells at these UTC hours only
     h4_structure_gate: bool = False,        # require H4 structure is actually bullish before buying
+    split_exit: bool = False,               # two-trade split: scalper at partial TP + runner with swing trail
+    scalper_tp_pct: float = 0.45,           # scalper exits at this fraction of full TP distance
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -378,8 +382,9 @@ def run_backtest(
         "1h_overlap_skipped": 0,
         "1h_bias_gated":      0,
         "retest_only_skip":   0,   # gradual long entries blocked by retest_buys_only
-        "gradual_hour_skip":  0,   # gradual long entries blocked by bad-hour filter
-        "h4_structure_gate":  0,   # buy blocked because H4 structure is bearish
+        "gradual_hour_skip":       0,   # gradual long entries blocked by bad-hour filter
+        "gradual_sell_hour_skip":  0,   # gradual sell entries blocked by bad-hour filter
+        "h4_structure_gate":       0,   # buy blocked because H4 structure is bearish
     }
 
     for i in range(warmup, n - max_forward_bars):
@@ -589,6 +594,15 @@ def run_backtest(
             filters["gradual_hour_skip"] += 1
             continue
 
+        # Hour-based gradual short filter: block first-touch sells at low-quality sessions.
+        # Retest sells and all buy entries are untouched regardless of hour.
+        if (block_gradual_short_hours
+                and direction == "sell"
+                and arrival_type == "gradual"
+                and ts_now.hour in block_gradual_short_hours):
+            filters["gradual_sell_hour_skip"] += 1
+            continue
+
         # Gradual (first-touch) entries are only allowed when at least one
         # strong reversal signal confirms the zone is reacting — otherwise wait
         # for a proper retest of the zone.
@@ -680,6 +694,10 @@ def run_backtest(
                 filters["sl_too_tight"] += 1
                 continue
 
+        if max_sl_pts > 0.0 and sl_dist > max_sl_pts:
+            filters["sl_too_wide"] += 1
+            continue
+
         if max_sl_pct > 0.0:
             _sl_pct = abs(entry - sl) / entry * 100.0
             if _sl_pct > max_sl_pct:
@@ -699,6 +717,29 @@ def run_backtest(
         exit_bar        = i + max_forward_bars
         max_favourable  = 0.0
         max_adverse     = 0.0
+        pnl             = 0.0
+
+        # ── Split-exit initialisation ─────────────────────────────────────────
+        _p1_active = _p2_active = False
+        _lot_each  = lot
+        _tsl_run   = sl
+        _be_run    = False
+        _tp_scalp  = entry
+        _mid_run   = entry
+        _p1_exit   = entry
+        _p2_exit   = entry
+        if split_exit:
+            _lot_each  = max(round(lot / 2, 2), 0.01)
+            _tp_scalp  = (entry + scalper_tp_pct * abs(tp - entry)
+                          if direction == "buy"
+                          else entry - scalper_tp_pct * abs(tp - entry))
+            _mid_run   = (entry + tp) / 2
+            _tsl_run   = sl
+            _be_run    = False
+            _p1_active = True
+            _p2_active = True
+            _p1_exit   = entry
+            _p2_exit   = entry
 
         if realistic and lot * contract_size > 0:
             price_to_zero      = equity / (lot * contract_size)
@@ -738,8 +779,8 @@ def run_backtest(
             max_favourable = max(max_favourable, favour)
             max_adverse    = max(max_adverse,    adverse)
             # ── Trailing stop update ──────────────────────────────────────────
-            if enable_trailing:
-                fc = float(df_15m["close"].iloc[j])
+            fc = float(df_15m["close"].iloc[j])
+            if enable_trailing and not split_exit:
                 # 1. Break-even at midline: trigger on bar close, not high/low
                 if not _be_triggered:
                     if direction == "buy"  and fc >= _midline:
@@ -775,6 +816,75 @@ def run_backtest(
                         else:
                             _trail_sl = min(_trail_sl, fc + atr_trail_mult * _atr14)
             # ─────────────────────────────────────────────────────────────────
+            # ── Split-exit: scalper + wick-BE runner ─────────────────────────
+            if split_exit:
+                # Scalper (pos1): fixed zone SL, exits at partial TP
+                if _p1_active:
+                    if direction == "buy":
+                        if fh >= _tp_scalp:
+                            _p1_active = False; _p1_exit = _tp_scalp
+                            if not _be_run:
+                                _be_run = True
+                                _tsl_run = max(_tsl_run, entry + be_buffer_pts)
+                        elif fl <= sl:
+                            _p1_active = False; _p1_exit = sl
+                    else:
+                        if fl <= _tp_scalp:
+                            _p1_active = False; _p1_exit = _tp_scalp
+                            if not _be_run:
+                                _be_run = True
+                                _tsl_run = min(_tsl_run, entry - be_buffer_pts)
+                        elif fh >= sl:
+                            _p1_active = False; _p1_exit = sl
+                # Runner (pos2): wick-based BE at midpoint, then swing trail + 30% lock
+                if _p2_active:
+                    if not _be_run:
+                        if direction == "buy" and fh >= _mid_run:
+                            _be_run = True; _tsl_run = max(_tsl_run, entry + be_buffer_pts)
+                        elif direction == "sell" and fl <= _mid_run:
+                            _be_run = True; _tsl_run = min(_tsl_run, entry - be_buffer_pts)
+                    if _be_run:
+                        _sbj = j - trail_swing_right
+                        if _sbj > i + trail_swing_left:
+                            _sbl = float(df_15m["low"].iloc[_sbj])
+                            _sbh = float(df_15m["high"].iloc[_sbj])
+                            _ll = all(float(df_15m["low"].iloc[_sbj-_m])  > _sbl for _m in range(1, trail_swing_left+1))
+                            _rl = all(float(df_15m["low"].iloc[_sbj+_m])  > _sbl for _m in range(1, trail_swing_right+1))
+                            _lh = all(float(df_15m["high"].iloc[_sbj-_m]) < _sbh for _m in range(1, trail_swing_left+1))
+                            _rh = all(float(df_15m["high"].iloc[_sbj+_m]) < _sbh for _m in range(1, trail_swing_right+1))
+                            if direction == "buy" and _ll and _rl:
+                                _cand = _sbl - be_buffer_pts
+                                if _cand > _tsl_run: _tsl_run = _cand
+                            elif direction == "sell" and _lh and _rh:
+                                _cand = _sbh + be_buffer_pts
+                                if _cand < _tsl_run: _tsl_run = _cand
+                        # 30% profit lock: floor trailing SL at 30% of current open profit
+                        if direction == "buy" and fc > entry:
+                            _tsl_run = max(_tsl_run, entry + 0.30 * (fc - entry))
+                        elif direction == "sell" and fc < entry:
+                            _tsl_run = min(_tsl_run, entry - 0.30 * (entry - fc))
+                    if direction == "buy":
+                        if fh >= tp:
+                            _p2_active = False; _p2_exit = tp
+                        elif fl <= _tsl_run:
+                            _p2_active = False; _p2_exit = _tsl_run
+                    else:
+                        if fl <= tp:
+                            _p2_active = False; _p2_exit = tp
+                        elif fh >= _tsl_run:
+                            _p2_active = False; _p2_exit = _tsl_run
+                # Both sub-positions closed → compute combined PnL and exit
+                if not _p1_active and not _p2_active:
+                    if direction == "buy":
+                        pnl = ((_p1_exit - entry) + (_p2_exit - entry)) * _lot_each * contract_size
+                    else:
+                        pnl = ((entry - _p1_exit) + (entry - _p2_exit)) * _lot_each * contract_size
+                    outcome    = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
+                    exit_price = _p2_exit
+                    exit_bar   = j
+                    break
+                continue  # one or both positions still open — skip single-trade check
+            # ─────────────────────────────────────────────────────────────────
             if direction == "buy":
                 if stopout_price_buy is not None and fl <= stopout_price_buy:
                     outcome = -1; exit_price = stopout_price_buy; exit_bar = j
@@ -788,6 +898,21 @@ def run_backtest(
                 if fl <= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
                 if fh >= _trail_sl:  outcome = -1; exit_price = _trail_sl; exit_bar = j; break
 
+        # ── Split-exit expiry: close any still-open sub-positions at last close ─
+        if split_exit and (_p1_active or _p2_active):
+            _last_p = float(df_15m["close"].iloc[min(exit_bar, n - 1)])
+            if _p1_active:
+                _p1_exit = _last_p
+            if _p2_active:
+                # If runner is BE-locked, honour its trailing SL; else close at market
+                _p2_exit = _tsl_run if _be_run else _last_p
+            if direction == "buy":
+                pnl = ((_p1_exit - entry) + (_p2_exit - entry)) * _lot_each * contract_size
+            else:
+                pnl = ((entry - _p1_exit) + (entry - _p2_exit)) * _lot_each * contract_size
+            outcome    = 0
+            exit_price = _p2_exit
+
         slip = 0.0
         if realistic and outcome == -1 and not stopout_occurred:
             slip = random.uniform(0.0, slippage_max_pts)
@@ -797,10 +922,11 @@ def run_backtest(
                 exit_price += slip
             total_slippage += slip * lot * contract_size
 
-        if direction == "buy":
-            pnl = (exit_price - entry) * lot * contract_size
-        else:
-            pnl = (entry - exit_price) * lot * contract_size
+        if not split_exit:
+            if direction == "buy":
+                pnl = (exit_price - entry) * lot * contract_size
+            else:
+                pnl = (entry - exit_price) * lot * contract_size
 
         swap_pnl = 0.0
         if realistic and exit_bar > i + 1:
@@ -1094,8 +1220,14 @@ def main() -> None:
                         help="Block all gradual (first-touch) long entries; only retest buys allowed")
     parser.add_argument("--gradual_long_bad_hours", default="",
                         help="Comma-separated UTC hours to block gradual long entries e.g. 0,2,9,11,16,21,23")
+    parser.add_argument("--gradual_short_bad_hours", default="",
+                        help="Comma-separated UTC hours to block gradual sell entries e.g. 1,2,4,6,11,15,19,21")
     parser.add_argument("--h4_structure_gate", action="store_true",
                         help="Block buys when H4 is below 20-MA AND last swing low was LL")
+    parser.add_argument("--split_exit", action="store_true",
+                        help="Two-trade split: scalper at partial TP + wick-BE runner with swing trail")
+    parser.add_argument("--scalper_tp_pct", type=float, default=0.45,
+                        help="Scalper exits at this fraction of full TP distance (default 0.45)")
     args = parser.parse_args()
 
     run_backtest(
@@ -1137,7 +1269,10 @@ def main() -> None:
         h4_bias_gate_1h=args.h4_bias_gate_1h,
         retest_buys_only=args.retest_buys_only,
         block_gradual_long_hours=[int(h) for h in args.gradual_long_bad_hours.split(",") if h.strip()] or None,
+        block_gradual_short_hours=[int(h) for h in args.gradual_short_bad_hours.split(",") if h.strip()] or None,
         h4_structure_gate=args.h4_structure_gate,
+        split_exit=args.split_exit,
+        scalper_tp_pct=args.scalper_tp_pct,
     )
 
 
