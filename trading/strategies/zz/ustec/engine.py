@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import random
+from dataclasses import replace as _dc_replace
 from typing import Optional
 
 import numpy as np
@@ -38,6 +39,7 @@ from trading.strategies.zz.ustec.strategy import (
     BE_TRIGGER_PTS   as _CFG_BE_TRIGGER_PTS,
     ATR_TRAIL_MULT   as _CFG_ATR_TRAIL_MULT,
     H4_REGIME_FILTER as _CFG_H4_REGIME_FILTER,
+    make_configs     as _make_base_configs,
 )
 
 
@@ -229,8 +231,14 @@ def run_backtest(
     max_daily_loss: Optional[float] = None, # block new entries once realized daily loss hits this
     max_positions: int = 1,                 # simultaneous open trades allowed (1 or 2)
     quality_max_positions: int = 1,         # extra slots for retest + 2-conf setups
-    weekly_trend_filter: bool = False,      # block buys when price < N h4 bars ago; block sells when above
+    weekly_trend_filter: bool = True,       # block buys when price < N h4 bars ago; block sells when above
     weekly_trend_bars: int = 80,            # 80 h4 bars ≈ 20 days
+    wick_ratio_min: Optional[float] = None,    # override yaml: min wick-to-range ratio for rejection_wick
+    body_ratio_max: Optional[float] = None,    # override yaml: max body-to-range ratio for rejection_wick
+    engulf_full_body: Optional[bool] = None,   # override yaml: True=strict full-body engulf, False=partial
+    close_in_upper_half: Optional[bool] = None, # override yaml: wick close must be in upper/lower half
+    bos_swing_n: Optional[int] = None,         # override yaml: bars each side required for BOS pivot
+    regime_ema200_only: bool = False,          # use only EMA200 for regime filter (ignore EMA50)
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -288,32 +296,46 @@ def run_backtest(
     df_4h["ema50"]  = df_4h["close"].ewm(span=50,  adjust=False).mean()
     df_4h["ema200"] = df_4h["close"].ewm(span=200, adjust=False).mean()
 
-    tf_cfg = TFConfig(
+    # Build base configs from the same yaml as live_bot_zz.py — single source of truth
+    _base_tf_cfg, _base_conf_cfg, _base_setup_cfg = _make_base_configs()
+
+    # TFConfig — base from yaml, override only CLI-tunable knobs
+    _zone_override = (
+        _dc_replace(_base_tf_cfg.h4_zone_cfg, max_zone_height_atr=max_zone_height_atr)
+        if max_zone_height_atr > 0
+        else _base_tf_cfg.h4_zone_cfg
+    )
+    tf_cfg = _dc_replace(
+        _base_tf_cfg,
         directional_filter=directional_filter,
         allow_neutral_up=allow_neutral,
         allow_neutral_down=allow_neutral,
         h4_swing_left=h4_swing_left,
         h4_swing_right=h4_swing_right,
-        h4_zone_cfg=ZoneConfig(
-            impulse_atr_mult=2.0,
-            body_ratio_min=0.50,
-            min_departure_candles=2,
-            departure_window=6,
-            base_lookback=5,
-            min_strength=1.5,
-            max_zone_height_atr=max_zone_height_atr,
-        ),
-        m15_tap_lookback=20,
-        require_m15_directional_close=True,
+        h4_zone_cfg=_zone_override,
     )
-    conf_cfg = ConfirmationConfig(
+
+    # ConfirmationConfig — base from yaml, override only CLI-tunable knobs
+    _conf_overrides: dict = dict(
         min_confirmations=min_confirmations,
         aggressive_boundary=aggressive_boundary,
-        bos_lookback=15,
-        structure_lookback=25,
         excluded_from_count=excluded_from_count or [],
     )
-    setup_cfg = TradeSetupConfig(
+    if wick_ratio_min is not None:
+        _conf_overrides["wick_ratio_min"] = wick_ratio_min
+    if body_ratio_max is not None:
+        _conf_overrides["body_ratio_max"] = body_ratio_max
+    if engulf_full_body is not None:
+        _conf_overrides["engulf_full_body"] = engulf_full_body
+    if close_in_upper_half is not None:
+        _conf_overrides["close_in_upper_half"] = close_in_upper_half
+    if bos_swing_n is not None:
+        _conf_overrides["bos_swing_n"] = bos_swing_n
+    conf_cfg = _dc_replace(_base_conf_cfg, **_conf_overrides)
+
+    # TradeSetupConfig — base from yaml, override only CLI-tunable knobs
+    setup_cfg = _dc_replace(
+        _base_setup_cfg,
         aggressive_entry=aggressive_entry,
         sl_buffer_pct=sl_buffer_pct,
         midline_tp=midline_tp,
@@ -323,26 +345,17 @@ def run_backtest(
         m15_sl_atr_floor_mult=m15_sl_atr_floor_mult,
     )
 
-    # 1H TFConfig — identical zone/bias parameters as 4H path, just fed 1H data
+    # 1H TFConfig — same yaml base as 4H path, just fed 1H data
     tf_cfg_1h = None
     if dual_tf:
-        tf_cfg_1h = TFConfig(
+        tf_cfg_1h = _dc_replace(
+            _base_tf_cfg,
             directional_filter=directional_filter,
             allow_neutral_up=allow_neutral,
             allow_neutral_down=allow_neutral,
             h4_swing_left=h4_swing_left,
             h4_swing_right=h4_swing_right,
-            h4_zone_cfg=ZoneConfig(
-                impulse_atr_mult=2.0,
-                body_ratio_min=0.50,
-                min_departure_candles=2,
-                departure_window=6,
-                base_lookback=5,
-                min_strength=1.5,
-                max_zone_height_atr=max_zone_height_atr,
-            ),
-            m15_tap_lookback=20,
-            require_m15_directional_close=True,
+            h4_zone_cfg=_zone_override,
         )
 
     _pr(
@@ -553,17 +566,25 @@ def run_backtest(
 
         if h4_regime_filter and direction == "buy":
             _price  = float(df_15m_w["close"].iloc[-1])
-            _ema50  = float(df_h4_w["ema50"].iloc[-1])
             _ema200 = float(df_h4_w["ema200"].iloc[-1])
-            if _price < _ema50 and _price < _ema200:
+            if regime_ema200_only:
+                _blocked = _price < _ema200
+            else:
+                _ema50  = float(df_h4_w["ema50"].iloc[-1])
+                _blocked = _price < _ema50 and _price < _ema200
+            if _blocked:
                 filters["regime_filter"] += 1
                 continue
 
         if h4_regime_filter and direction == "sell":
             _price  = float(df_15m_w["close"].iloc[-1])
-            _ema50  = float(df_h4_w["ema50"].iloc[-1])
             _ema200 = float(df_h4_w["ema200"].iloc[-1])
-            if _price > _ema50 and _price > _ema200:
+            if regime_ema200_only:
+                _blocked = _price > _ema200
+            else:
+                _ema50  = float(df_h4_w["ema50"].iloc[-1])
+                _blocked = _price > _ema50 and _price > _ema200
+            if _blocked:
                 filters["regime_filter"] += 1
                 continue
 
@@ -713,17 +734,14 @@ def run_backtest(
 
         signal_price = float(df_15m_w["close"].iloc[-1])
 
-        # M15 ATR14 for SL floor validation (only computed when needed)
-        if use_m15_sl:
-            _atr_vals = []
-            for _ak in range(max(1, len(df_15m_w) - 14), len(df_15m_w)):
-                _fh  = float(df_15m_w["high"].iloc[_ak])
-                _fl  = float(df_15m_w["low"].iloc[_ak])
-                _fpc = float(df_15m_w["close"].iloc[_ak - 1])
-                _atr_vals.append(max(_fh - _fl, abs(_fh - _fpc), abs(_fl - _fpc)))
-            _m15_atr14 = sum(_atr_vals) / max(len(_atr_vals), 1)
-        else:
-            _m15_atr14 = 0.0
+        # M15 ATR14 — always computed (matches live_bot_zz.py)
+        _atr_vals = []
+        for _ak in range(max(1, len(df_15m_w) - 14), len(df_15m_w)):
+            _fh  = float(df_15m_w["high"].iloc[_ak])
+            _fl  = float(df_15m_w["low"].iloc[_ak])
+            _fpc = float(df_15m_w["close"].iloc[_ak - 1])
+            _atr_vals.append(max(_fh - _fl, abs(_fh - _fpc), abs(_fl - _fpc)))
+        _m15_atr14 = sum(_atr_vals) / max(len(_atr_vals), 1) if _atr_vals else 0.0
 
         setup = setup_from_analysis(
             tf_result, signal_price, setup_cfg,
