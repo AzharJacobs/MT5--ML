@@ -456,6 +456,28 @@ class ZZLiveBot:
                 log.info("Buy blocked — price below H4 EMA50 and EMA200 (downtrend regime)")
                 return
 
+        if H4_REGIME_FILTER and direction == "sell":
+            _price  = float(df_15m_w["close"].iloc[-1])
+            _ema50  = float(df_4h_w["ema50"].iloc[-1])
+            _ema200 = float(df_4h_w["ema200"].iloc[-1])
+            if _price > _ema50 and _price > _ema200:
+                self.zlog.log_skip(now, "regime_filter_sell_blocked", tf_result)
+                log.info("Sell blocked — price above H4 EMA50 and EMA200 (uptrend regime)")
+                return
+
+        _WEEKLY_TREND_BARS = 80
+        if len(df_4h) > _WEEKLY_TREND_BARS:
+            _cur  = float(df_4h["close"].iloc[-1])
+            _past = float(df_4h["close"].iloc[-1 - _WEEKLY_TREND_BARS])
+            if direction == "buy" and _cur < _past:
+                self.zlog.log_skip(now, "weekly_trend_buy_blocked", tf_result)
+                log.info("Buy blocked — price %.2f below 20-day level %.2f (weekly downtrend)", _cur, _past)
+                return
+            if direction == "sell" and _cur > _past:
+                self.zlog.log_skip(now, "weekly_trend_sell_blocked", tf_result)
+                log.info("Sell blocked — price %.2f above 20-day level %.2f (weekly uptrend)", _cur, _past)
+                return
+
         if zk not in self.zone_touch_tracker:
             self.zone_touch_tracker[zk] = {
                 "bottom":    active_zone.bottom,

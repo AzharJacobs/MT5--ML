@@ -227,6 +227,10 @@ def run_backtest(
     scalper_tp_pct: float = 0.45,           # scalper exits at this fraction of full TP distance
     skip_months: Optional[list] = None,     # e.g. [11] to skip November; [6, 11] for Jun+Nov
     max_daily_loss: Optional[float] = None, # block new entries once realized daily loss hits this
+    max_positions: int = 1,                 # simultaneous open trades allowed (1 or 2)
+    quality_max_positions: int = 1,         # extra slots for retest + 2-conf setups
+    weekly_trend_filter: bool = False,      # block buys when price < N h4 bars ago; block sells when above
+    weekly_trend_bars: int = 80,            # 80 h4 bars ≈ 20 days
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
@@ -350,7 +354,7 @@ def run_backtest(
     equity         = cash
     equity_curve   = [cash]
     trades: list   = []
-    skip_until     = -1
+    _pending: list = []           # open positions awaiting close (keyed by exit_bar)
     zone_cooldown: dict  = {}
     zone_reentry:  dict  = {}
     won_zones:     set   = set()
@@ -431,7 +435,56 @@ def run_backtest(
             for zk in ready:
                 del zone_reentry[zk]
 
-        if i <= skip_until:
+        # ── Close any pending positions whose exit bar has been reached ─────────
+        _still_open = []
+        for _p in sorted(_pending, key=lambda x: x["exit_bar"]):
+            if _p["exit_bar"] <= i:
+                equity += _p["pnl"]
+                if equity < 0:
+                    equity = 0.0
+                _p["trade_data"]["equity"] = round(equity, 2)
+                equity_curve.append(equity)
+                trades.append(_p["trade_data"])
+                _zk_c, _zid_c = _p["zk"], _p["zid"]
+                _oc_c, _pnl_c = _p["outcome"], _p["pnl"]
+                _dir_c, _eb_c = _p["direction"], _p["exit_bar"]
+                zone_outcome_history.setdefault(_zid_c, []).append(_oc_c)
+                if _oc_c == 1:
+                    won_zones.add(_zk_c)
+                    zone_consec_losses[_zid_c] = 0
+                    if dir_max_losses > 0:
+                        dir_consec_losses[_dir_c] = 0
+                        dir_cooldown[_dir_c] = None
+                    if require_leave_and_return:
+                        zone_reentry[_zk_c] = {
+                            "phase":            "exit",
+                            "bottom":           _p["zone_bottom"],
+                            "top":              _p["zone_top"],
+                            "earliest_reentry": _eb_c + cooldown_bars,
+                        }
+                    else:
+                        zone_cooldown[_zk_c] = _eb_c + cooldown_bars
+                elif _oc_c == -1:
+                    zone_cooldown[_zk_c] = _eb_c + COOLDOWN_LOSS
+                    if _pnl_c < 0:
+                        if zone_max_losses > 0:
+                            _nc = zone_consec_losses.get(_zid_c, 0) + 1
+                            zone_consec_losses[_zid_c] = _nc
+                            if _nc >= zone_max_losses:
+                                zone_blacklist.add(_zid_c)
+                        if dir_max_losses > 0:
+                            _nd = dir_consec_losses.get(_dir_c, 0) + 1
+                            dir_consec_losses[_dir_c] = _nd
+                            if _nd >= dir_max_losses:
+                                dir_cooldown[_dir_c] = _eb_c + dir_cooldown_bars
+                else:
+                    zone_consec_losses[_zid_c] = 0
+                zone_touch_tracker.pop(_zk_c, None)
+            else:
+                _still_open.append(_p)
+        _pending = _still_open
+
+        if len(_pending) >= max(max_positions, quality_max_positions):
             filters["in_position"] += 1
             continue
 
@@ -514,6 +567,19 @@ def run_backtest(
                 filters["regime_filter"] += 1
                 continue
 
+        if weekly_trend_filter:
+            _h4_all  = df_4h[df_4h["timestamp"] <= ts_now]
+            _n_h4    = len(_h4_all)
+            if _n_h4 > weekly_trend_bars:
+                _cur  = float(_h4_all["close"].iloc[-1])
+                _past = float(_h4_all["close"].iloc[-1 - weekly_trend_bars])
+                if direction == "buy"  and _cur < _past:
+                    filters["weekly_trend_skip"] = filters.get("weekly_trend_skip", 0) + 1
+                    continue
+                if direction == "sell" and _cur > _past:
+                    filters["weekly_trend_skip"] = filters.get("weekly_trend_skip", 0) + 1
+                    continue
+
         # H4 structure gate: block buys when H4 trend is genuinely bearish.
         # Checks price vs 20-MA AND most recent swing low label — buy blocked only
         # when BOTH fail (price below MA AND last swing low was LL).
@@ -578,6 +644,11 @@ def run_backtest(
             continue
 
         is_retest = zk in won_zones
+        _is_quality = is_retest and conf.count >= 2
+        _eff_cap    = quality_max_positions if _is_quality else max_positions
+        if len(_pending) >= _eff_cap:
+            filters["in_position"] += 1
+            continue
         history   = zone_outcome_history.get(zid, [])
         if not history:
             prior_bucket = "first_attempt"
@@ -959,84 +1030,64 @@ def run_backtest(
                 pnl      += swap_pnl
                 total_swap_pnl += swap_pnl
 
-        equity += pnl
-        if equity < 0:
-            equity = 0.0
-        equity_curve.append(equity)
-        skip_until = exit_bar
+        # Update daily_pnl now so the cap check sees this trade on re-entry attempts
         if max_daily_loss is not None:
             _entry_day = ts_now.date()
             daily_pnl[_entry_day] = daily_pnl.get(_entry_day, 0.0) + pnl
 
-        zone_outcome_history.setdefault(zid, []).append(outcome)
-
-        if outcome == 1:
-            won_zones.add(zk)
-            zone_consec_losses[zid] = 0
-            if dir_max_losses > 0:
-                dir_consec_losses[direction] = 0
-                dir_cooldown[direction] = None
-            if require_leave_and_return:
-                zone_reentry[zk] = {
-                    "phase":            "exit",
-                    "bottom":           active_zone.bottom,
-                    "top":              active_zone.top,
-                    "earliest_reentry": exit_bar + cooldown_bars,
-                }
-            else:
-                zone_cooldown[zk] = exit_bar + cooldown_bars
-        elif outcome == -1:
-            zone_cooldown[zk] = exit_bar + COOLDOWN_LOSS
-            # Only blacklist / count losses when the trade actually lost money.
-            # A trailing-stop exit at BE+buffer is outcome=-1 but pnl > 0; don't penalise the zone.
-            if pnl < 0:
-                if zone_max_losses > 0:
-                    new_count = zone_consec_losses.get(zid, 0) + 1
-                    zone_consec_losses[zid] = new_count
-                    if new_count >= zone_max_losses:
-                        zone_blacklist.add(zid)
-                if dir_max_losses > 0:
-                    new_dir = dir_consec_losses[direction] + 1
-                    dir_consec_losses[direction] = new_dir
-                    if new_dir >= dir_max_losses:
-                        dir_cooldown[direction] = exit_bar + dir_cooldown_bars
-        else:
-            zone_consec_losses[zid] = 0
-
         exit_ts = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
-        trades.append({
-            "date":          ts_now,
-            "exit_date":     exit_ts,
-            "side":          direction,
-            "entry":         entry,
-            "sl":            sl,
-            "tp":            tp,
-            "exit":          exit_price,
-            "outcome":       outcome,
-            "lot":           lot,
-            "pnl":           round(pnl, 2),
-            "equity":        round(equity, 2),
-            "max_favour":    round(max_favourable, 2),
-            "max_adverse":   round(max_adverse, 2),
-            "confirmations": conf.count,
-            "signals":       "|".join(conf.signals),
-            "h4_bias":       tf_result["h4_bias"],
-            "entry_mode":    setup.entry_mode,
-            "tp_mode":       setup.tp_mode,
-            "is_retest":     is_retest,
-            "prior_bucket":  prior_bucket,
-            "arrival_type":  arrival_type,
-            "zone_fresh":    active_zone.fresh,
-            "zone_bottom":   active_zone.bottom,
-            "zone_top":      active_zone.top,
-            "zone_strength": active_zone.strength,
-            "zone_kind":     active_zone.kind,
-            "tf_source":     _tf_source,
-            "structure":       {"zone": (active_zone.bottom, active_zone.top)},
-            "signal_close":    signal_price,
-            "raw_open":        raw_open,
+        _pending.append({
+            "exit_bar":    exit_bar,
+            "pnl":         pnl,
+            "outcome":     outcome,
+            "direction":   direction,
+            "zk":          zk,
+            "zid":         zid,
+            "zone_bottom": active_zone.bottom,
+            "zone_top":    active_zone.top,
+            "ts_entry":    ts_now,
+            "trade_data": {
+                "date":          ts_now,
+                "exit_date":     exit_ts,
+                "side":          direction,
+                "entry":         entry,
+                "sl":            sl,
+                "tp":            tp,
+                "exit":          exit_price,
+                "outcome":       outcome,
+                "lot":           lot,
+                "pnl":           round(pnl, 2),
+                "equity":        None,           # filled at close time
+                "max_favour":    round(max_favourable, 2),
+                "max_adverse":   round(max_adverse, 2),
+                "confirmations": conf.count,
+                "signals":       "|".join(conf.signals),
+                "h4_bias":       tf_result["h4_bias"],
+                "entry_mode":    setup.entry_mode,
+                "tp_mode":       setup.tp_mode,
+                "is_retest":     is_retest,
+                "prior_bucket":  prior_bucket,
+                "arrival_type":  arrival_type,
+                "zone_fresh":    active_zone.fresh,
+                "zone_bottom":   active_zone.bottom,
+                "zone_top":      active_zone.top,
+                "zone_strength": active_zone.strength,
+                "zone_kind":     active_zone.kind,
+                "tf_source":     _tf_source,
+                "structure":       {"zone": (active_zone.bottom, active_zone.top)},
+                "signal_close":    signal_price,
+                "raw_open":        raw_open,
+            },
         })
-        zone_touch_tracker.pop(zk, None)
+
+    # ── Flush any positions still open at end of the bar loop ─────────────────
+    for _p in sorted(_pending, key=lambda x: x["exit_bar"]):
+        equity += _p["pnl"]
+        if equity < 0:
+            equity = 0.0
+        _p["trade_data"]["equity"] = round(equity, 2)
+        equity_curve.append(equity)
+        trades.append(_p["trade_data"])
 
     if not trades:
         print("No trades generated. Widen date range, lower min_rr, or reduce min_confirmations.")

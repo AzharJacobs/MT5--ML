@@ -86,6 +86,8 @@ def main() -> None:
                         help="Comma-separated month numbers to skip entirely e.g. 11 or 6,11")
     parser.add_argument("--max_daily_loss", type=float, default=0.0,
                         help="Block new entries once realized daily loss reaches this amount")
+    parser.add_argument("--max_positions", type=int, default=1,
+                        help="Maximum simultaneous open trades (1 or 2)")
 
     args = parser.parse_args()
 
@@ -128,6 +130,7 @@ def main() -> None:
         retest_buys_only=args.retest_buys_only,
         skip_months=[int(m) for m in args.skip_months.split(",") if m.strip()] or None,
         max_daily_loss=args.max_daily_loss if args.max_daily_loss > 0 else None,
+        max_positions=args.max_positions,
     )
 
 
