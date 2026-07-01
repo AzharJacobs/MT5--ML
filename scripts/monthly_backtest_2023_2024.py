@@ -28,6 +28,9 @@ result = run_backtest(
     end="2025-01-01",
     cash=150.0,
     symbol="ustech",
+    be_trigger_r=1.0,
+    lock_trigger_r=2.0,
+    be_buffer_pts=5.0,
     silent=True,
 )
 
@@ -157,7 +160,7 @@ HEADER = (
 )
 
 print("\n" + DIVIDER)
-print("  USTECm  |  Backtest Monthly Report  |  Jan 2023 – Dec 2024")
+print("  USTECm  |  Backtest Monthly Report  |  Jan 2023 – Dec 2024  |  BE@1R / Lock@2R")
 print(DIVIDER)
 print(HEADER)
 print(DIVIDER)

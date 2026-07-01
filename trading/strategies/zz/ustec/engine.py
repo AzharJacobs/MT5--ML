@@ -91,6 +91,10 @@ def run_backtest(
     fixed_lot:     float = 0.0,
     require_leave_and_return: bool = True,
     cooldown_bars: int = 15,
+    # ── Trade management ──────────────────────────────────────────────────────
+    be_trigger_r:   float = 0.0,   # R profit to trigger break-even (0 = off)
+    lock_trigger_r: float = 0.0,   # R profit to lock in +1R on SL (0 = off)
+    be_buffer_pts:  float = 5.0,   # buffer above/below entry when moving to BE
     save_path: Optional[str] = None,
     chart:  bool = False,
     silent: bool = False,
@@ -283,6 +287,12 @@ def run_backtest(
 
         lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size)
 
+        # ── Trade management state ────────────────────────────────────────────
+        orig_sl_dist   = abs(entry - sl)
+        active_sl      = sl
+        be_triggered   = False
+        lock_triggered = False
+
         # ── Simulate trade bar-by-bar ─────────────────────────────────────────
         outcome        = 0
         exit_price     = entry
@@ -293,14 +303,45 @@ def run_backtest(
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
             fl = float(df_15m["low"].iloc[j])
+
             max_favourable = max(max_favourable, (fh - entry) if direction == "buy" else (entry - fl))
             max_adverse    = max(max_adverse,    (entry - fl) if direction == "buy" else (fh - entry))
-            if direction == "buy":
-                if fh >= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                if fl <= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
+
+            # Current bar's max favour in R terms (use bar high/low, not close,
+            # so the management trigger fires as soon as price reaches the level)
+            if orig_sl_dist > 0:
+                bar_favor_r = (
+                    (fh - entry) / orig_sl_dist if direction == "buy"
+                    else (entry - fl) / orig_sl_dist
+                )
             else:
-                if fl <= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                if fh >= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
+                bar_favor_r = 0.0
+
+            # Level 1: move SL to break-even
+            if be_trigger_r > 0 and not be_triggered and bar_favor_r >= be_trigger_r:
+                be_triggered = True
+                if direction == "buy":
+                    active_sl = max(active_sl, entry + be_buffer_pts)
+                else:
+                    active_sl = min(active_sl, entry - be_buffer_pts)
+
+            # Level 2: lock in +1R on the SL
+            if lock_trigger_r > 0 and not lock_triggered and bar_favor_r >= lock_trigger_r:
+                lock_triggered = True
+                lock_price = entry + orig_sl_dist if direction == "buy" else entry - orig_sl_dist
+                if direction == "buy":
+                    active_sl = max(active_sl, lock_price)
+                else:
+                    active_sl = min(active_sl, lock_price)
+
+            if direction == "buy":
+                if fh >= tp:         outcome =  1; exit_price = tp;        exit_bar = j; break
+                if fl <= active_sl:  outcome = -1; exit_price = active_sl; exit_bar = j; break
+            else:
+                if fl <= tp:         outcome =  1; exit_price = tp;        exit_bar = j; break
+                if fh >= active_sl:  outcome = -1; exit_price = active_sl; exit_bar = j; break
+
+        managed = "lock" if lock_triggered else ("be" if be_triggered else "none")
 
         if direction == "buy":
             pnl = (exit_price - entry) * lot * contract_size
@@ -340,6 +381,7 @@ def run_backtest(
                 "zone_kind":     active_zone.kind,
                 "entry_mode":    setup.entry_mode,
                 "tp_mode":       setup.tp_mode,
+                "managed":       managed,
             },
         })
 
@@ -395,6 +437,9 @@ def run_backtest(
         "directional_filter": directional_filter,
         "entry_mode":      "zone_boundary" if aggressive_entry else "confirmation",
         "tp_mode":         f"midline_{midline_pct:.0%}" if midline_tp else "zone_edge",
+        "be_trigger_r":    be_trigger_r   if be_trigger_r   > 0 else "off",
+        "lock_trigger_r":  lock_trigger_r if lock_trigger_r > 0 else "off",
+        "be_buffer_pts":   be_buffer_pts,
     }
 
     if not silent:
@@ -458,6 +503,12 @@ def main() -> None:
     parser.add_argument("--fixed_lot",   type=float, default=0.0)
     parser.add_argument("--no_leave_return", action="store_true")
     parser.add_argument("--cooldown_bars",   type=int, default=15)
+    parser.add_argument("--be_trigger_r",   type=float, default=0.0,
+                        help="Move SL to BE when trade reaches this many R in profit (0=off)")
+    parser.add_argument("--lock_trigger_r", type=float, default=0.0,
+                        help="Lock in +1R on SL when trade reaches this many R in profit (0=off)")
+    parser.add_argument("--be_buffer_pts",  type=float, default=5.0,
+                        help="Buffer above/below entry when moving to BE (default 5 pts)")
     parser.add_argument("--save",  default=None)
     parser.add_argument("--chart", action="store_true")
     parser.add_argument("--silent", action="store_true")
@@ -483,6 +534,9 @@ def main() -> None:
         fixed_lot=args.fixed_lot,
         require_leave_and_return=not args.no_leave_return,
         cooldown_bars=args.cooldown_bars,
+        be_trigger_r=args.be_trigger_r,
+        lock_trigger_r=args.lock_trigger_r,
+        be_buffer_pts=args.be_buffer_pts,
         save_path=args.save,
         chart=args.chart,
         silent=args.silent,
