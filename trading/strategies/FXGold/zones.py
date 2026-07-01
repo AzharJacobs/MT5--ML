@@ -22,7 +22,7 @@ Grading rules:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -43,6 +43,8 @@ class Zone:
     score: float = 0.0
     is_strong: bool = False
     flipped: bool = False
+    flip_origin: Optional[int] = None   # bar index where first breakout fired
+    dead: bool = False                  # True after a second breakout (single-flip guard)
 
     @property
     def zone_key(self) -> Tuple[float, float]:
@@ -106,9 +108,14 @@ def _grade(zones: List[Zone], df: pd.DataFrame, cfg: FXGoldConfig) -> None:
             bc = float(df["close"].iloc[i])
 
             if is_breakout(bc, zone):
+                if zone.flipped:                  # single-flip guard: second breakout kills zone
+                    zone.dead = True
+                    break
                 zone.flipped = True
                 zone.kind = "support" if zone.kind == "resistance" else "resistance"
-                break
+                zone.touches = 0                  # pre-breakout touches discarded
+                zone.flip_origin = i              # touch counting restarts here
+                continue                          # keep scanning for post-flip retests
 
             if is_rejection_touch(bh, bl, bc, zone):
                 zone.touches += 1
@@ -188,5 +195,5 @@ def detect_zones(df: pd.DataFrame, tf: str, cfg: FXGoldConfig) -> List[Zone]:
 
     _grade(zones, df, cfg)
 
-    strong = [z for z in zones if z.is_strong and not z.flipped]
+    strong = [z for z in zones if z.is_strong and not z.dead]
     return sorted(strong, key=lambda z: z.score, reverse=True)

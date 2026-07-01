@@ -298,7 +298,21 @@
       "Bash(/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -c \"import numpy; print\\('found at', numpy.__file__\\)\")",
       "Bash(pyenv versions *)",
       "Bash(brew list *)",
-      "Bash(xargs -I{} sh -c '{} -c \"import numpy\" 2>/dev/null && echo {}')"
+      "Bash(xargs -I{} sh -c '{} -c \"import numpy\" 2>/dev/null && echo {}')",
+      "Bash(ls \"f:/rl_ustec-main/scripts/\")",
+      "Read(//f/rl_ustec-main/scripts/**)",
+      "PowerShell(cd \"f:\\\\rl_ustec-main\"; $env:DB_PASSWORD = \"@thraaParker2003!\"; python scripts/check_db.py 2>&1)",
+      "PowerShell(pip install MetaTrader5 2>&1)",
+      "PowerShell($env:PGPASSWORD = \"@thraaParker2003!\"; psql -U postgres -d XAUUSD -h localhost -f \"f:\\\\rl_ustec-main\\\\scripts\\\\create_candle_tables.sql\" 2>&1)",
+      "PowerShell(cd \"f:\\\\rl_ustec-main\"; $env:MT5_LOGIN = \"161597519\"; $env:MT5_PASSWORD = \"50CentXAU$\"; $env:MT5_SERVER = \"Exness-MT5Real21\"; $env:DB_PASSWORD = \"@thraaParker2003!\"; python scripts/backfill_mt5.py 2>&1)",
+      "PowerShell($env:MT5_LOGIN = \"161597519\"; $env:MT5_PASSWORD = \"50CentXAU$\"; $env:MT5_SERVER = \"Exness-MT5Real21\"; $env:DB_PASSWORD = \"@thraaParker2003!\"; cd \"f:\\\\\"; python \"f:\\\\rl_ustec-main\\\\scripts\\\\backfill_mt5.py\" 2>&1)",
+      "PowerShell(Rename-Item -Path \"f:\\\\rl_ustec-main\\\\logging\" -NewName \"rl_logging\")",
+      "PowerShell($env:DB_PASSWORD = \"@thraaParker2003!\"; python \"C:\\\\Users\\\\AZHARJ~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\f--MT5--ML\\\\0cfa2807-29ce-4849-a2f2-3eb22df4bdec\\\\scratchpad\\\\smoke_test.py\" 2>&1)",
+      "PowerShell(New-Item -ItemType Directory -Force \"f:\\\\rl_ustec-main\\\\models\\\\best\")",
+      "PowerShell(New-Item -ItemType Directory -Force \"f:\\\\rl_ustec-main\\\\models\\\\checkpoints\")",
+      "PowerShell(New-Item -ItemType Directory -Force \"f:\\\\rl_ustec-main\\\\logs\\\\eval\")",
+      "PowerShell(New-Item -ItemType Directory -Force \"f:\\\\rl_ustec-main\\\\logs\\\\tensorboard\")",
+      "PowerShell($env:DB_PASSWORD = \"@thraaParker2003!\"; cd \"f:\\\\rl_ustec-main\"; python scripts/run_train.py 2>&1)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Azhar Jacobs\\.claude\\projects\\f--MT5--ML",
