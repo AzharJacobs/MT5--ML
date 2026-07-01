@@ -1,16 +1,23 @@
 """
 zones.py — Demand / Supply zone detection engine.
 
-Zone marking rules (demand — supply is mirrored):
-  1. Detect an impulsive UP move: strong bullish departure candles where
-     price breaks away sharply from a base.
-  2. Step back to the BASE immediately before the impulse:
-       the last red/bearish candle (or, if none in range, the prior bar).
-  3. Zone box uses the base candle's full range (wicks):
-       top    = high (wick high) of base candle/cluster
-       bottom = low  (wick low)  of base candle/cluster
-  4. Strength = net_impulse / ATR — higher = stronger zone.
-  5. A zone is "fresh" until price taps back into it; prefer fresh zones.
+Zone marking rules (Base → Impulse → Return pattern):
+  Demand zone (buy):
+    top    = body-high of the last bearish candle before the rally
+             = max(open, close) of base candle
+    bottom = wick-low of that same base candle = low of base candle
+    So: wick-low → body-open of the candle right before the rally.
+
+  Supply zone (sell):
+    top    = wick-high of the last bullish candle before the drop = high of base candle
+    bottom = body-low of that same base candle
+             = min(open, close) of base candle
+    So: body-open → wick-high of the candle right before the drop.
+
+  The base candle = last opposing-colour candle before the impulse.
+  Zones represent leftover unfilled institutional orders (order flow imbalance).
+  A zone is "fresh" until price taps back; prefer fresh zones over tapped ones.
+  Zone strength fades after 2-3 touches.
 
 All thresholds are tunable via ZoneConfig.
 """
@@ -257,7 +264,8 @@ def detect_zones(
             if base_idx not in used_demand:
                 strength = net_up / cur_atr
                 if strength >= cfg.min_strength:
-                    z_top = float(highs[base_idx])
+                    # Demand: wick-low → body-high of the last down candle before rally
+                    z_top = max(float(opens[base_idx]), float(closes[base_idx]))
                     z_bot = float(lows[base_idx])
                     if z_top > z_bot:
                         if cfg.max_zone_height_atr > 0 and (z_top - z_bot) > cfg.max_zone_height_atr * cur_atr:
@@ -279,8 +287,9 @@ def detect_zones(
             if base_idx not in used_supply:
                 strength = net_down / cur_atr
                 if strength >= cfg.min_strength:
+                    # Supply: body-low → wick-high of the last up candle before drop
                     z_top = float(highs[base_idx])
-                    z_bot = float(lows[base_idx])
+                    z_bot = min(float(opens[base_idx]), float(closes[base_idx]))
                     if z_top > z_bot:
                         if cfg.max_zone_height_atr > 0 and (z_top - z_bot) > cfg.max_zone_height_atr * cur_atr:
                             pass  # zone too wide — discard

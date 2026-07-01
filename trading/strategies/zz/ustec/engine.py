@@ -1,69 +1,48 @@
 """
 USTEC Zone-to-Zone backtest engine.
 
-Bar-by-bar M15 simulation:
+Core strategy (all steps execute in order):
   Step 1  detect_zones on H4 (bounded to current bar — no lookahead)
-  Step 2  analyse_timeframes → H4 bias + active zone + M15 pre-filter
-  Step 3  check_confirmations_at_last_bar → entry pattern gate
+  Step 2  analyse_timeframes → H4 bias + zone selection + M15 tap
+          No-man's-land rule: clean edge reaction required (not mid-zone drift)
+  Step 3  check_confirmations → engulfing / rejection wick / BOS / CHoCH
   Step 4  build_trade_setup → entry / SL / TP geometry
+          Buy demand, sell supply — directional only
+          SL below demand zone / above supply zone
+          TP at next opposite zone (or midline 50%)
 """
 
 from __future__ import annotations
 
 import argparse
-import random
 from dataclasses import replace as _dc_replace
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
-from trading.strategies.zz.core.zones import ZoneConfig
 from trading.strategies.zz.core.timeframe_structure import TFConfig, analyse_timeframes
 from trading.strategies.zz.core.confirmations import ConfirmationConfig, check_confirmations_at_last_bar
-from trading.strategies.zz.core.swing_structure import (
-    detect_swings as _detect_swings_h4,
-    label_structure as _label_structure_h4,
-)
 from trading.strategies.zz.core.trade_setup import TradeSetupConfig, setup_from_analysis
 from trading.shared.backtest.report import print_report, save_report
 from trading.shared.backtest.chart import plot_trades
 from trading.shared.data_loader import get_connection
 
-# Pull USTEC config defaults so run_backtest() parameters match config.yaml out-of-the-box
-from trading.strategies.zz.ustec.strategy import (
-    ZONE_MAX_LOSSES  as _CFG_ZONE_MAX_LOSSES,
-    MAX_SL_PCT       as _CFG_MAX_SL_PCT,
-    ENABLE_TRAILING  as _CFG_ENABLE_TRAILING,
-    BE_BUFFER_PTS    as _CFG_BE_BUFFER_PTS,
-    BE_TRIGGER_PTS   as _CFG_BE_TRIGGER_PTS,
-    ATR_TRAIL_MULT   as _CFG_ATR_TRAIL_MULT,
-    H4_REGIME_FILTER as _CFG_H4_REGIME_FILTER,
-    make_configs     as _make_base_configs,
-)
+from trading.strategies.zz.ustec.strategy import make_configs as _make_base_configs
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-H4_WINDOW  = 150
-H1_WINDOW  = 300   # ~18 trading days of 1H context (same coverage as H4_WINDOW on H4)
-M15_WINDOW = 80
+H4_WINDOW        = 150
+M15_WINDOW       = 80
 MAX_FORWARD_BARS = 350
-
-RISK_PCT      = 0.01
-COOLDOWN_LOSS = 48   # M15 bars (12 h)
+RISK_PCT         = 0.01
+COOLDOWN_LOSS    = 48   # M15 bars cooldown after a loss (~12 h)
 
 SYMBOL_CONFIG = {
     "ustech": ("ustech_ohlcv", "ustech_ohlcv", 100.0),
-    "xauusd": ("XAUUSD",       "xauusd_ohlcv", 100.0),
 }
 SYMBOL_SPREAD = {
     "ustech": 2.0,
-    "xauusd": 0.0,
 }
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _load_ohlcv(db, table: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
     query = (
@@ -84,197 +63,54 @@ def _zone_key(zone) -> tuple:
     return (round(zone.bottom, 1), round(zone.top, 1))
 
 
-def _zones_overlap(z1, z2) -> bool:
-    """True when two zones share any price overlap."""
-    return max(z1.bottom, z2.bottom) < min(z1.top, z2.top)
-
-
-def _dynamic_spread(ts: pd.Timestamp, base: float = 4.0) -> float:
-    h = ts.hour + ts.minute / 60.0
-    if 21.0 <= h < 22.1:
-        return base * 3.0
-    if h < 6.0:
-        return base * 2.0
-    return base
-
-
-def _count_overnights(ts_entry: pd.Timestamp, ts_exit: pd.Timestamp) -> int:
-    return max(0, (ts_exit.date() - ts_entry.date()).days)
-
-
-def _lot_size(equity: float, sl_dist: float, contract_size: float, risk_pct: float = RISK_PCT) -> float:
+def _lot_size(equity: float, sl_dist: float, contract_size: float) -> float:
     if sl_dist <= 0:
         return 0.01
-    lot = (equity * risk_pct) / (sl_dist * contract_size)
+    lot = (equity * RISK_PCT) / (sl_dist * contract_size)
     return max(round(lot, 2), 0.01)
 
 
-def _h4_bearish_regime(
-    df_h4: pd.DataFrame,
-    n_consec_ll: int = 2,
-    swing_left: int = 2,
-    swing_right: int = 2,
-) -> bool:
-    """
-    True when the last n_consec_ll confirmed H4 swing lows are all Lower Lows,
-    indicating a sustained bearish structural regime.  No lookahead beyond df_h4.
-    swing_right bars of confirmation lag is inherent and expected.
-    """
-    if len(df_h4) < swing_left + swing_right + 2:
-        return False
-    swings  = _detect_swings_h4(df_h4, left=swing_left, right=swing_right)
-    labeled = _label_structure_h4(swings)
-    sl_seq  = [lbl for _, _, lbl in labeled if lbl in ("HL", "LL")]
-    if len(sl_seq) < n_consec_ll:
-        return False
-    return all(lbl == "LL" for lbl in sl_seq[-n_consec_ll:])
-
-
-def _h4_bullish_structure(
-    df_h4: pd.DataFrame,
-    ma_period: int = 20,
-    swing_left: int = 2,
-    swing_right: int = 2,
-) -> bool:
-    """
-    True when H4 shows genuine upward structure — either:
-      (a) current close is above the rolling ma_period MA, OR
-      (b) the most recent confirmed H4 swing low was a Higher Low (not LL).
-    A buy is blocked only when BOTH checks fail (price below MA AND last swing was LL),
-    meaning the structure is unambiguously bearish.
-    Returns True (allow) when there is insufficient data to judge.
-    """
-    min_bars = ma_period + swing_left + swing_right + 2
-    if len(df_h4) < min_bars:
-        return True  # not enough history — don't block
-    ma    = df_h4["close"].rolling(ma_period).mean()
-    price = float(df_h4["close"].iloc[-1])
-    price_above_ma = price >= float(ma.iloc[-1])
-    if price_above_ma:
-        return True
-    # price is below MA — check swing structure for any sign of HL
-    swings  = _detect_swings_h4(df_h4, left=swing_left, right=swing_right)
-    labeled = _label_structure_h4(swings)
-    swing_lows = [lbl for _, _, lbl in labeled if lbl in ("HL", "LL")]
-    if not swing_lows:
-        return True  # no swing lows yet — don't block
-    return swing_lows[-1] == "HL"
-
-
-# ── Main backtest ─────────────────────────────────────────────────────────────
-
 def run_backtest(
-    start: str = "2023-01-01",
-    end:   str = "2024-01-01",
-    cash:  float = 10_000.0,
+    start:  str   = "2023-01-01",
+    end:    str   = "2024-01-01",
+    cash:   float = 10_000.0,
     min_rr: float = 1.5,
-    max_forward_bars: int = MAX_FORWARD_BARS,
-    symbol: str = "ustech",
+    max_forward_bars: int   = MAX_FORWARD_BARS,
+    symbol: str   = "ustech",
     spread: Optional[float] = None,
-    directional_filter: bool = True,
-    allow_neutral: bool = True,
-    h4_swing_left: int = 2,
+    directional_filter: bool  = True,
+    allow_neutral:      bool  = True,
+    h4_swing_left:  int = 2,
     h4_swing_right: int = 2,
-    min_confirmations: int = 1,
+    min_confirmations:   int  = 1,
     aggressive_boundary: bool = False,
-    excluded_from_count: Optional[list] = None,
-    aggressive_entry: bool = False,
-    midline_tp: bool = False,
-    midline_pct: float = 0.50,
+    aggressive_entry:    bool = False,
+    midline_tp:    bool  = False,
+    midline_pct:   float = 0.50,
     sl_buffer_pct: float = 0.002,
-    fixed_lot: float = 0.0,
+    fixed_lot:     float = 0.0,
     require_leave_and_return: bool = True,
     cooldown_bars: int = 15,
-    zone_max_losses: int = _CFG_ZONE_MAX_LOSSES,
-    dir_max_losses: int = 0,
-    dir_cooldown_bars: int = 48,
-    h4_regime_filter: bool = _CFG_H4_REGIME_FILTER,
-    regime_conf_filter: bool = False,
-    min_sl_pct: float = 0.0,
-    max_sl_pts: float = 0.0,
-    max_sl_pct: float = _CFG_MAX_SL_PCT,
-    enable_trailing:   bool  = _CFG_ENABLE_TRAILING,
-    be_buffer_pts:     float = _CFG_BE_BUFFER_PTS,
-    be_trigger_pts:    float = _CFG_BE_TRIGGER_PTS,
-    atr_trail_mult:    float = _CFG_ATR_TRAIL_MULT,
-    trail_swing_left:  int   = 2,
-    trail_swing_right: int   = 2,
-    realistic: bool = False,
-    contract_size_override: Optional[float] = None,
-    base_spread_pts: float = 4.0,
-    swap_long_pts: float = -1.5,
-    swap_short_pts: float = 0.8,
-    slippage_max_pts: float = 3.0,
-    margin_rate: float = 0.01,
-    margin_call_pct: float = 0.60,
     save_path: Optional[str] = None,
-    zone_guard: bool = True,
-    chart: bool = False,
-    gradual_filter: str = "all",   # "all" | "retest_only" | "tightened" | "no_multi_conf"
+    chart:  bool = False,
     silent: bool = False,
-    risk_pct: Optional[float] = None,   # overrides RISK_PCT; ignored when fixed_lot > 0
-    # ── New feature params ────────────────────────────────────────────────────
-    use_m15_sl: bool = False,
-    m15_sl_atr_floor_mult: float = 0.5,
-    max_zone_height_atr: float = 0.0,
-    skip_hours: Optional[list] = None,      # e.g. list(range(0,7)) + list(range(21,24))
-    skip_weekdays: Optional[list] = None,   # e.g. ["Monday", "Sunday"]
-    dual_tf: bool = False,                  # also run 1H zones in parallel with 4H
-    h4_bias_gate_1h: bool = False,          # require 4H bias to agree before taking a 1H signal
-    retest_buys_only: bool = False,         # block all gradual (first-touch) long entries
-    block_gradual_long_hours: Optional[list] = None,   # block gradual buys at these UTC hours only
-    block_gradual_short_hours: Optional[list] = None,  # block gradual sells at these UTC hours only
-    h4_structure_gate: bool = False,        # require H4 structure is actually bullish before buying
-    split_exit: bool = False,               # two-trade split: scalper at partial TP + runner with swing trail
-    scalper_tp_pct: float = 0.45,           # scalper exits at this fraction of full TP distance
-    skip_months: Optional[list] = None,     # e.g. [11] to skip November; [6, 11] for Jun+Nov
-    max_daily_loss: Optional[float] = None, # block new entries once realized daily loss hits this
-    max_positions: int = 1,                 # simultaneous open trades allowed (1 or 2)
-    quality_max_positions: int = 1,         # extra slots for retest + 2-conf setups
-    weekly_trend_filter: bool = True,       # block buys when price < N h4 bars ago; block sells when above
-    weekly_trend_bars: int = 80,            # 80 h4 bars ≈ 20 days
-    wick_ratio_min: Optional[float] = None,    # override yaml: min wick-to-range ratio for rejection_wick
-    body_ratio_max: Optional[float] = None,    # override yaml: max body-to-range ratio for rejection_wick
-    engulf_full_body: Optional[bool] = None,   # override yaml: True=strict full-body engulf, False=partial
-    close_in_upper_half: Optional[bool] = None, # override yaml: wick close must be in upper/lower half
-    bos_swing_n: Optional[int] = None,         # override yaml: bars each side required for BOS pivot
-    regime_ema200_only: bool = False,          # use only EMA200 for regime filter (ignore EMA50)
 ) -> dict:
     sym = symbol.lower()
     if sym not in SYMBOL_CONFIG:
         raise ValueError(f"Unknown symbol '{symbol}'. Choose from: {list(SYMBOL_CONFIG)}")
 
     db_name, table, contract_size = SYMBOL_CONFIG[sym]
-    if contract_size_override is not None:
-        contract_size = contract_size_override
     eff_spread = spread if spread is not None else SYMBOL_SPREAD.get(sym, 0.0)
-    if realistic and spread is None:
-        eff_spread = base_spread_pts
-    _risk_pct = risk_pct if risk_pct is not None else RISK_PCT
 
     db = get_connection()
     db.database = db_name
     db.connect()
 
     _pr = (lambda *a, **kw: None) if silent else print
-    _pr(f"\nSymbol : {sym.upper()}  |  DB: {db_name}  |  Contract: ${contract_size}/pt/lot  |  Spread: {eff_spread} pts")
-    _pr(f"Loading 15M data  {start} → {end} ...")
-    df_15m = _load_ohlcv(db, table, "15min", start, end)
-    _pr(f"Loading 4H  data  {start} → {end} ...")
-    df_4h  = _load_ohlcv(db, table, "4H",    start, end)
-    df_1h  = pd.DataFrame()
-    if dual_tf:
-        _pr(f"Loading 1H  data  {start} → {end} ...")
-        df_1h = _load_ohlcv(db, table, "1H", start, end)
-        if df_1h.empty:
-            print("ERROR: dual_tf=True but no 1H bars found in DB — stopping.")
-            print("  Confirm the DB has timeframe='1H' rows before using --dual_tf.")
-            try:
-                db.connection.close()
-            except Exception:
-                pass
-            return {}
+    _pr(f"\n{sym.upper()}  |  {start} → {end}  |  spread={eff_spread} pts")
 
+    df_15m = _load_ohlcv(db, table, "15min", start, end)
+    df_4h  = _load_ohlcv(db, table, "4H",    start, end)
     try:
         db.connection.close()
     except Exception:
@@ -289,22 +125,12 @@ def run_backtest(
     df_4h   = df_4h[df_4h[_ohlcv].ne(df_4h[_ohlcv].shift()).any(axis=1)].reset_index(drop=True)
     _dupes  = _before - len(df_4h)
     if _dupes:
-        _pr(f"  (removed {_dupes} duplicate 4H rows — historical data artifact)")
+        _pr(f"  (removed {_dupes} duplicate 4H rows)")
 
-    _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}" +
-        (f" | 1H bars: {len(df_1h)}" if dual_tf else ""))
-    df_4h["ema50"]  = df_4h["close"].ewm(span=50,  adjust=False).mean()
-    df_4h["ema200"] = df_4h["close"].ewm(span=200, adjust=False).mean()
+    _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
 
-    # Build base configs from the same yaml as live_bot_zz.py — single source of truth
     _base_tf_cfg, _base_conf_cfg, _base_setup_cfg = _make_base_configs()
 
-    # TFConfig — base from yaml, override only CLI-tunable knobs
-    _zone_override = (
-        _dc_replace(_base_tf_cfg.h4_zone_cfg, max_zone_height_atr=max_zone_height_atr)
-        if max_zone_height_atr > 0
-        else _base_tf_cfg.h4_zone_cfg
-    )
     tf_cfg = _dc_replace(
         _base_tf_cfg,
         directional_filter=directional_filter,
@@ -312,28 +138,13 @@ def run_backtest(
         allow_neutral_down=allow_neutral,
         h4_swing_left=h4_swing_left,
         h4_swing_right=h4_swing_right,
-        h4_zone_cfg=_zone_override,
     )
-
-    # ConfirmationConfig — base from yaml, override only CLI-tunable knobs
-    _conf_overrides: dict = dict(
+    conf_cfg = _dc_replace(
+        _base_conf_cfg,
         min_confirmations=min_confirmations,
         aggressive_boundary=aggressive_boundary,
-        excluded_from_count=excluded_from_count or [],
+        excluded_from_count=[],
     )
-    if wick_ratio_min is not None:
-        _conf_overrides["wick_ratio_min"] = wick_ratio_min
-    if body_ratio_max is not None:
-        _conf_overrides["body_ratio_max"] = body_ratio_max
-    if engulf_full_body is not None:
-        _conf_overrides["engulf_full_body"] = engulf_full_body
-    if close_in_upper_half is not None:
-        _conf_overrides["close_in_upper_half"] = close_in_upper_half
-    if bos_swing_n is not None:
-        _conf_overrides["bos_swing_n"] = bos_swing_n
-    conf_cfg = _dc_replace(_base_conf_cfg, **_conf_overrides)
-
-    # TradeSetupConfig — base from yaml, override only CLI-tunable knobs
     setup_cfg = _dc_replace(
         _base_setup_cfg,
         aggressive_entry=aggressive_entry,
@@ -341,97 +152,26 @@ def run_backtest(
         midline_tp=midline_tp,
         midline_pct=midline_pct,
         min_rr=min_rr,
-        use_m15_sl=use_m15_sl,
-        m15_sl_atr_floor_mult=m15_sl_atr_floor_mult,
     )
 
-    # 1H TFConfig — same yaml base as 4H path, just fed 1H data
-    tf_cfg_1h = None
-    if dual_tf:
-        tf_cfg_1h = _dc_replace(
-            _base_tf_cfg,
-            directional_filter=directional_filter,
-            allow_neutral_up=allow_neutral,
-            allow_neutral_down=allow_neutral,
-            h4_swing_left=h4_swing_left,
-            h4_swing_right=h4_swing_right,
-            h4_zone_cfg=_zone_override,
-        )
+    equity       = cash
+    equity_curve = [cash]
+    trades: list = []
+    _pending: list = []
 
-    _pr(
-        f"Config : directional_filter={directional_filter}  min_confirmations={min_confirmations}"
-        f"  aggressive_entry={aggressive_entry}  midline_tp={midline_tp}"
-        + (f"  dual_tf=True (1H+4H)" if dual_tf else "") + "\n"
-    )
+    zone_cooldown: dict = {}
+    zone_reentry:  dict = {}
 
-    equity         = cash
-    equity_curve   = [cash]
-    trades: list   = []
-    _pending: list = []           # open positions awaiting close (keyed by exit_bar)
-    zone_cooldown: dict  = {}
-    zone_reentry:  dict  = {}
-    won_zones:     set   = set()
-    zone_outcome_history: dict = {}
-    zone_consec_losses:   dict = {}
-    zone_blacklist:       set  = set()
-    zone_touch_tracker:   dict = {}   # zk → {bottom, top, exited}
-    dir_consec_losses: dict = {"buy": 0, "sell": 0}
-    dir_cooldown:      dict = {"buy": None, "sell": None}
-    stopout_occurred:     bool = False
-    total_swap_pnl:       float = 0.0
-    total_slippage:       float = 0.0
-    daily_pnl:            dict  = {}
     n      = len(df_15m)
     warmup = max(M15_WINDOW, 30)
 
-    filters = {
-        "in_position":   0,
-        "tf_neutral":    0,
-        "conf_failed":   0,
-        "setup_invalid": 0,
-        "zone_cooldown": 0,
-        "zone_blacklist": 0,
-        "dir_breaker":   0,
-        "regime_filter": 0,
-        "regime_conf_skip": 0,
-        "sl_too_tight":   0,
-        "sl_too_wide":    0,
-        "margin_call":    0,
-        "gradual_filter": 0,
-        "zone_violated":  0,
-        "1h_overlap_skipped": 0,
-        "1h_bias_gated":      0,
-        "retest_only_skip":   0,   # gradual long entries blocked by retest_buys_only
-        "gradual_hour_skip":       0,   # gradual long entries blocked by bad-hour filter
-        "gradual_sell_hour_skip":  0,   # gradual sell entries blocked by bad-hour filter
-        "h4_structure_gate":       0,   # buy blocked because H4 structure is bearish
-        "month_skip":              0,   # entry in a calendar month on the skip list
-        "daily_loss_skip":         0,   # daily realized loss cap reached
-    }
-
     for i in range(warmup, n - max_forward_bars):
-
         bar_h = float(df_15m["high"].iloc[i])
         bar_l = float(df_15m["low"].iloc[i])
 
-        for _zkt, _zks in zone_touch_tracker.items():
-            if not _zks["exited"]:
-                kind = _zks["kind"]
-                if kind == "demand":
-                    if bar_l > _zks["top"]:      # price fully above demand = clean bounce up
-                        _zks["exited"]    = True
-                        _zks["exit_kind"] = "favorable"
-                    elif bar_h < _zks["bottom"]:  # price fully below demand = zone broken
-                        _zks["exited"]    = True
-                        _zks["exit_kind"] = "violation"
-                else:  # supply
-                    if bar_h < _zks["bottom"]:   # price fully below supply = clean drop
-                        _zks["exited"]    = True
-                        _zks["exit_kind"] = "favorable"
-                    elif bar_l > _zks["top"]:    # price fully above supply = zone broken
-                        _zks["exited"]    = True
-                        _zks["exit_kind"] = "violation"
-
+        # ── Update leave-and-return zone states ───────────────────────────────
+        # After a win: wait for price to fully leave the zone, then return before
+        # allowing another entry. This enforces "wait for price to return — don't chase."
         if require_leave_and_return and zone_reentry:
             tol   = 0.001
             ready = []
@@ -442,13 +182,12 @@ def run_backtest(
                     if bar_h < z_bot or bar_l > z_top:
                         state["phase"] = "return"
                 else:
-                    if bar_l <= z_top and bar_h >= z_bot:
-                        if i >= state["earliest_reentry"]:
-                            ready.append(zk)
+                    if bar_l <= z_top and bar_h >= z_bot and i >= state["earliest_reentry"]:
+                        ready.append(zk)
             for zk in ready:
                 del zone_reentry[zk]
 
-        # ── Close any pending positions whose exit bar has been reached ─────────
+        # ── Close positions whose exit bar has been reached ───────────────────
         _still_open = []
         for _p in sorted(_pending, key=lambda x: x["exit_bar"]):
             if _p["exit_bar"] <= i:
@@ -458,60 +197,27 @@ def run_backtest(
                 _p["trade_data"]["equity"] = round(equity, 2)
                 equity_curve.append(equity)
                 trades.append(_p["trade_data"])
-                _zk_c, _zid_c = _p["zk"], _p["zid"]
-                _oc_c, _pnl_c = _p["outcome"], _p["pnl"]
-                _dir_c, _eb_c = _p["direction"], _p["exit_bar"]
-                zone_outcome_history.setdefault(_zid_c, []).append(_oc_c)
-                if _oc_c == 1:
-                    won_zones.add(_zk_c)
-                    zone_consec_losses[_zid_c] = 0
-                    if dir_max_losses > 0:
-                        dir_consec_losses[_dir_c] = 0
-                        dir_cooldown[_dir_c] = None
+                _zk, _outcome, _eb = _p["zk"], _p["outcome"], _p["exit_bar"]
+                if _outcome == 1:
                     if require_leave_and_return:
-                        zone_reentry[_zk_c] = {
+                        zone_reentry[_zk] = {
                             "phase":            "exit",
                             "bottom":           _p["zone_bottom"],
                             "top":              _p["zone_top"],
-                            "earliest_reentry": _eb_c + cooldown_bars,
+                            "earliest_reentry": _eb + cooldown_bars,
                         }
                     else:
-                        zone_cooldown[_zk_c] = _eb_c + cooldown_bars
-                elif _oc_c == -1:
-                    zone_cooldown[_zk_c] = _eb_c + COOLDOWN_LOSS
-                    if _pnl_c < 0:
-                        if zone_max_losses > 0:
-                            _nc = zone_consec_losses.get(_zid_c, 0) + 1
-                            zone_consec_losses[_zid_c] = _nc
-                            if _nc >= zone_max_losses:
-                                zone_blacklist.add(_zid_c)
-                        if dir_max_losses > 0:
-                            _nd = dir_consec_losses.get(_dir_c, 0) + 1
-                            dir_consec_losses[_dir_c] = _nd
-                            if _nd >= dir_max_losses:
-                                dir_cooldown[_dir_c] = _eb_c + dir_cooldown_bars
-                else:
-                    zone_consec_losses[_zid_c] = 0
-                zone_touch_tracker.pop(_zk_c, None)
+                        zone_cooldown[_zk] = _eb + cooldown_bars
+                elif _outcome == -1:
+                    zone_cooldown[_zk] = _eb + COOLDOWN_LOSS
             else:
                 _still_open.append(_p)
         _pending = _still_open
 
-        if len(_pending) >= max(max_positions, quality_max_positions):
-            filters["in_position"] += 1
+        if _pending:
             continue
 
         ts_now = df_15m["timestamp"].iloc[i]
-
-        if skip_hours    and ts_now.hour              in skip_hours:    continue
-        if skip_weekdays and ts_now.day_name()        in skip_weekdays: continue
-        if skip_months   and ts_now.month             in skip_months:
-            filters["month_skip"] += 1
-            continue
-        if max_daily_loss is not None:
-            if daily_pnl.get(ts_now.date(), 0.0) <= -max_daily_loss:
-                filters["daily_loss_skip"] += 1
-                continue
 
         df_h4_w = df_4h[df_4h["timestamp"] <= ts_now].tail(H4_WINDOW).reset_index(drop=True)
         if len(df_h4_w) < 20:
@@ -520,538 +226,86 @@ def run_backtest(
         m15_start = max(0, i - M15_WINDOW + 1)
         df_15m_w  = df_15m.iloc[m15_start: i + 1].reset_index(drop=True)
 
+        # ── Step 2: H4 bias + zone selection + M15 tap ───────────────────────
         h4_up_to  = len(df_h4_w) - 1
         tf_result = analyse_timeframes(df_h4_w, df_15m_w, cfg=tf_cfg, h4_up_to_bar=h4_up_to)
 
-        # ── Dual-timeframe: merge 1H signal with 4H ───────────────────────────
-        # Priority: 4H always wins when both fire with overlapping zones.
-        # Non-overlapping same-bar tie: 4H still wins (macro > micro).
-        # If only 1H fires: use the 1H signal.
-        _tf_source = "4H"
-        if dual_tf and not df_1h.empty:
-            df_1h_w = df_1h[df_1h["timestamp"] <= ts_now].tail(H1_WINDOW).reset_index(drop=True)
-            if len(df_1h_w) >= 20:
-                h1_up_to      = len(df_1h_w) - 1
-                _tf_result_1h = analyse_timeframes(
-                    df_1h_w, df_15m_w, cfg=tf_cfg_1h, h4_up_to_bar=h1_up_to
-                )
-                if _tf_result_1h["signal"] != "neutral":
-                    if tf_result["signal"] == "neutral":
-                        # Only 1H fires — optionally gate on 4H macro bias
-                        _1h_ok = True
-                        if h4_bias_gate_1h:
-                            _h4_bias = tf_result["h4_bias"]   # bias from the 4H analysis
-                            _1h_dir  = _tf_result_1h["direction"]
-                            if _1h_dir == "buy"  and _h4_bias not in ("bullish", "neutral_up"):
-                                _1h_ok = False
-                            elif _1h_dir == "sell" and _h4_bias not in ("bearish", "neutral_down"):
-                                _1h_ok = False
-                        if _1h_ok:
-                            tf_result  = _tf_result_1h
-                            _tf_source = "1H"
-                        else:
-                            filters["1h_bias_gated"] += 1
-                    elif _zones_overlap(tf_result["active_zone"], _tf_result_1h["active_zone"]):
-                        # Both fire, same price area — 4H wins, log dropped 1H
-                        filters["1h_overlap_skipped"] += 1
-                    # else: both fire, different areas — 4H still wins same-bar tie
-        # ─────────────────────────────────────────────────────────────────────
-
         if tf_result["signal"] == "neutral":
-            filters["tf_neutral"] += 1
+            continue
+
+        # No-man's land rule: skip if M15 tap is mid-zone drift, not edge reaction.
+        # A clean tap requires price to reach the zone edge and close the correct side
+        # of the zone midpoint. Anything else is between zones — skip it.
+        if not tf_result.get("clean_tap", True):
             continue
 
         active_zone = tf_result["active_zone"]
         direction   = tf_result["direction"]
-
-        if h4_regime_filter and direction == "buy":
-            _price  = float(df_15m_w["close"].iloc[-1])
-            _ema200 = float(df_h4_w["ema200"].iloc[-1])
-            if regime_ema200_only:
-                _blocked = _price < _ema200
-            else:
-                _ema50  = float(df_h4_w["ema50"].iloc[-1])
-                _blocked = _price < _ema50 and _price < _ema200
-            if _blocked:
-                filters["regime_filter"] += 1
-                continue
-
-        if h4_regime_filter and direction == "sell":
-            _price  = float(df_15m_w["close"].iloc[-1])
-            _ema200 = float(df_h4_w["ema200"].iloc[-1])
-            if regime_ema200_only:
-                _blocked = _price > _ema200
-            else:
-                _ema50  = float(df_h4_w["ema50"].iloc[-1])
-                _blocked = _price > _ema50 and _price > _ema200
-            if _blocked:
-                filters["regime_filter"] += 1
-                continue
-
-        if weekly_trend_filter:
-            _h4_all  = df_4h[df_4h["timestamp"] <= ts_now]
-            _n_h4    = len(_h4_all)
-            if _n_h4 > weekly_trend_bars:
-                _cur  = float(_h4_all["close"].iloc[-1])
-                _past = float(_h4_all["close"].iloc[-1 - weekly_trend_bars])
-                if direction == "buy"  and _cur < _past:
-                    filters["weekly_trend_skip"] = filters.get("weekly_trend_skip", 0) + 1
-                    continue
-                if direction == "sell" and _cur > _past:
-                    filters["weekly_trend_skip"] = filters.get("weekly_trend_skip", 0) + 1
-                    continue
-
-        # H4 structure gate: block buys when H4 trend is genuinely bearish.
-        # Checks price vs 20-MA AND most recent swing low label — buy blocked only
-        # when BOTH fail (price below MA AND last swing low was LL).
-        if h4_structure_gate and direction == "buy":
-            if not _h4_bullish_structure(df_h4_w):
-                filters["h4_structure_gate"] += 1
-                continue
-
-        if dir_max_losses > 0:
-            _dcd = dir_cooldown[direction]
-            if _dcd is not None:
-                if i >= _dcd:
-                    dir_cooldown[direction] = None
-                    dir_consec_losses[direction] = 0
-                else:
-                    filters["dir_breaker"] += 1
-                    continue
-
-        conf = check_confirmations_at_last_bar(df_15m_w, active_zone, direction, conf_cfg)
-        if not conf.confirmed:
-            filters["conf_failed"] += 1
-            continue
-
-        # Close-containment: signal bar close must be strictly inside the zone
-        # (no tolerance — same class of fix as confirmations.py close_left_zone).
-        # Pattern A (wick-through, close outside) is blocked here.
-        # Pattern B (genuine session-gap outside zone) is blocked by zone_guard below.
-        _sig_close = float(df_15m_w["close"].iloc[-1])
-        if direction == "buy"  and _sig_close > active_zone.top:
-            filters["conf_failed"] += 1
-            continue
-        if direction == "sell" and _sig_close < active_zone.bottom:
-            filters["conf_failed"] += 1
-            continue
-
-        if regime_conf_filter and conf.count >= 2:
-            _h4_ema200 = float(df_h4_w["ema200"].iloc[-1])
-            if _sig_close > _h4_ema200:
-                filters["regime_conf_skip"] += 1
-                continue
-
-        zk = _zone_key(active_zone)
-        if zk not in zone_touch_tracker:
-            zone_touch_tracker[zk] = {
-                "bottom":    active_zone.bottom,
-                "top":       active_zone.top,
-                "kind":      active_zone.kind,
-                "exited":    False,
-                "exit_kind": None,
-            }
+        zk          = _zone_key(active_zone)
 
         if zone_cooldown.get(zk, -1) >= i:
-            filters["zone_cooldown"] += 1
             continue
         if require_leave_and_return and zk in zone_reentry:
-            filters["zone_cooldown"] += 1
             continue
 
-        zid = active_zone.zone_id
-        if zone_max_losses > 0 and zid in zone_blacklist:
-            filters["zone_blacklist"] += 1
+        # ── Step 3: confirmation at zone ─────────────────────────────────────
+        conf = check_confirmations_at_last_bar(df_15m_w, active_zone, direction, conf_cfg)
+        if not conf.confirmed:
             continue
-
-        is_retest = zk in won_zones
-        _is_quality = is_retest and conf.count >= 2
-        _eff_cap    = quality_max_positions if _is_quality else max_positions
-        if len(_pending) >= _eff_cap:
-            filters["in_position"] += 1
-            continue
-        history   = zone_outcome_history.get(zid, [])
-        if not history:
-            prior_bucket = "first_attempt"
-        elif history[-1] == 1:
-            prior_bucket = "post_win"
-        elif history[-1] == -1:
-            prior_bucket = "post_loss"
-        else:
-            prior_bucket = "post_expired"
-
-        _tracker = zone_touch_tracker.get(zk, {})
-        if _tracker.get("exited", False):
-            if _tracker.get("exit_kind") == "violation":
-                # Zone was broken in the adverse direction — price passed completely
-                # through the zone.  Any re-entry is into damaged territory; skip.
-                filters["zone_violated"] += 1
-                continue
-            arrival_type = "retest"
-        else:
-            arrival_type = "gradual"
-
-        # Hard block: skip all first-touch long entries when retest_buys_only is on.
-        # Sells are unaffected — short zones react differently on first touch.
-        if retest_buys_only and direction == "buy" and arrival_type == "gradual":
-            filters["retest_only_skip"] += 1
-            continue
-
-        # Hour-based gradual long filter: block first-touch buys at low-quality sessions.
-        # Retest buys and all sell entries are untouched regardless of hour.
-        if (block_gradual_long_hours
-                and direction == "buy"
-                and arrival_type == "gradual"
-                and ts_now.hour in block_gradual_long_hours):
-            filters["gradual_hour_skip"] += 1
-            continue
-
-        # Hour-based gradual short filter: block first-touch sells at low-quality sessions.
-        # Retest sells and all buy entries are untouched regardless of hour.
-        if (block_gradual_short_hours
-                and direction == "sell"
-                and arrival_type == "gradual"
-                and ts_now.hour in block_gradual_short_hours):
-            filters["gradual_sell_hour_skip"] += 1
-            continue
-
-        # Gradual (first-touch) entries are only allowed when at least one
-        # strong reversal signal confirms the zone is reacting — otherwise wait
-        # for a proper retest of the zone.
-        _STRONG_SIGNALS = {"rejection_wick", "engulfing", "bos_msb", "choch"}
-        if arrival_type == "gradual" and not _STRONG_SIGNALS.intersection(conf.signals):
-            filters["gradual_filter"] += 1
-            continue
-
-        if arrival_type == "gradual" and gradual_filter != "all":
-            if (
-                gradual_filter == "retest_only"
-                or (gradual_filter == "tightened" and (conf.count < 2 or not active_zone.fresh))
-                or (gradual_filter == "no_multi_conf" and conf.count >= 2)
-            ):
-                filters["gradual_filter"] += 1
-                continue
 
         signal_price = float(df_15m_w["close"].iloc[-1])
 
-        # M15 ATR14 — always computed (matches live_bot_zz.py)
-        _atr_vals = []
-        for _ak in range(max(1, len(df_15m_w) - 14), len(df_15m_w)):
-            _fh  = float(df_15m_w["high"].iloc[_ak])
-            _fl  = float(df_15m_w["low"].iloc[_ak])
-            _fpc = float(df_15m_w["close"].iloc[_ak - 1])
-            _atr_vals.append(max(_fh - _fl, abs(_fh - _fpc), abs(_fl - _fpc)))
-        _m15_atr14 = sum(_atr_vals) / max(len(_atr_vals), 1) if _atr_vals else 0.0
-
-        setup = setup_from_analysis(
-            tf_result, signal_price, setup_cfg,
-            m15_sl_anchor=conf.m15_sl_anchor,
-            m15_atr14=_m15_atr14,
-        )
+        # ── Step 4: trade geometry ────────────────────────────────────────────
+        setup = setup_from_analysis(tf_result, signal_price, setup_cfg)
         if not setup.valid:
-            filters["setup_invalid"] += 1
             continue
 
-        # Change 4: TP headroom — require at least 30 pts of reward vs current price
-        if direction == "buy" and setup.tp < signal_price + 30.0:
-            filters["setup_invalid"] += 1
-            continue
-        if direction == "sell" and setup.tp > signal_price - 30.0:
-            filters["setup_invalid"] += 1
-            continue
-
+        # Fill at next bar open + spread
         raw_open = float(df_15m["open"].iloc[i + 1])
-        entry    = raw_open
-        bar_spread = _dynamic_spread(ts_now, base_spread_pts) if realistic else eff_spread
-        if bar_spread > 0:
-            entry = entry + bar_spread if direction == "buy" else entry - bar_spread
+        entry    = raw_open + eff_spread if direction == "buy" else raw_open - eff_spread
 
-        # Skip if the fill bar opened outside the zone boundary.
-        # 0.2% tolerance absorbs normal spread without being loose enough to
-        # allow genuine gap-outside entries.  Pass zone_guard=False to bypass
-        # (used only by the outside-zone diagnostic script).
-        if zone_guard:
-            _gap_tol = 0.002
-            if direction == "buy" and entry > active_zone.top * (1 + _gap_tol):
-                filters["setup_invalid"] += 1
-                continue
-            if direction == "sell" and entry < active_zone.bottom * (1 - _gap_tol):
-                filters["setup_invalid"] += 1
-                continue
+        # Skip if fill bar opened outside the zone (gap)
+        _gap_tol = 0.002
+        if direction == "buy"  and entry > active_zone.top    * (1 + _gap_tol):
+            continue
+        if direction == "sell" and entry < active_zone.bottom * (1 - _gap_tol):
+            continue
 
+        # Translate SL distance from signal price to actual fill
         sl_dist = abs(signal_price - setup.sl)
         sl = entry - sl_dist if direction == "buy" else entry + sl_dist
+        tp = setup.tp
 
-        if setup.tp_mode == "midline" and setup.tp_zone is not None:
-            full_tp = (setup.tp_zone.bottom if direction == "buy" else setup.tp_zone.top)
-            tp = entry + midline_pct * (full_tp - entry)
-        else:
-            tp = setup.tp
-
-        if direction == "buy":
-            if sl >= entry or tp <= entry:
-                filters["setup_invalid"] += 1
-                continue
-        else:
-            if sl <= entry or tp >= entry:
-                filters["setup_invalid"] += 1
-                continue
-
-        if min_sl_pct > 0.0:
-            sl_dist_pct = abs(entry - sl) / entry * 100.0
-            if sl_dist_pct < min_sl_pct:
-                filters["sl_too_tight"] += 1
-                continue
-
-        if max_sl_pts > 0.0 and sl_dist > max_sl_pts:
-            filters["sl_too_wide"] += 1
+        if direction == "buy"  and (sl >= entry or tp <= entry):
+            continue
+        if direction == "sell" and (sl <= entry or tp >= entry):
             continue
 
-        if max_sl_pct > 0.0:
-            _sl_pct = abs(entry - sl) / entry * 100.0
-            if _sl_pct > max_sl_pct:
-                filters["sl_too_wide"] += 1
-                continue
+        lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size)
 
-        lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size, _risk_pct)
-
-        if realistic:
-            margin_needed = lot * contract_size * entry * margin_rate
-            if equity < margin_needed * margin_call_pct:
-                filters["margin_call"] += 1
-                continue
-
-        outcome         = 0
-        exit_price      = entry
-        exit_bar        = i + max_forward_bars
-        max_favourable  = 0.0
-        max_adverse     = 0.0
-        pnl             = 0.0
-
-        # ── Split-exit initialisation ─────────────────────────────────────────
-        _p1_active = _p2_active = False
-        _lot_each  = lot
-        _tsl_run   = sl
-        _be_run    = False
-        _tp_scalp  = entry
-        _mid_run   = entry
-        _p1_exit   = entry
-        _p2_exit   = entry
-        if split_exit:
-            _lot_each  = max(round(lot / 2, 2), 0.01)
-            _tp_scalp  = (entry + scalper_tp_pct * abs(tp - entry)
-                          if direction == "buy"
-                          else entry - scalper_tp_pct * abs(tp - entry))
-            _mid_run   = (entry + tp) / 2
-            _tsl_run   = sl
-            _be_run    = False
-            _p1_active = True
-            _p2_active = True
-            _p1_exit   = entry
-            _p2_exit   = entry
-
-        if realistic and lot * contract_size > 0:
-            price_to_zero      = equity / (lot * contract_size)
-            stopout_price_buy  = entry - price_to_zero
-            stopout_price_sell = entry + price_to_zero
-        else:
-            stopout_price_buy = stopout_price_sell = None
-
-        # ── Trailing stop state ───────────────────────────────────────────────
-        _be_triggered = False
-        _trail_sl     = sl
-        if enable_trailing:
-            _midline = (entry + tp) / 2
-            # be_trigger_pts > 0 → trigger BE at fixed pts offset; else use midline
-            if be_trigger_pts > 0:
-                _be_trig_buy  = entry + be_trigger_pts
-                _be_trig_sell = entry - be_trigger_pts
-            else:
-                _be_trig_buy  = _midline
-                _be_trig_sell = _midline
-            _atr_trs = []
-            for _ak in range(max(1, i - 13), i + 1):
-                _h  = float(df_15m["high"].iloc[_ak])
-                _l  = float(df_15m["low"].iloc[_ak])
-                _pc = float(df_15m["close"].iloc[_ak - 1])
-                _atr_trs.append(max(_h - _l, abs(_h - _pc), abs(_l - _pc)))
-            _atr14 = sum(_atr_trs) / max(len(_atr_trs), 1)
-        else:
-            _be_trig_buy = _be_trig_sell = _midline = 0.0
-            _atr14 = 0.0
+        # ── Simulate trade bar-by-bar ─────────────────────────────────────────
+        outcome        = 0
+        exit_price     = entry
+        exit_bar       = i + max_forward_bars
+        max_favourable = 0.0
+        max_adverse    = 0.0
 
         for j in range(i + 1, min(i + 1 + max_forward_bars, n)):
             fh = float(df_15m["high"].iloc[j])
             fl = float(df_15m["low"].iloc[j])
-            favour  = (fh - entry) if direction == "buy" else (entry - fl)
-            adverse = (entry - fl) if direction == "buy" else (fh - entry)
-            max_favourable = max(max_favourable, favour)
-            max_adverse    = max(max_adverse,    adverse)
-            # ── Trailing stop update ──────────────────────────────────────────
-            fc = float(df_15m["close"].iloc[j])
-            if enable_trailing and not split_exit:
-                # 1. Break-even at midline: trigger on bar close, not high/low
-                if not _be_triggered:
-                    if direction == "buy"  and fc >= _midline:
-                        _be_triggered = True
-                        _trail_sl = max(_trail_sl, entry + be_buffer_pts)
-                    elif direction == "sell" and fc <= _midline:
-                        _be_triggered = True
-                        _trail_sl = min(_trail_sl, entry - be_buffer_pts)
-                if _be_triggered and be_trigger_pts == 0:
-                    # 2. Ratchet behind newly confirmed M15 swing — legacy midline mode only.
-                    # When be_trigger_pts > 0 (pure BE stop), we skip swing trailing so the
-                    # SL stays fixed at entry+buffer and doesn't generate premature extra exits.
-                    _sb = j - trail_swing_right
-                    if _sb > i + trail_swing_left:
-                        _sb_l = float(df_15m["low"].iloc[_sb])
-                        _sb_h = float(df_15m["high"].iloc[_sb])
-                        _ll = all(float(df_15m["low"].iloc[_sb - m])  > _sb_l for m in range(1, trail_swing_left  + 1))
-                        _rl = all(float(df_15m["low"].iloc[_sb + m])  > _sb_l for m in range(1, trail_swing_right + 1))
-                        _lh = all(float(df_15m["high"].iloc[_sb - m]) < _sb_h for m in range(1, trail_swing_left  + 1))
-                        _rh = all(float(df_15m["high"].iloc[_sb + m]) < _sb_h for m in range(1, trail_swing_right + 1))
-                        if direction == "buy" and _ll and _rl:
-                            _cand = _sb_l - be_buffer_pts
-                            if _cand > _trail_sl:
-                                _trail_sl = _cand
-                        elif direction == "sell" and _lh and _rh:
-                            _cand = _sb_h + be_buffer_pts
-                            if _cand < _trail_sl:
-                                _trail_sl = _cand
-                    # 3. ATR backstop: SL can't lag more than mult×ATR from price
-                    if atr_trail_mult > 0 and _atr14 > 0:
-                        if direction == "buy":
-                            _trail_sl = max(_trail_sl, fc - atr_trail_mult * _atr14)
-                        else:
-                            _trail_sl = min(_trail_sl, fc + atr_trail_mult * _atr14)
-            # ─────────────────────────────────────────────────────────────────
-            # ── Split-exit: scalper + wick-BE runner ─────────────────────────
-            if split_exit:
-                # Scalper (pos1): fixed zone SL, exits at partial TP
-                if _p1_active:
-                    if direction == "buy":
-                        if fh >= _tp_scalp:
-                            _p1_active = False; _p1_exit = _tp_scalp
-                            if not _be_run:
-                                _be_run = True
-                                _tsl_run = max(_tsl_run, entry + be_buffer_pts)
-                        elif fl <= sl:
-                            _p1_active = False; _p1_exit = sl
-                    else:
-                        if fl <= _tp_scalp:
-                            _p1_active = False; _p1_exit = _tp_scalp
-                            if not _be_run:
-                                _be_run = True
-                                _tsl_run = min(_tsl_run, entry - be_buffer_pts)
-                        elif fh >= sl:
-                            _p1_active = False; _p1_exit = sl
-                # Runner (pos2): wick-based BE at midpoint, then swing trail + 30% lock
-                if _p2_active:
-                    if not _be_run:
-                        if direction == "buy" and fh >= _mid_run:
-                            _be_run = True; _tsl_run = max(_tsl_run, entry + be_buffer_pts)
-                        elif direction == "sell" and fl <= _mid_run:
-                            _be_run = True; _tsl_run = min(_tsl_run, entry - be_buffer_pts)
-                    if _be_run:
-                        _sbj = j - trail_swing_right
-                        if _sbj > i + trail_swing_left:
-                            _sbl = float(df_15m["low"].iloc[_sbj])
-                            _sbh = float(df_15m["high"].iloc[_sbj])
-                            _ll = all(float(df_15m["low"].iloc[_sbj-_m])  > _sbl for _m in range(1, trail_swing_left+1))
-                            _rl = all(float(df_15m["low"].iloc[_sbj+_m])  > _sbl for _m in range(1, trail_swing_right+1))
-                            _lh = all(float(df_15m["high"].iloc[_sbj-_m]) < _sbh for _m in range(1, trail_swing_left+1))
-                            _rh = all(float(df_15m["high"].iloc[_sbj+_m]) < _sbh for _m in range(1, trail_swing_right+1))
-                            if direction == "buy" and _ll and _rl:
-                                _cand = _sbl - be_buffer_pts
-                                if _cand > _tsl_run: _tsl_run = _cand
-                            elif direction == "sell" and _lh and _rh:
-                                _cand = _sbh + be_buffer_pts
-                                if _cand < _tsl_run: _tsl_run = _cand
-                        # 30% profit lock: floor trailing SL at 30% of current open profit
-                        if direction == "buy" and fc > entry:
-                            _tsl_run = max(_tsl_run, entry + 0.30 * (fc - entry))
-                        elif direction == "sell" and fc < entry:
-                            _tsl_run = min(_tsl_run, entry - 0.30 * (entry - fc))
-                    if direction == "buy":
-                        if fh >= tp:
-                            _p2_active = False; _p2_exit = tp
-                        elif fl <= _tsl_run:
-                            _p2_active = False; _p2_exit = _tsl_run
-                    else:
-                        if fl <= tp:
-                            _p2_active = False; _p2_exit = tp
-                        elif fh >= _tsl_run:
-                            _p2_active = False; _p2_exit = _tsl_run
-                # Both sub-positions closed → compute combined PnL and exit
-                if not _p1_active and not _p2_active:
-                    if direction == "buy":
-                        pnl = ((_p1_exit - entry) + (_p2_exit - entry)) * _lot_each * contract_size
-                    else:
-                        pnl = ((entry - _p1_exit) + (entry - _p2_exit)) * _lot_each * contract_size
-                    outcome    = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
-                    exit_price = _p2_exit
-                    exit_bar   = j
-                    break
-                continue  # one or both positions still open — skip single-trade check
-            # ─────────────────────────────────────────────────────────────────
+            max_favourable = max(max_favourable, (fh - entry) if direction == "buy" else (entry - fl))
+            max_adverse    = max(max_adverse,    (entry - fl) if direction == "buy" else (fh - entry))
             if direction == "buy":
-                if stopout_price_buy is not None and fl <= stopout_price_buy:
-                    outcome = -1; exit_price = stopout_price_buy; exit_bar = j
-                    stopout_occurred = True; break
                 if fh >= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                if fl <= _trail_sl:  outcome = -1; exit_price = _trail_sl; exit_bar = j; break
+                if fl <= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
             else:
-                if stopout_price_sell is not None and fh >= stopout_price_sell:
-                    outcome = -1; exit_price = stopout_price_sell; exit_bar = j
-                    stopout_occurred = True; break
                 if fl <= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                if fh >= _trail_sl:  outcome = -1; exit_price = _trail_sl; exit_bar = j; break
+                if fh >= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
 
-        # ── Split-exit expiry: close any still-open sub-positions at last close ─
-        if split_exit and (_p1_active or _p2_active):
-            _last_p = float(df_15m["close"].iloc[min(exit_bar, n - 1)])
-            if _p1_active:
-                _p1_exit = _last_p
-            if _p2_active:
-                # If runner is BE-locked, honour its trailing SL; else close at market
-                _p2_exit = _tsl_run if _be_run else _last_p
-            if direction == "buy":
-                pnl = ((_p1_exit - entry) + (_p2_exit - entry)) * _lot_each * contract_size
-            else:
-                pnl = ((entry - _p1_exit) + (entry - _p2_exit)) * _lot_each * contract_size
-            outcome    = 0
-            exit_price = _p2_exit
-
-        slip = 0.0
-        if realistic and outcome == -1 and not stopout_occurred:
-            slip = random.uniform(0.0, slippage_max_pts)
-            if direction == "buy":
-                exit_price -= slip
-            else:
-                exit_price += slip
-            total_slippage += slip * lot * contract_size
-
-        if not split_exit:
-            if direction == "buy":
-                pnl = (exit_price - entry) * lot * contract_size
-            else:
-                pnl = (entry - exit_price) * lot * contract_size
-
-        swap_pnl = 0.0
-        if realistic and exit_bar > i + 1:
-            ts_entry_bar = df_15m["timestamp"].iloc[i + 1]
-            ts_exit_bar  = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
-            nights = _count_overnights(ts_entry_bar, ts_exit_bar)
-            if nights > 0:
-                swap_rate = swap_long_pts if direction == "buy" else swap_short_pts
-                swap_pnl  = swap_rate * lot * contract_size * nights
-                pnl      += swap_pnl
-                total_swap_pnl += swap_pnl
-
-        # Update daily_pnl now so the cap check sees this trade on re-entry attempts
-        if max_daily_loss is not None:
-            _entry_day = ts_now.date()
-            daily_pnl[_entry_day] = daily_pnl.get(_entry_day, 0.0) + pnl
+        if direction == "buy":
+            pnl = (exit_price - entry) * lot * contract_size
+        else:
+            pnl = (entry - exit_price) * lot * contract_size
 
         exit_ts = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
         _pending.append({
@@ -1060,45 +314,36 @@ def run_backtest(
             "outcome":     outcome,
             "direction":   direction,
             "zk":          zk,
-            "zid":         zid,
             "zone_bottom": active_zone.bottom,
             "zone_top":    active_zone.top,
-            "ts_entry":    ts_now,
             "trade_data": {
                 "date":          ts_now,
                 "exit_date":     exit_ts,
                 "side":          direction,
-                "entry":         entry,
-                "sl":            sl,
-                "tp":            tp,
-                "exit":          exit_price,
+                "entry":         round(entry, 5),
+                "sl":            round(sl, 5),
+                "tp":            round(tp, 5),
+                "exit":          round(exit_price, 5),
                 "outcome":       outcome,
                 "lot":           lot,
                 "pnl":           round(pnl, 2),
-                "equity":        None,           # filled at close time
+                "equity":        None,
                 "max_favour":    round(max_favourable, 2),
                 "max_adverse":   round(max_adverse, 2),
                 "confirmations": conf.count,
                 "signals":       "|".join(conf.signals),
                 "h4_bias":       tf_result["h4_bias"],
-                "entry_mode":    setup.entry_mode,
-                "tp_mode":       setup.tp_mode,
-                "is_retest":     is_retest,
-                "prior_bucket":  prior_bucket,
-                "arrival_type":  arrival_type,
                 "zone_fresh":    active_zone.fresh,
                 "zone_bottom":   active_zone.bottom,
                 "zone_top":      active_zone.top,
                 "zone_strength": active_zone.strength,
                 "zone_kind":     active_zone.kind,
-                "tf_source":     _tf_source,
-                "structure":       {"zone": (active_zone.bottom, active_zone.top)},
-                "signal_close":    signal_price,
-                "raw_open":        raw_open,
+                "entry_mode":    setup.entry_mode,
+                "tp_mode":       setup.tp_mode,
             },
         })
 
-    # ── Flush any positions still open at end of the bar loop ─────────────────
+    # ── Flush positions still open at end of loop ─────────────────────────────
     for _p in sorted(_pending, key=lambda x: x["exit_bar"]):
         equity += _p["pnl"]
         if equity < 0:
@@ -1111,8 +356,7 @@ def run_backtest(
         print("No trades generated. Widen date range, lower min_rr, or reduce min_confirmations.")
         return {}
 
-    df_t = pd.DataFrame(trades)
-
+    df_t     = pd.DataFrame(trades)
     total    = len(df_t)
     tp_hits  = int((df_t["outcome"] ==  1).sum())
     sl_hits  = int((df_t["outcome"] == -1).sum())
@@ -1120,18 +364,12 @@ def run_backtest(
     win_rate = tp_hits / max(total, 1) * 100
     winners  = df_t[df_t["pnl"] > 0]
     losers   = df_t[df_t["pnl"] < 0]
-
-    eq_s       = pd.Series(equity_curve)
-    max_dd_pct = round(((eq_s - eq_s.cummax()) / eq_s.cummax()).min() * 100, 2)
-
-    buy_df  = df_t[df_t["side"] == "buy"]
-    sell_df = df_t[df_t["side"] == "sell"]
-
-    stack_counts = df_t["confirmations"].value_counts().sort_index()
+    eq_s     = pd.Series(equity_curve)
+    max_dd   = round(((eq_s - eq_s.cummax()) / eq_s.cummax()).min() * 100, 2)
+    buy_df   = df_t[df_t["side"] == "buy"]
+    sell_df  = df_t[df_t["side"] == "sell"]
 
     metrics = {
-        "strategy":        "Zone-Based Strategy (Steps 1–4)",
-        "dual_tf":         dual_tf,
         "symbol":          sym.upper(),
         "period":          f"{start} to {end}",
         "start_cash":      f"${cash:,.2f}",
@@ -1150,105 +388,39 @@ def run_backtest(
         "avg_loss_$":      f"${losers['pnl'].mean():.2f}"  if len(losers)  else "$0.00",
         "largest_win_$":   f"${df_t['pnl'].max():.2f}",
         "largest_loss_$":  f"${df_t['pnl'].min():.2f}",
-        "max_drawdown_%":  f"{max_dd_pct:.2f}",
-        "lowest_equity":   min(equity_curve),
+        "max_drawdown_%":  f"{max_dd:.2f}",
         "spread_pts":      eff_spread,
         "min_rr":          min_rr,
         "min_confirmations": min_confirmations,
+        "directional_filter": directional_filter,
         "entry_mode":      "zone_boundary" if aggressive_entry else "confirmation",
         "tp_mode":         f"midline_{midline_pct:.0%}" if midline_tp else "zone_edge",
-        "directional_filter":  directional_filter,
-        "win_cooldown":        f"leave_and_return (floor={cooldown_bars}b)" if require_leave_and_return else f"{cooldown_bars} bars",
-        "excluded_from_count": ",".join(excluded_from_count) if excluded_from_count else "none",
-        "zone_max_losses":     zone_max_losses if zone_max_losses > 0 else "disabled",
-        "zones_blacklisted":   len(zone_blacklist),
-        "dir_max_losses":      dir_max_losses if dir_max_losses > 0 else "disabled",
-        "dir_cooldown_bars":   dir_cooldown_bars if dir_max_losses > 0 else "n/a",
-        "h4_regime_filter":    h4_regime_filter,
-        "regime_conf_filter":  regime_conf_filter,
-        "enable_trailing":     enable_trailing,
-        "be_trigger_pts":      be_trigger_pts if enable_trailing else "disabled",
-        "be_buffer_pts":       be_buffer_pts  if enable_trailing else "disabled",
-        "atr_trail_mult":      atr_trail_mult if enable_trailing else "disabled",
-        "min_sl_pct":          min_sl_pct if min_sl_pct > 0 else "disabled",
-        "realistic_mode":      realistic,
-        "contract_size":       contract_size,
-        "total_swap_pnl":      f"${total_swap_pnl:+.2f}" if realistic else "n/a",
-        "total_slippage_cost": f"${-abs(total_slippage):.2f}" if realistic else "n/a",
-        "stopout_occurred":    stopout_occurred if realistic else "n/a",
     }
 
     if not silent:
         print_report(metrics, run_label="Zone Strategy")
 
-        evaluated = n - warmup - max_forward_bars
-        print(f"\n{'─'*48}")
-        print(f"  Filter breakdown  ({evaluated:,} bars evaluated)")
-        print(f"{'─'*48}")
-        for label, count in sorted(filters.items(), key=lambda x: -x[1]):
-            if count == 0:
-                continue
-            pct = count / max(evaluated, 1) * 100
-            print(f"  {label:<25} {count:>8,}  ({pct:.1f}%)")
-        print(f"  {'signals fired':<25} {total:>8,}")
-        print(f"{'─'*48}")
-
-        print(f"\n  Confirmation stacking (out of 5):")
-        for cnt, freq in stack_counts.items():
-            wr_stack = df_t[df_t["confirmations"] == cnt]
-            wr_pct   = (wr_stack["outcome"] == 1).mean() * 100
-            print(f"    {cnt} confirmations : {freq:>4} trades  WR={wr_pct:.0f}%")
+        print(f"\n  Confirmation stacking:")
+        for cnt, freq in df_t["confirmations"].value_counts().sort_index().items():
+            wr_s = (df_t[df_t["confirmations"] == cnt]["outcome"] == 1).mean() * 100
+            print(f"    {cnt} confirmations : {freq:>4} trades  WR={wr_s:.0f}%")
 
         print(f"\n  H4 bias at entry:")
         for bias_val, grp in df_t.groupby("h4_bias"):
             wr_b = (grp["outcome"] == 1).mean() * 100
             print(f"    {bias_val:<14} : {len(grp):>4} trades  WR={wr_b:.0f}%")
+
+        print(f"\n  Zone freshness:")
+        for fresh_val, grp in df_t.groupby("zone_fresh"):
+            wr_f = (grp["outcome"] == 1).mean() * 100
+            lbl  = "fresh" if fresh_val else "tapped"
+            print(f"    {lbl:<8} : {len(grp):>4} trades  WR={wr_f:.0f}%")
+
         print()
-
-        def _pb_stats(bucket):
-            g = df_t[df_t["prior_bucket"] == bucket]
-            if len(g) == 0:
-                return 0, 0, 0.0, 0.0
-            wr  = (g["outcome"] == 1).mean() * 100
-            net = g["pnl"].sum()
-            return len(g), int((g["outcome"] == 1).sum()), wr, net
-
-        print(f"\n  Prior-outcome split (exact zone_id):")
-        for pb in ("first_attempt", "post_win", "post_loss", "post_expired"):
-            n_pb, w_pb, wr_pb, net_pb = _pb_stats(pb)
-            if n_pb == 0:
-                continue
-            print(f"    {pb:<16} : {n_pb:>3} trades  W={w_pb:>2}  "
-                  f"WR={wr_pb:.0f}%  net=${net_pb:+.2f}")
-        print()
-
-        # ── Arrival-type split ────────────────────────────────────────────────
-        print(f"  {'─'*62}")
-        print(f"  Arrival-type split")
-        print(f"  {'─'*62}")
-        print(f"  {'Type':<10} {'Trades':>7} {'Wins':>5} {'WR%':>6} {'Net PnL':>10} {'Avg PnL':>10}")
-        print(f"  {'─'*62}")
-        _at_rows = []
-        for atype in ("retest", "gradual"):
-            _g = df_t[df_t["arrival_type"] == atype]
-            if len(_g) == 0:
-                _at_rows.append((atype, 0, 0, 0.0, 0.0, 0.0))
-                continue
-            _wr  = (_g["outcome"] == 1).mean() * 100
-            _net = _g["pnl"].sum()
-            _avg = _g["pnl"].mean()
-            _at_rows.append((atype, len(_g), int((_g["outcome"] == 1).sum()), _wr, _net, _avg))
-            print(f"  {atype:<10} {len(_g):>7} {int((_g['outcome']==1).sum()):>5} "
-                  f"{_wr:>5.1f}% {_net:>+10.2f} {_avg:>+10.2f}")
-        _retest_net  = next((r[4] for r in _at_rows if r[0] == "retest"),  0.0)
-        print(f"  {'─'*62}")
-        print(f"  Net PnL excl. gradual : ${_retest_net:+.2f}")
-        print(f"  {'─'*62}")
-        print()
-
         cols = ["date", "side", "h4_bias", "signals", "confirmations",
-                "arrival_type", "is_retest", "prior_bucket", "entry", "sl", "tp", "exit", "pnl", "outcome"]
-        print(df_t[cols].to_string(index=False))
+                "zone_fresh", "zone_kind", "entry", "sl", "tp", "exit", "pnl", "outcome"]
+        _present = [c for c in cols if c in df_t.columns]
+        print(df_t[_present].to_string(index=False))
         print()
 
     if save_path:
@@ -1256,8 +428,8 @@ def run_backtest(
 
     if chart:
         title = (
-            f"Zone Strategy — {sym.upper()}  |  {start} → {end}  |  "
-            f"{tp_hits}W / {sl_hits}L / {expired}E  |  WR {win_rate:.1f}%"
+            f"Zone Strategy — {sym.upper()}  {start}→{end}  "
+            f"{tp_hits}W/{sl_hits}L/{expired}E  WR{win_rate:.1f}%"
         )
         fig = plot_trades(df_15m, trades, title=title, start_cash=cash)
         fig.show()
@@ -1265,11 +437,8 @@ def run_backtest(
     return metrics, df_t
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest: USTEC Zone-to-Zone")
-    parser.add_argument("--symbol",   default="ustech", choices=list(SYMBOL_CONFIG))
     parser.add_argument("--start",    default="2023-01-01")
     parser.add_argument("--end",      default="2024-01-01")
     parser.add_argument("--cash",     type=float, default=10_000.0)
@@ -1277,49 +446,21 @@ def main() -> None:
     parser.add_argument("--max_bars", type=int,   default=MAX_FORWARD_BARS)
     parser.add_argument("--spread",   type=float, default=None)
     parser.add_argument("--no_directional_filter", action="store_true")
+    parser.add_argument("--no_neutral",            action="store_true")
     parser.add_argument("--h4_swing_left",  type=int, default=2)
     parser.add_argument("--h4_swing_right", type=int, default=2)
-    parser.add_argument("--no_neutral",            action="store_true")
-    parser.add_argument("--min_confirmations", type=int,   default=1)
+    parser.add_argument("--min_confirmations",   type=int,  default=1)
     parser.add_argument("--aggressive_boundary", action="store_true")
-    parser.add_argument("--exclude_signals", default="")
-    parser.add_argument("--zone_max_losses", type=int, default=0)
-    parser.add_argument("--dir_max_losses",   type=int, default=0)
-    parser.add_argument("--dir_cooldown",     type=int, default=48)
-    parser.add_argument("--h4_regime_filter", action="store_true")
-    parser.add_argument("--regime_conf_filter", action="store_true")
-    parser.add_argument("--aggressive_entry", action="store_true")
-    parser.add_argument("--midline_tp",  action="store_true")
+    parser.add_argument("--aggressive_entry",    action="store_true")
+    parser.add_argument("--midline_tp",          action="store_true")
     parser.add_argument("--midline_pct", type=float, default=0.50)
     parser.add_argument("--sl_buffer",   type=float, default=0.002)
     parser.add_argument("--fixed_lot",   type=float, default=0.0)
+    parser.add_argument("--no_leave_return", action="store_true")
+    parser.add_argument("--cooldown_bars",   type=int, default=15)
     parser.add_argument("--save",  default=None)
     parser.add_argument("--chart", action="store_true")
-    parser.add_argument("--cooldown_bars",  type=int,  default=15)
-    parser.add_argument("--no_leave_return", action="store_true")
-    parser.add_argument("--min_sl_pct",  type=float, default=0.0)
-    parser.add_argument("--realistic",   action="store_true")
-    parser.add_argument("--trailing",    dest="enable_trailing", action="store_true",  default=_CFG_ENABLE_TRAILING)
-    parser.add_argument("--no_trailing", dest="enable_trailing", action="store_false")
-    parser.add_argument("--be_trigger",  type=float, default=_CFG_BE_TRIGGER_PTS)
-    parser.add_argument("--be_buffer",   type=float, default=_CFG_BE_BUFFER_PTS)
-    parser.add_argument("--atr_mult",    type=float, default=_CFG_ATR_TRAIL_MULT)
-    parser.add_argument("--dual_tf",          action="store_true",
-                        help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
-    parser.add_argument("--h4_bias_gate_1h", action="store_true",
-                        help="Require 4H bias to agree before taking a 1H-sourced signal")
-    parser.add_argument("--retest_buys_only", action="store_true",
-                        help="Block all gradual (first-touch) long entries; only retest buys allowed")
-    parser.add_argument("--gradual_long_bad_hours", default="",
-                        help="Comma-separated UTC hours to block gradual long entries e.g. 0,2,9,11,16,21,23")
-    parser.add_argument("--gradual_short_bad_hours", default="",
-                        help="Comma-separated UTC hours to block gradual sell entries e.g. 1,2,4,6,11,15,19,21")
-    parser.add_argument("--h4_structure_gate", action="store_true",
-                        help="Block buys when H4 is below 20-MA AND last swing low was LL")
-    parser.add_argument("--split_exit", action="store_true",
-                        help="Two-trade split: scalper at partial TP + wick-BE runner with swing trail")
-    parser.add_argument("--scalper_tp_pct", type=float, default=0.45,
-                        help="Scalper exits at this fraction of full TP distance (default 0.45)")
+    parser.add_argument("--silent", action="store_true")
     args = parser.parse_args()
 
     run_backtest(
@@ -1328,7 +469,6 @@ def main() -> None:
         cash=args.cash,
         min_rr=args.min_rr,
         max_forward_bars=args.max_bars,
-        symbol=args.symbol,
         spread=args.spread,
         directional_filter=not args.no_directional_filter,
         allow_neutral=not args.no_neutral,
@@ -1336,7 +476,6 @@ def main() -> None:
         h4_swing_right=args.h4_swing_right,
         min_confirmations=args.min_confirmations,
         aggressive_boundary=args.aggressive_boundary,
-        excluded_from_count=[s.strip() for s in args.exclude_signals.split(",") if s.strip()],
         aggressive_entry=args.aggressive_entry,
         midline_tp=args.midline_tp,
         midline_pct=args.midline_pct,
@@ -1344,27 +483,9 @@ def main() -> None:
         fixed_lot=args.fixed_lot,
         require_leave_and_return=not args.no_leave_return,
         cooldown_bars=args.cooldown_bars,
-        zone_max_losses=args.zone_max_losses,
-        dir_max_losses=args.dir_max_losses,
-        dir_cooldown_bars=args.dir_cooldown,
-        h4_regime_filter=args.h4_regime_filter,
-        regime_conf_filter=args.regime_conf_filter,
-        min_sl_pct=args.min_sl_pct,
-        realistic=args.realistic,
-        enable_trailing=args.enable_trailing,
-        be_trigger_pts=args.be_trigger,
-        be_buffer_pts=args.be_buffer,
-        atr_trail_mult=args.atr_mult,
         save_path=args.save,
         chart=args.chart,
-        dual_tf=args.dual_tf,
-        h4_bias_gate_1h=args.h4_bias_gate_1h,
-        retest_buys_only=args.retest_buys_only,
-        block_gradual_long_hours=[int(h) for h in args.gradual_long_bad_hours.split(",") if h.strip()] or None,
-        block_gradual_short_hours=[int(h) for h in args.gradual_short_bad_hours.split(",") if h.strip()] or None,
-        h4_structure_gate=args.h4_structure_gate,
-        split_exit=args.split_exit,
-        scalper_tp_pct=args.scalper_tp_pct,
+        silent=args.silent,
     )
 
 

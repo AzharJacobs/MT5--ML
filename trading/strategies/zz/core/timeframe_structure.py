@@ -90,6 +90,18 @@ class TFConfig:
     # Require at least one M15 candle within the tap window to close with a
     # body in the trade direction (bullish body for demand, bearish for supply).
 
+    # ── M15 zone detection (stacked-confluence filter) ────────────────────────
+    m15_zone_cfg: ZoneConfig = field(
+        default_factory=lambda: ZoneConfig(
+            impulse_atr_mult=1.5,
+            min_strength=1.0,
+            min_departure_candles=2,
+            departure_window=6,
+        )
+    )
+    # M15 impulses are smaller than H4 so thresholds are lower.
+    # Used by the engine's stacked-confluence filter; ignored when that filter is off.
+
 
 # ---------------------------------------------------------------------------
 # H4 bias detection
@@ -210,6 +222,45 @@ def _m15_directional_close(
     return bool((in_zone & directional).any())
 
 
+def _m15_clean_edge_tap(
+    df_m15: pd.DataFrame,
+    zone: Zone,
+    direction: str,
+    lookback: int,
+    tol: float,
+) -> bool:
+    """
+    True when the M15 tap is a clean edge reaction rather than mid-zone drift.
+
+    A clean tap requires at least one M15 bar in the lookback window that:
+      (a) overlaps the zone (same condition as _m15_tapped), AND
+      (b) touched the critical edge of the zone:
+            demand → bar low reached zone.bottom*(1+tol)  (touched bottom edge)
+            supply → bar high reached zone.top*(1-tol)    (touched top edge)
+      (c) closed on the correct side of the zone midpoint:
+            demand → close >= zone.mid  (bounced back above the midpoint)
+            supply → close <= zone.mid  (dropped back below the midpoint)
+
+    Failure = price wandered into the middle of the zone without a clean
+    edge approach → no-man's-land, skip.
+    """
+    recent = df_m15.tail(lookback)
+    z_top  = zone.top    * (1 + tol)
+    z_bot  = zone.bottom * (1 - tol)
+    z_mid  = zone.mid
+
+    in_zone = (recent["low"] <= z_top) & (recent["high"] >= z_bot)
+
+    if direction == "buy":
+        edge_touched  = recent["low"] <= zone.bottom * (1 + tol)
+        close_reacted = recent["close"] >= z_mid
+    else:
+        edge_touched  = recent["high"] >= zone.top * (1 - tol)
+        close_reacted = recent["close"] <= z_mid
+
+    return bool((in_zone & edge_touched & close_reacted).any())
+
+
 # ---------------------------------------------------------------------------
 # H4 zone selection
 # ---------------------------------------------------------------------------
@@ -298,6 +349,7 @@ def analyse_timeframes(
         "direction":      None,
         "zone_tapped":    False,
         "m15_confirmed":  False,
+        "clean_tap":      False,
         "signal":         "neutral",
         "reason":         "",
     }
@@ -349,6 +401,12 @@ def analyse_timeframes(
     tapped = _m15_tapped(df_m15, active_zone,
                          cfg.m15_tap_lookback, cfg.m15_tap_tolerance_pct)
     result["zone_tapped"] = tapped
+
+    if tapped:
+        result["clean_tap"] = _m15_clean_edge_tap(
+            df_m15, active_zone, direction,
+            cfg.m15_tap_lookback, cfg.m15_tap_tolerance_pct,
+        )
 
     if not tapped:
         result["reason"] = (
