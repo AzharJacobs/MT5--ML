@@ -88,6 +88,7 @@ class Zone:
     bottom: float    # lower edge — wick low  of base candle
     origin_bar: int  # bar index of the base candle in the source dataframe
     strength: float  # impulse_net / ATR at origin (higher = stronger)
+    departure_end: int = 0  # first bar AFTER the departure window — freshness scan starts here
     fresh: bool = True
     tap_count: int = 0
 
@@ -277,6 +278,7 @@ def detect_zones(
                                 bottom=z_bot,
                                 origin_bar=base_idx,
                                 strength=strength,
+                                departure_end=w_end,
                             ))
                             used_demand.add(base_idx)
 
@@ -300,6 +302,7 @@ def detect_zones(
                                 bottom=z_bot,
                                 origin_bar=base_idx,
                                 strength=strength,
+                                departure_end=w_end,
                             ))
                             used_supply.add(base_idx)
 
@@ -326,7 +329,7 @@ def update_freshness(
     for zone in zones:
         if not zone.fresh:
             continue
-        start = zone.origin_bar + 1
+        start = zone.departure_end
         end   = min(current_bar + 1, len(highs))
         if start >= end:
             continue

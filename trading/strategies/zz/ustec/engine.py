@@ -26,25 +26,27 @@ from trading.strategies.zz.core.trade_setup import TradeSetupConfig, setup_from_
 from trading.shared.backtest.report import print_report, save_report
 from trading.shared.backtest.chart import plot_trades
 from trading.shared.data_loader import get_connection
+from trading.shared.mt5_loader import fetch_ohlcv as _mt5_fetch, disconnect as _mt5_disconnect
 
 from trading.strategies.zz.ustec.strategy import make_configs as _make_base_configs
 
 
 H4_WINDOW        = 150
+H1_WINDOW        = 200
 M15_WINDOW       = 80
 MAX_FORWARD_BARS = 350
 RISK_PCT         = 0.01
 COOLDOWN_LOSS    = 48   # M15 bars cooldown after a loss (~12 h)
 
 SYMBOL_CONFIG = {
-    "ustech": ("ustech_ohlcv", "ustech_ohlcv", 100.0),
+    "ustech": ("ustech_ohlcv", "ustech_ohlcv", 1.0),
 }
 SYMBOL_SPREAD = {
     "ustech": 2.0,
 }
 
 
-def _load_ohlcv(db, table: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
+def _load_ohlcv_db(db, table: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
     query = (
         f"SELECT * FROM {table} WHERE timeframe = %s "
         f"AND timestamp >= %s AND timestamp <= %s ORDER BY timestamp ASC"
@@ -95,6 +97,11 @@ def run_backtest(
     be_trigger_r:   float = 0.0,   # R profit to trigger break-even (0 = off)
     lock_trigger_r: float = 0.0,   # R profit to lock in +1R on SL (0 = off)
     be_buffer_pts:  float = 5.0,   # buffer above/below entry when moving to BE
+    # ── Data source ───────────────────────────────────────────────────────────
+    data_source: str = "db",       # "db" = PostgreSQL  |  "mt5" = live MT5 terminal
+    use_1h_zones: bool = False,    # add 1H zone detection alongside H4
+    max_rr: float = 0.0,           # skip setups with theoretical RR above this (0 = off)
+    bos_msb_min1: bool = False,    # allow single bos_msb confirmation; all others still need conf>=min
     save_path: Optional[str] = None,
     chart:  bool = False,
     silent: bool = False,
@@ -106,22 +113,32 @@ def run_backtest(
     db_name, table, contract_size = SYMBOL_CONFIG[sym]
     eff_spread = spread if spread is not None else SYMBOL_SPREAD.get(sym, 0.0)
 
-    db = get_connection()
-    db.database = db_name
-    db.connect()
-
     _pr = (lambda *a, **kw: None) if silent else print
-    _pr(f"\n{sym.upper()}  |  {start} → {end}  |  spread={eff_spread} pts")
+    _pr(f"\n{sym.upper()}  |  {start} → {end}  |  spread={eff_spread} pts  |  source={data_source}")
 
-    df_15m = _load_ohlcv(db, table, "15min", start, end)
-    df_4h  = _load_ohlcv(db, table, "4H",    start, end)
-    try:
-        db.connection.close()
-    except Exception:
-        pass
+    df_1h = None
+    if data_source == "mt5":
+        df_15m = _mt5_fetch(sym, "15min", start, end, silent=silent)
+        df_4h  = _mt5_fetch(sym, "4H",    start, end, silent=silent)
+        if use_1h_zones:
+            df_1h = _mt5_fetch(sym, "1H", start, end, silent=silent)
+        _mt5_disconnect()
+    else:
+        db = get_connection()
+        db.database = db_name
+        db.connect()
+        df_15m = _load_ohlcv_db(db, table, "15min", start, end)
+        df_4h  = _load_ohlcv_db(db, table, "4H",    start, end)
+        if use_1h_zones:
+            df_1h = _load_ohlcv_db(db, table, "1H", start, end)
+        try:
+            db.connection.close()
+        except Exception:
+            pass
 
     if df_15m.empty or df_4h.empty:
-        print("ERROR: no data returned — check DB connection and date range.")
+        src = "MT5 terminal" if data_source == "mt5" else "DB"
+        print(f"ERROR: no data returned from {src} — check connection and date range.")
         return {}
 
     _ohlcv  = ["open", "high", "low", "close"]
@@ -142,10 +159,12 @@ def run_backtest(
         allow_neutral_down=allow_neutral,
         h4_swing_left=h4_swing_left,
         h4_swing_right=h4_swing_right,
+        use_1h_zones=use_1h_zones,
     )
+    _eff_min_conf = 1 if bos_msb_min1 else min_confirmations
     conf_cfg = _dc_replace(
         _base_conf_cfg,
-        min_confirmations=min_confirmations,
+        min_confirmations=_eff_min_conf,
         aggressive_boundary=aggressive_boundary,
         excluded_from_count=[],
     )
@@ -227,12 +246,19 @@ def run_backtest(
         if len(df_h4_w) < 20:
             continue
 
+        df_h1_w = None
+        if use_1h_zones and df_1h is not None and not df_1h.empty:
+            df_h1_w = df_1h[df_1h["timestamp"] <= ts_now].tail(H1_WINDOW).reset_index(drop=True)
+            if len(df_h1_w) < 20:
+                df_h1_w = None
+
         m15_start = max(0, i - M15_WINDOW + 1)
         df_15m_w  = df_15m.iloc[m15_start: i + 1].reset_index(drop=True)
 
         # ── Step 2: H4 bias + zone selection + M15 tap ───────────────────────
         h4_up_to  = len(df_h4_w) - 1
-        tf_result = analyse_timeframes(df_h4_w, df_15m_w, cfg=tf_cfg, h4_up_to_bar=h4_up_to)
+        tf_result = analyse_timeframes(df_h4_w, df_15m_w, cfg=tf_cfg, h4_up_to_bar=h4_up_to,
+                                       df_h1=df_h1_w)
 
         if tf_result["signal"] == "neutral":
             continue
@@ -246,6 +272,8 @@ def run_backtest(
         active_zone = tf_result["active_zone"]
         direction   = tf_result["direction"]
         zk          = _zone_key(active_zone)
+        _h1_ids     = {z.zone_id for z in tf_result.get("h1_zones", [])}
+        zone_tf     = "1H" if active_zone.zone_id in _h1_ids else "H4"
 
         if zone_cooldown.get(zk, -1) >= i:
             continue
@@ -256,12 +284,17 @@ def run_backtest(
         conf = check_confirmations_at_last_bar(df_15m_w, active_zone, direction, conf_cfg)
         if not conf.confirmed:
             continue
+        # bos_msb_min1: single-conf entries only allowed when that conf is bos_msb
+        if bos_msb_min1 and conf.count < min_confirmations and not conf.bos_msb:
+            continue
 
         signal_price = float(df_15m_w["close"].iloc[-1])
 
         # ── Step 4: trade geometry ────────────────────────────────────────────
         setup = setup_from_analysis(tf_result, signal_price, setup_cfg)
         if not setup.valid:
+            continue
+        if max_rr > 0 and setup.rr > max_rr:
             continue
 
         # Fill at next bar open + spread
@@ -379,6 +412,7 @@ def run_backtest(
                 "zone_top":      active_zone.top,
                 "zone_strength": active_zone.strength,
                 "zone_kind":     active_zone.kind,
+                "zone_tf":       zone_tf,
                 "entry_mode":    setup.entry_mode,
                 "tp_mode":       setup.tp_mode,
                 "managed":       managed,
@@ -509,6 +543,8 @@ def main() -> None:
                         help="Lock in +1R on SL when trade reaches this many R in profit (0=off)")
     parser.add_argument("--be_buffer_pts",  type=float, default=5.0,
                         help="Buffer above/below entry when moving to BE (default 5 pts)")
+    parser.add_argument("--data_source", default="db", choices=["db", "mt5"],
+                        help="Data source: 'db' = PostgreSQL (default), 'mt5' = live MT5 terminal")
     parser.add_argument("--save",  default=None)
     parser.add_argument("--chart", action="store_true")
     parser.add_argument("--silent", action="store_true")
@@ -537,6 +573,7 @@ def main() -> None:
         be_trigger_r=args.be_trigger_r,
         lock_trigger_r=args.lock_trigger_r,
         be_buffer_pts=args.be_buffer_pts,
+        data_source=args.data_source,
         save_path=args.save,
         chart=args.chart,
         silent=args.silent,

@@ -102,6 +102,20 @@ class TFConfig:
     # M15 impulses are smaller than H4 so thresholds are lower.
     # Used by the engine's stacked-confluence filter; ignored when that filter is off.
 
+    # ── 1H zone detection (optional stacked confluence) ───────────────────────
+    h1_zone_cfg: ZoneConfig = field(
+        default_factory=lambda: ZoneConfig(
+            impulse_atr_mult=1.75,
+            min_strength=1.2,
+            min_departure_candles=2,
+            departure_window=6,
+        )
+    )
+    use_1h_zones: bool = False
+    # When True, detect 1H zones and merge them into the H4 zone pool.
+    # ZoneConfig is scaled between H4 (atr_mult=2.0, strength=1.5) and
+    # M15 (atr_mult=1.5, strength=1.0) defaults.
+
 
 # ---------------------------------------------------------------------------
 # H4 bias detection
@@ -149,10 +163,10 @@ def detect_h4_bias(
     # Mixed cases
     if last_sh_lbl == "HH":
         return "neutral_up"
-    if last_sl_lbl == "HL":
-        return "neutral_up"
-    if last_sh_lbl == "LH":
+    if last_sh_lbl == "LH":       # LH+HL = lower high dominates → neutral_down
         return "neutral_down"
+    if last_sl_lbl == "HL":       # HH+HL already handled above; only LL+HL reaches here
+        return "neutral_up"
     # last_sl_lbl == "LL"
     return "neutral_down"
 
@@ -312,6 +326,7 @@ def analyse_timeframes(
     df_m15: pd.DataFrame,
     cfg: Optional[TFConfig] = None,
     h4_up_to_bar: Optional[int] = None,
+    df_h1: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Full two-timeframe structure analysis.
@@ -370,10 +385,24 @@ def analyse_timeframes(
         highs_h4 = df_h4["high"].values
         lows_h4  = df_h4["low"].values
         cap = h4_up_to_bar if h4_up_to_bar is not None else len(df_h4) - 1
-        update_freshness(h4_zones, highs_h4, lows_h4, current_bar=cap,
+        update_freshness(h4_zones, highs_h4, lows_h4, current_bar=max(0, cap - 2),
                          tap_tol=cfg.h4_zone_cfg.tap_tolerance_pct)
 
+    # ── 1H zone detection (merged into H4 pool when enabled) ────────────────
+    h1_zones: list = []
+    if cfg.use_1h_zones and df_h1 is not None and not df_h1.empty:
+        h1_up = len(df_h1) - 1
+        h1_zones = detect_zones(df_h1, cfg=cfg.h1_zone_cfg, up_to_bar=h1_up)
+        if h1_zones:
+            highs_h1 = df_h1["high"].values
+            lows_h1  = df_h1["low"].values
+            update_freshness(h1_zones, highs_h1, lows_h1,
+                             current_bar=max(0, h1_up - 2),
+                             tap_tol=cfg.h1_zone_cfg.tap_tolerance_pct)
+            h4_zones = h4_zones + h1_zones
+
     result["h4_zones"] = h4_zones
+    result["h1_zones"] = h1_zones   # kept separate for zone-TF tracking in engine
 
     # ── Step 3: directional filter ───────────────────────────────────────────
     eligible = [z for z in h4_zones if bias_permits(bias, z.kind, cfg)]

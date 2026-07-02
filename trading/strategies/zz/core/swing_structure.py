@@ -163,9 +163,9 @@ def get_bias(
         return "bearish"
     if last_sh_lbl == "HH":
         return "neutral_up"
-    if last_sl_lbl == "HL":
-        return "neutral_up"
-    if last_sh_lbl == "LH":
+    if last_sh_lbl == "LH":       # LH+HL = lower high dominates → neutral_down
         return "neutral_down"
+    if last_sl_lbl == "HL":       # HH+HL already handled above; only LL+HL reaches here
+        return "neutral_up"
     # last_sl_lbl == "LL"
     return "neutral_down"
