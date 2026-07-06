@@ -251,28 +251,23 @@ def _m15_clean_edge_tap(
       (b) touched the critical edge of the zone:
             demand → bar low reached zone.bottom*(1+tol)  (touched bottom edge)
             supply → bar high reached zone.top*(1-tol)    (touched top edge)
-      (c) closed on the correct side of the zone midpoint:
-            demand → close >= zone.mid  (bounced back above the midpoint)
-            supply → close <= zone.mid  (dropped back below the midpoint)
 
-    Failure = price wandered into the middle of the zone without a clean
-    edge approach → no-man's-land, skip.
+    Failure = price never reached the zone edge (only drifted through the
+    middle) → no-man's-land, skip. Slow bounces that touch the edge but
+    close mid-zone still count as clean.
     """
     recent = df_m15.tail(lookback)
     z_top  = zone.top    * (1 + tol)
     z_bot  = zone.bottom * (1 - tol)
-    z_mid  = zone.mid
 
     in_zone = (recent["low"] <= z_top) & (recent["high"] >= z_bot)
 
     if direction == "buy":
         edge_touched  = recent["low"] <= zone.bottom * (1 + tol)
-        close_reacted = recent["close"] >= z_mid
     else:
         edge_touched  = recent["high"] >= zone.top * (1 - tol)
-        close_reacted = recent["close"] <= z_mid
 
-    return bool((in_zone & edge_touched & close_reacted).any())
+    return bool((in_zone & edge_touched).any())
 
 
 # ---------------------------------------------------------------------------

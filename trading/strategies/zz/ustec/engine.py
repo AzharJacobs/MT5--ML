@@ -15,6 +15,7 @@ Core strategy (all steps execute in order):
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import replace as _dc_replace
 from typing import Optional
 
@@ -28,15 +29,13 @@ from trading.shared.backtest.chart import plot_trades
 from trading.shared.data_loader import get_connection
 from trading.shared.mt5_loader import fetch_ohlcv as _mt5_fetch, disconnect as _mt5_disconnect
 
-from trading.strategies.zz.ustec.strategy import make_configs as _make_base_configs
+from trading.strategies.zz.ustec.strategy import (
+    make_configs as _make_base_configs,
+    H4_WINDOW, M15_WINDOW, MAX_FORWARD_BARS, RISK_PCT, COOLDOWN_LOSS_H,
+)
 
-
-H4_WINDOW        = 150
-H1_WINDOW        = 200
-M15_WINDOW       = 80
-MAX_FORWARD_BARS = 350
-RISK_PCT         = 0.01
-COOLDOWN_LOSS    = 48   # M15 bars cooldown after a loss (~12 h)
+H1_WINDOW     = 200
+COOLDOWN_LOSS = int(COOLDOWN_LOSS_H * 4)   # hours → M15 bars (from config.yaml)
 
 SYMBOL_CONFIG = {
     "ustech": ("ustech_ohlcv", "ustech_ohlcv", 1.0),
@@ -166,7 +165,9 @@ def run_backtest(
         _base_conf_cfg,
         min_confirmations=_eff_min_conf,
         aggressive_boundary=aggressive_boundary,
-        excluded_from_count=[],
+        # parity fix: was [], which let structure_shift count in backtest but
+        # not live. Now uses config.yaml's excluded_from_count everywhere.
+        excluded_from_count=list(_base_conf_cfg.excluded_from_count),
     )
     setup_cfg = _dc_replace(
         _base_setup_cfg,
@@ -184,6 +185,10 @@ def run_backtest(
 
     zone_cooldown: dict = {}
     zone_reentry:  dict = {}
+    rejects = Counter()
+    fresh_tap_rejects = Counter()
+    fresh_taps_total  = 0
+    fresh_taps_placed = 0
 
     n      = len(df_15m)
     warmup = max(M15_WINDOW, 30)
@@ -260,32 +265,64 @@ def run_backtest(
         tf_result = analyse_timeframes(df_h4_w, df_15m_w, cfg=tf_cfg, h4_up_to_bar=h4_up_to,
                                        df_h1=df_h1_w)
 
+        _tap_zone  = tf_result.get("active_zone")
+        _h1_ids    = {z.zone_id for z in tf_result.get("h1_zones", [])}
+        _is_h1_zone = _tap_zone is not None and _tap_zone.zone_id in _h1_ids
+
+        _fresh_tap = bool(tf_result.get("zone_tapped")) and _tap_zone is not None \
+                     and bool(_tap_zone.fresh)
+        if _fresh_tap:
+            fresh_taps_total += 1
+
+        # Fresh-zone relaxation (skip clean_tap, allow 1 confirmation) applies only
+        # to H4 zones. 1H zones always need clean_tap + the configured min_confirmations.
+        _relax_fresh = _fresh_tap and not _is_h1_zone
+
         if tf_result["signal"] == "neutral":
+            rejects[tf_result["reason"].split("|")[0].strip()] += 1
+            if _fresh_tap:
+                fresh_tap_rejects[tf_result["reason"].split("|")[0].strip()] += 1
             continue
 
         # No-man's land rule: skip if M15 tap is mid-zone drift, not edge reaction.
         # A clean tap requires price to reach the zone edge and close the correct side
         # of the zone midpoint. Anything else is between zones — skip it.
-        if not tf_result.get("clean_tap", True):
+        # Fresh H4 zones skip this gate entirely (relaxed rule for first-touch zones).
+        if not _relax_fresh and not tf_result.get("clean_tap", True):
+            rejects["no_clean_tap"] += 1
             continue
 
         active_zone = tf_result["active_zone"]
         direction   = tf_result["direction"]
         zk          = _zone_key(active_zone)
-        _h1_ids     = {z.zone_id for z in tf_result.get("h1_zones", [])}
-        zone_tf     = "1H" if active_zone.zone_id in _h1_ids else "H4"
+        zone_tf     = "1H" if _is_h1_zone else "H4"
 
         if zone_cooldown.get(zk, -1) >= i:
+            rejects["cooldown"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["cooldown"] += 1
             continue
         if require_leave_and_return and zk in zone_reentry:
+            rejects["leave_and_return_wait"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["leave_and_return_wait"] += 1
             continue
 
         # ── Step 3: confirmation at zone ─────────────────────────────────────
+        # Fresh H4 zones only need 1 confirmation; 1H zones and tapped zones keep
+        # the configured min_confirmations gate (conf.confirmed already applies it).
         conf = check_confirmations_at_last_bar(df_15m_w, active_zone, direction, conf_cfg)
-        if not conf.confirmed:
+        _confirmed = (conf.count >= 1) if _relax_fresh else conf.confirmed
+        if not _confirmed:
+            rejects["confirmations"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["confirmations"] += 1
             continue
         # bos_msb_min1: single-conf entries only allowed when that conf is bos_msb
         if bos_msb_min1 and conf.count < min_confirmations and not conf.bos_msb:
+            rejects["bos_msb_min1_filter"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["bos_msb_min1_filter"] += 1
             continue
 
         signal_price = float(df_15m_w["close"].iloc[-1])
@@ -293,8 +330,15 @@ def run_backtest(
         # ── Step 4: trade geometry ────────────────────────────────────────────
         setup = setup_from_analysis(tf_result, signal_price, setup_cfg)
         if not setup.valid:
+            _reason_key = setup.reason.split()[0] if setup.reason else "setup_invalid"
+            rejects[_reason_key] += 1
+            if _fresh_tap:
+                fresh_tap_rejects[_reason_key] += 1
             continue
         if max_rr > 0 and setup.rr > max_rr:
+            rejects["max_rr_filter"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["max_rr_filter"] += 1
             continue
 
         # Fill at next bar open + spread
@@ -304,8 +348,14 @@ def run_backtest(
         # Skip if fill bar opened outside the zone (gap)
         _gap_tol = 0.002
         if direction == "buy"  and entry > active_zone.top    * (1 + _gap_tol):
+            rejects["gap_fill"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["gap_fill"] += 1
             continue
         if direction == "sell" and entry < active_zone.bottom * (1 - _gap_tol):
+            rejects["gap_fill"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["gap_fill"] += 1
             continue
 
         # Translate SL distance from signal price to actual fill
@@ -314,9 +364,18 @@ def run_backtest(
         tp = setup.tp
 
         if direction == "buy"  and (sl >= entry or tp <= entry):
+            rejects["invalid_geometry"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["invalid_geometry"] += 1
             continue
         if direction == "sell" and (sl <= entry or tp >= entry):
+            rejects["invalid_geometry"] += 1
+            if _fresh_tap:
+                fresh_tap_rejects["invalid_geometry"] += 1
             continue
+
+        if _fresh_tap:
+            fresh_taps_placed += 1
 
         lot = fixed_lot if fixed_lot > 0 else _lot_size(equity, abs(entry - sl), contract_size)
 
@@ -427,6 +486,16 @@ def run_backtest(
         _p["trade_data"]["equity"] = round(equity, 2)
         equity_curve.append(equity)
         trades.append(_p["trade_data"])
+
+    if not silent:
+        print(f"\n  Rejected setups (top 10 reasons):")
+        for reason, count in rejects.most_common(10):
+            print(f"    {count:>7}  {reason}")
+
+        print(f"\n  Fresh-zone taps: {fresh_taps_total}  (placed as trades: {fresh_taps_placed})")
+        print(f"  Fresh-zone tap rejections by filter:")
+        for reason, count in fresh_tap_rejects.most_common(10):
+            print(f"    {count:>7}  {reason}")
 
     if not trades:
         print("No trades generated. Widen date range, lower min_rr, or reduce min_confirmations.")

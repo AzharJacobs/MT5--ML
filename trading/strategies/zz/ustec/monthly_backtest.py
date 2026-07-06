@@ -19,27 +19,42 @@ import argparse
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from trading.strategies.zz.ustec.strategy import MIN_RR, MIN_SL_PCT, SPREAD_PTS, MAX_FORWARD_BARS
+from trading.strategies.zz.ustec.strategy import (
+    MIN_RR, SPREAD_PTS, MAX_FORWARD_BARS, RISK_PCT, ALLOW_NEUTRAL, MIDLINE_TP, MIDLINE_PCT,
+    SL_BUFFER_PCT,
+)
 from trading.strategies.zz.ustec.engine import run_backtest
+from trading.Reports.report_html import save_html_report
+
+REPORTS_DIR = _ROOT / "trading" / "Reports"
 
 
-def run_monthly(start: str, end: str, cash: float, spread: float, risk_pct: float) -> None:
+def run_monthly(start: str, end: str, cash: float, spread: float, min_confirmations: int,
+                 out_path: str | None = None, bos_msb_min1: bool = False,
+                 dual_tf: bool = False) -> None:
 
-    print(f"\nMonthly backtest  {start} → {end}")
-    print(f"  Cash=${cash:.2f}  risk={risk_pct*100:.2f}%  spread={spread}pts")
-    print(f"  Single continuous run — equity compounds across months …\n")
+    print(f"\nMonthly backtest  {start} -> {end}")
+    print(f"  Cash=${cash:.2f}  risk={RISK_PCT*100:.2f}% (from config.yaml)  spread={spread}pts")
+    print(f"  Single continuous run - equity compounds across months...\n")
 
     m, df = run_backtest(
         start=start, end=end, cash=cash,
         symbol="ustech", spread=spread,
-        fixed_lot=0, risk_pct=risk_pct,
-        min_rr=MIN_RR, min_sl_pct=MIN_SL_PCT, max_forward_bars=MAX_FORWARD_BARS,
-        gradual_filter="all",
-        min_confirmations=2,
+        fixed_lot=0,
+        min_rr=MIN_RR, max_forward_bars=MAX_FORWARD_BARS,
+        min_confirmations=min_confirmations,
+        bos_msb_min1=bos_msb_min1,
+        allow_neutral=ALLOW_NEUTRAL,
+        midline_tp=MIDLINE_TP,
+        midline_pct=MIDLINE_PCT,
+        sl_buffer_pct=SL_BUFFER_PCT,
+        use_1h_zones=dual_tf,
         silent=True,
     )
 
@@ -50,7 +65,8 @@ def run_monthly(start: str, end: str, cash: float, spread: float, risk_pct: floa
     df = df.copy()
     df["month"] = df["date"].dt.to_period("M")
 
-    all_months = sorted(df["month"].unique())
+    full_range = pd.period_range(start=pd.Period(start, freq="M"), end=pd.Period(end, freq="M"), freq="M")
+    all_months = list(full_range)
 
     # Track running equity: start of each month = equity after last closed trade
     # df["equity"] = equity after each trade closes (in chronological order)
@@ -63,21 +79,19 @@ def run_monthly(start: str, end: str, cash: float, spread: float, risk_pct: floa
     for _, row in df_sorted.iterrows():
         monthly[row["month"]].append(row)
 
-    W   = 12
-    SEP = "─" * (12 + W * 7 + 6)
-
-    print(SEP)
-    print(f"  {'Month':<10} {'Trades':>{W}} {'Wins':>{W}} {'WR%':>{W}} "
-          f"{'Month PnL':>{W}} {'End Equity':>{W}} {'DD%':>{W}}")
-    print(SEP)
+    trade_cols = ["date", "side", "h4_bias", "signals", "confirmations",
+                  "zone_fresh", "zone_kind", "entry", "sl", "tp", "exit", "pnl", "outcome"]
+    trade_cols = [c for c in trade_cols if c in df_sorted.columns]
 
     running_eq = cash
     peak_eq    = cash
+    lowest_eq  = cash
     total_trades = 0
     total_wins   = 0
 
     for period in all_months:
         rows = monthly[period]
+        month_df    = pd.DataFrame(rows)
         month_pnl   = sum(r["pnl"] for r in rows)
         trades      = len(rows)
         wins        = sum(1 for r in rows if r["outcome"] == 1)
@@ -88,15 +102,23 @@ def run_monthly(start: str, end: str, cash: float, spread: float, risk_pct: floa
             end_eq = 0.0
         running_eq  = end_eq
         peak_eq     = max(peak_eq, running_eq)
+        lowest_eq   = min(lowest_eq, running_eq)
         dd_pct      = (running_eq - peak_eq) / peak_eq * 100 if peak_eq > 0 else 0.0
         total_trades += trades
         total_wins   += wins
 
-        blown = " ⚠BLOWN" if running_eq <= 0.01 else ""
-        print(f"  {str(period):<10} {trades:>{W}} {wins:>{W}} {wr:>{W-1}.1f}% "
-              f"{month_pnl:>+{W}.2f} {running_eq:>{W},.2f} {dd_pct:>{W-1}.2f}%{blown}")
+        print("=" * 100)
+        print(f"  {period}  ({trades} trades)")
+        print("=" * 100)
+        if trades:
+            print(month_df[trade_cols].to_string(index=False))
+        else:
+            print("  No trades this month.")
+        blown = "  !! BLOWN" if running_eq <= 0.01 else ""
+        print(f"\n  Trades: {trades}   Wins: {wins}   WR: {wr:.1f}%   "
+              f"Month PnL: {month_pnl:+.2f}   Start Eq: {start_eq:,.2f}   "
+              f"End Eq: {running_eq:,.2f}   DD: {dd_pct:.2f}%{blown}\n")
 
-    print(SEP)
     total_wr  = total_wins / total_trades * 100 if total_trades else 0.0
     total_pnl = running_eq - cash
     overall_dd = (running_eq - peak_eq) / peak_eq * 100 if peak_eq > 0 else 0.0
@@ -104,30 +126,50 @@ def run_monthly(start: str, end: str, cash: float, spread: float, risk_pct: floa
     dd_str = str(m.get("max_drawdown_%", "0"))
     max_dd = float(dd_str)
 
-    print(f"  {'TOTAL':<10} {total_trades:>{W}} {total_wins:>{W}} {total_wr:>{W-1}.1f}% "
-          f"{total_pnl:>+{W}.2f} {running_eq:>{W},.2f} {overall_dd:>{W-1}.2f}%")
-    print(SEP)
-    print(f"\n  Starting equity : ${cash:,.2f}")
+    print("=" * 100)
+    print("  OVERALL (for reference - see each month above for the per-month breakdown)")
+    print("=" * 100)
+    print(f"  Starting equity : ${cash:,.2f}")
     print(f"  Final equity    : ${running_eq:,.2f}")
     print(f"  Net PnL         : ${total_pnl:+,.2f}")
+    print(f"  Total trades    : {total_trades}   Wins: {total_wins}   WR: {total_wr:.1f}%")
     print(f"  Peak equity     : ${peak_eq:,.2f}")
-    print(f"  Lowest equity   : ${m.get('lowest_equity', cash):,.2f}")
+    print(f"  Lowest equity   : ${lowest_eq:,.2f}")
     print(f"  Max drawdown    : {max_dd:.2f}%")
     print()
 
+    report_path = out_path or str(REPORTS_DIR / "ustec_monthly_report.html")
+    save_html_report(
+        df, start=start, end=end, cash=cash, out_path=report_path,
+        meta={
+            "risk": f"{RISK_PCT*100:.2f}%/trade",
+            "spread": f"{spread} pts",
+            "min confirmations": str(min_confirmations),
+        },
+    )
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Monthly backtest — USTEC ZZ")
+    parser = argparse.ArgumentParser(description="Monthly backtest - USTEC ZZ")
     parser.add_argument("--start",    default="2023-01-01")
     parser.add_argument("--end",      default="2025-01-01")
     parser.add_argument("--cash",     type=float, default=150.0)
     parser.add_argument("--spread",   type=float, default=SPREAD_PTS)
-    parser.add_argument("--risk_pct", type=float, default=0.01)
+    parser.add_argument("--min_confirmations", type=int, default=1)
+    parser.add_argument("--out", default=None,
+                        help="HTML report output path (default: trading/Reports/ustec_monthly_report.html)")
+    parser.add_argument("--bos_msb_min1", action="store_true",
+                        help="Allow single-confirmation entries when that confirmation is bos_msb")
+    parser.add_argument("--dual_tf", action="store_true",
+                        help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
     args = parser.parse_args()
     run_monthly(
         start=args.start, end=args.end,
         cash=args.cash, spread=args.spread,
-        risk_pct=args.risk_pct,
+        min_confirmations=args.min_confirmations,
+        out_path=args.out,
+        bos_msb_min1=args.bos_msb_min1,
+        dual_tf=args.dual_tf,
     )
 
 

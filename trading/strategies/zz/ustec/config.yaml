@@ -5,7 +5,7 @@
 symbol: USTECm          # Exness symbol name (live/demo MT5)
 db_name: ustech_ohlcv   # PostgreSQL database
 table: ustech_ohlcv     # OHLCV table
-contract_size: 100.0    # $100/pt/lot (Exness USTEC)
+contract_size: 1.0      # $1/pt/lot (Exness USTECm — verified; engine uses 1.0)
 
 # Execution
 spread_pts: 2.0         # applied at fill in paper mode; MT5 uses real fill
@@ -32,16 +32,16 @@ zone:
 # Timeframe (H4 bias + M15 entry)
 timeframe:
   directional_filter: true
-  allow_neutral: true
+  allow_neutral: false
   h4_swing_left: 2
   h4_swing_right: 2
   prefer_fresh_h4: true
   m15_tap_lookback: 20
-  require_m15_directional_close: true
+  require_m15_directional_close: false
 
 # Confirmations — all 5 signals active (no gold-style disabling)
 confirmations:
-  min_confirmations: 1
+  min_confirmations: 2
   aggressive_boundary: false
   # structure_shift has poor standalone WR — excluded so it cannot satisfy
   # min_confirmations alone.  It still fires and is logged for analysis.
@@ -63,12 +63,12 @@ confirmations:
 # Trade setup
 trade_setup:
   aggressive_entry: false
-  sl_buffer_pct: 0.0
+  sl_buffer_pct: 0.002
   sl_min_points: 0.0
   midline_tp: false
   midline_pct: 0.50
   tp_prefer_fresh: true
-  use_m15_sl: true            # use M15 structural swing as SL anchor instead of zone bottom
+  use_m15_sl: false           # PDF rule: SL below/above the ZONE — never inside it
   m15_sl_atr_floor_mult: 0.5  # SL must be >= 0.5×ATR14 from entry (noise guard)
 
 # Cooldown
@@ -78,11 +78,11 @@ cooldown:
   cooldown_loss_h: 12          # hours to block zone after a loss (≈48 × M15 bars)
   cooldown_win_floor_h: 3.75   # minimum hours after win before leave-and-return eligible
   max_forward_bars: 350        # 350 × 15 min ≈ 87 h ≈ 4 trading days
-  zone_max_losses: 1           # retire a zone after its first SL hit — seek fresher zones
+  zone_max_losses: 3           # not a PDF rule — kept as guard, relaxed from 1 (was killing trades)
 
 # Regime filter — blocks buys when price is below both H4 EMA50 and EMA200
 regime:
-  h4_regime_filter: true
+  h4_regime_filter: false      # not in PDF + tested net-negative over 3yrs — OFF
 
 # Trailing stop (USTEC only — not shared with gold)
 trailing:

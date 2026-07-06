@@ -55,6 +55,10 @@ ZONE_MAX_LOSSES      = int(_cool.get("zone_max_losses", 0))
 
 TAP_TOL              = float(_cfg["zone"]["tap_tolerance_pct"])
 EXCLUDED_FROM_COUNT  = list(_cfg["confirmations"].get("excluded_from_count", []))
+ALLOW_NEUTRAL        = bool(_cfg["timeframe"]["allow_neutral"])
+MIDLINE_TP           = bool(_cfg["trade_setup"].get("midline_tp", False))
+MIDLINE_PCT          = float(_cfg["trade_setup"].get("midline_pct", 0.50))
+SL_BUFFER_PCT        = float(_cfg["trade_setup"].get("sl_buffer_pct", 0.0))
 
 _trail               = _cfg.get("trailing", {})
 ENABLE_TRAILING      = bool(_trail.get("enable_trailing", False))
