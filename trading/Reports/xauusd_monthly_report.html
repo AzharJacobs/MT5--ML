@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Monthly Trade Report — XAUUSD</title>
+<style>
+:root {
+  --bg:#111110; --panel:#191816; --line:#2a2825;
+  --text:#e8e4dc; --dim:#8f8a80; --gold:#d9a441;
+  --green:#5fbf7a; --red:#e2685f;
+  font-size:15px;
+}
+* { box-sizing:border-box; margin:0; }
+body { background:var(--bg); color:var(--text);
+  font:400 1rem/1.5 "Segoe UI",system-ui,sans-serif; padding:40px 16px; }
+.wrap { max-width:960px; margin:0 auto; }
+.eyebrow { color:var(--gold); letter-spacing:.14em; font-size:.72rem; font-weight:600; }
+h1 { font-size:2rem; margin:6px 0 4px; }
+.meta { color:var(--dim); font-size:.85rem; border-bottom:1px solid var(--line);
+  padding-bottom:18px; margin-bottom:24px; }
+.meta b { color:var(--text); font-weight:600; }
+
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:24px; }
+.card { background:var(--panel); padding:16px 18px; border-right:1px solid var(--line); }
+.card:last-child { border-right:0; }
+.card .lbl { color:var(--dim); font-size:.68rem; letter-spacing:.1em; }
+.card .val { font-size:1.35rem; font-weight:700; margin-top:4px; }
+.pos { color:var(--green); } .neg { color:var(--red); }
+
+.chart { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:18px; margin-bottom:20px; }
+.chart .lbl { color:var(--dim); font-size:.68rem; letter-spacing:.1em; margin-bottom:14px; }
+.bars { display:flex; align-items:center; gap:4px; height:150px; }
+.bar-wrap { flex:1; display:flex; align-items:center; height:100%; }
+.bar { width:100%; border-radius:2px; }
+.bar.up   { background:var(--green); align-self:flex-end; transform:translateY(-50%); }
+.bar.dn   { background:var(--red);   align-self:flex-start; transform:translateY(50%); }
+.bar.flat { background:var(--line); height:2px !important; align-self:center; }
+.bars { position:relative; }
+.bars::after { content:""; position:absolute; left:0; right:0; top:50%;
+  border-top:1px solid var(--line); }
+.xlabels { display:flex; justify-content:space-between; color:var(--dim);
+  font-size:.65rem; margin-top:8px; }
+
+.chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:26px; }
+.chip { color:var(--dim); text-decoration:none; font-size:.75rem;
+  border:1px solid var(--line); border-radius:6px; padding:4px 10px; }
+.chip.has { color:var(--text); border-color:var(--gold); }
+
+.month { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:18px; margin-bottom:14px; }
+.mh { display:flex; justify-content:space-between; align-items:baseline;
+  flex-wrap:wrap; gap:8px; }
+.mh h2 { font-size:1.05rem; }
+.mstats { color:var(--dim); font-size:.8rem; }
+.wr.bad { color:var(--red); } .wr.ok { color:var(--green); }
+.pill { border:1px solid var(--line); border-radius:20px; padding:2px 10px;
+  font-size:.72rem; color:var(--dim); }
+.empty { color:var(--dim); font-style:italic; margin-top:10px; font-size:.85rem; }
+
+.tbl { overflow-x:auto; margin-top:12px; }
+table { border-collapse:collapse; width:100%; font-size:.78rem; white-space:nowrap; }
+th { color:var(--dim); font-size:.65rem; letter-spacing:.08em; text-align:left;
+  padding:6px 10px; border-bottom:1px solid var(--line); }
+td { padding:7px 10px; border-bottom:1px solid var(--line); }
+tr:last-child td { border-bottom:0; }
+td.buy { color:var(--green); } td.sell { color:var(--red); }
+td.d { font-weight:600; } td.sig { color:var(--dim); }
+</style></head><body><div class="wrap">
+<div class="eyebrow">ZONE-TO-ZONE · XAUUSD · BACKTEST</div>
+<h1>Monthly Trade Report — XAUUSD</h1>
+<div class="meta">2023-01-01 &rarr; 2023-06-01 &middot; Start cash <b>$150.00</b> &middot; risk <b>1.00%/trade</b> &middot; spread <b>0.0 pts</b> &middot; min confirmations <b>1</b> &middot; d1 trend filter <b>False</b> &middot; trading hours <b>None</b></div>
+
+<div class="cards">
+  <div class="card"><div class="lbl">START EQUITY</div><div class="val">$150.00</div></div>
+  <div class="card"><div class="lbl">FINAL EQUITY</div><div class="val">$118.33</div></div>
+  <div class="card"><div class="lbl">NET PNL</div><div class="val neg">-31.67</div></div>
+  <div class="card"><div class="lbl">TRADES</div><div class="val">13</div></div>
+  <div class="card"><div class="lbl">WIN RATE</div><div class="val">23.1%</div></div>
+  <div class="card"><div class="lbl">MAX DRAWDOWN</div><div class="val neg">-26.83%</div></div>
+</div>
+
+<div class="chart"><div class="lbl">MONTH PNL ($)</div>
+  <div class="bars"><div class="bar-wrap" title="2023-01: +0.00"><div class="bar flat" style="height:2px"></div></div><div class="bar-wrap" title="2023-02: -35.11"><div class="bar dn" style="height:70px"></div></div><div class="bar-wrap" title="2023-03: -5.13"><div class="bar dn" style="height:10px"></div></div><div class="bar-wrap" title="2023-04: +0.09"><div class="bar up" style="height:2px"></div></div><div class="bar-wrap" title="2023-05: +8.48"><div class="bar up" style="height:17px"></div></div><div class="bar-wrap" title="2023-06: +0.00"><div class="bar flat" style="height:2px"></div></div></div>
+  <div class="xlabels"><span>23-01</span><span>23-04</span></div>
+</div>
+
+<div class="chips"><a class="chip " href="#m2023-01">2023-01</a><a class="chip has" href="#m2023-02">2023-02</a><a class="chip has" href="#m2023-03">2023-03</a><a class="chip has" href="#m2023-04">2023-04</a><a class="chip has" href="#m2023-05">2023-05</a><a class="chip " href="#m2023-06">2023-06</a></div>
+<section class="month" id="m2023-01"><div class="mh"><h2>2023-01</h2><div class="mstats"><span class="pill">no trades</span> &nbsp; PnL <b class="pos">+0.00</b> &nbsp; End Eq $150.00 &nbsp; DD 0.00%</div></div><p class="empty">No trades this month.</p></section><section class="month" id="m2023-02"><div class="mh"><h2>2023-02</h2><div class="mstats"><span class="wr bad">0/3 won · 0% WR</span> &nbsp; PnL <b class="neg">-35.11</b> &nbsp; End Eq $114.89 &nbsp; DD -23.41%</div></div><div class="tbl"><table><thead><tr><th>DATE</th><th>SIDE</th><th>H4 BIAS</th><th>SIGNALS</th><th>CONF</th><th>FRESH</th><th>ZONE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>PNL</th><th>OUTCOME</th></tr></thead><tbody><tr><td class="d">2023-02-02 17:45</td><td class="buy">buy</td><td>bullish</td><td class="sig">rejection_wick</td><td>1</td><td>fresh</td><td>demand</td><td>1,913.17</td><td>1,894.74</td><td>1,942.35</td><td>1,894.74</td><td class="neg">-18.44</td><td>SL</td></tr><tr><td class="d">2023-02-07 23:15</td><td class="buy">buy</td><td>bullish</td><td class="sig">rejection_wick</td><td>1</td><td>tapped</td><td>demand</td><td>1,876.53</td><td>1,868.73</td><td>1,913.17</td><td>1,868.73</td><td class="neg">-7.80</td><td>SL</td></tr><tr><td class="d">2023-02-22 22:00</td><td class="buy">buy</td><td>neutral_up</td><td class="sig">rejection_wick</td><td>1</td><td>tapped</td><td>demand</td><td>1,825.55</td><td>1,816.68</td><td>1,852.30</td><td>1,816.68</td><td class="neg">-8.87</td><td>SL</td></tr></tbody></table></div></section><section class="month" id="m2023-03"><div class="mh"><h2>2023-03</h2><div class="mstats"><span class="wr ok">1/3 won · 33% WR</span> &nbsp; PnL <b class="neg">-5.13</b> &nbsp; End Eq $109.76 &nbsp; DD -26.83%</div></div><div class="tbl"><table><thead><tr><th>DATE</th><th>SIDE</th><th>H4 BIAS</th><th>SIGNALS</th><th>CONF</th><th>FRESH</th><th>ZONE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>PNL</th><th>OUTCOME</th></tr></thead><tbody><tr><td class="d">2023-03-09 22:15</td><td class="buy">buy</td><td>bullish</td><td class="sig">engulfing|choch</td><td>2</td><td>tapped</td><td>demand</td><td>1,834.75</td><td>1,827.23</td><td>1,846.07</td><td>1,846.07</td><td class="pos">+11.32</td><td>TP</td></tr><tr><td class="d">2023-03-23 00:30</td><td class="sell">sell</td><td>bearish</td><td class="sig">rejection_wick</td><td>1</td><td>tapped</td><td>supply</td><td>1,974.35</td><td>1,990.79</td><td>1,926.91</td><td>1,990.79</td><td class="neg">-16.45</td><td>SL</td></tr><tr><td class="d">2023-03-23 14:30</td><td class="sell">sell</td><td>bearish</td><td class="sig">rejection_wick</td><td>1</td><td>tapped</td><td>supply</td><td>1,992.97</td><td>2,016.41</td><td>1,943.07</td><td>1,992.97</td><td class="pos">+0.00</td><td>EXP</td></tr></tbody></table></div></section><section class="month" id="m2023-04"><div class="mh"><h2>2023-04</h2><div class="mstats"><span class="wr ok">1/4 won · 25% WR</span> &nbsp; PnL <b class="pos">+0.09</b> &nbsp; End Eq $109.85 &nbsp; DD -26.77%</div></div><div class="tbl"><table><thead><tr><th>DATE</th><th>SIDE</th><th>H4 BIAS</th><th>SIGNALS</th><th>CONF</th><th>FRESH</th><th>ZONE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>PNL</th><th>OUTCOME</th></tr></thead><tbody><tr><td class="d">2023-04-02 23:45</td><td class="buy">buy</td><td>neutral_up</td><td class="sig">rejection_wick</td><td>1</td><td>fresh</td><td>demand</td><td>1,960.22</td><td>1,949.39</td><td>1,978.41</td><td>1,978.41</td><td class="pos">+18.19</td><td>TP</td></tr><tr><td class="d">2023-04-12 00:30</td><td class="sell">sell</td><td>neutral_down</td><td class="sig">rejection_wick</td><td>1</td><td>fresh</td><td>supply</td><td>2,015.24</td><td>2,024.03</td><td>1,966.28</td><td>2,024.03</td><td class="neg">-8.79</td><td>SL</td></tr><tr><td class="d">2023-04-14 13:30</td><td class="sell">sell</td><td>neutral_down</td><td class="sig">engulfing</td><td>1</td><td>tapped</td><td>supply</td><td>1,997.47</td><td>2,006.79</td><td>1,966.28</td><td>2,006.79</td><td class="neg">-9.31</td><td>SL</td></tr><tr><td class="d">2023-04-21 07:30</td><td class="buy">buy</td><td>neutral_up</td><td class="sig">rejection_wick</td><td>1</td><td>fresh</td><td>demand</td><td>1,986.45</td><td>1,962.86</td><td>2,028.57</td><td>1,986.45</td><td class="pos">+0.00</td><td>EXP</td></tr></tbody></table></div></section><section class="month" id="m2023-05"><div class="mh"><h2>2023-05</h2><div class="mstats"><span class="wr ok">1/3 won · 33% WR</span> &nbsp; PnL <b class="pos">+8.48</b> &nbsp; End Eq $118.33 &nbsp; DD -21.11%</div></div><div class="tbl"><table><thead><tr><th>DATE</th><th>SIDE</th><th>H4 BIAS</th><th>SIGNALS</th><th>CONF</th><th>FRESH</th><th>ZONE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>PNL</th><th>OUTCOME</th></tr></thead><tbody><tr><td class="d">2023-05-05 00:15</td><td class="sell">sell</td><td>neutral_down</td><td class="sig">choch</td><td>1</td><td>tapped</td><td>supply</td><td>2,045.82</td><td>2,054.34</td><td>2,018.42</td><td>2,018.42</td><td class="pos">+27.39</td><td>TP</td></tr><tr><td class="d">2023-05-05 10:45</td><td class="sell">sell</td><td>neutral_down</td><td class="sig">rejection_wick</td><td>1</td><td>tapped</td><td>supply</td><td>2,010.32</td><td>2,019.91</td><td>1,982.88</td><td>2,019.91</td><td class="neg">-9.59</td><td>SL</td></tr><tr><td class="d">2023-05-24 20:30</td><td class="buy">buy</td><td>neutral_up</td><td class="sig">engulfing</td><td>1</td><td>tapped</td><td>demand</td><td>1,958.97</td><td>1,949.66</td><td>1,989.63</td><td>1,949.66</td><td class="neg">-9.32</td><td>SL</td></tr></tbody></table></div></section><section class="month" id="m2023-06"><div class="mh"><h2>2023-06</h2><div class="mstats"><span class="pill">no trades</span> &nbsp; PnL <b class="pos">+0.00</b> &nbsp; End Eq $118.33 &nbsp; DD -21.11%</div></div><p class="empty">No trades this month.</p></section>
+</div></body></html>

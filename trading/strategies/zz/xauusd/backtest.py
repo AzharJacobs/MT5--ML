@@ -39,6 +39,7 @@ def main() -> None:
     parser.add_argument("--cash",   type=float, default=10_000.0)
     parser.add_argument("--save",   default=None)
     parser.add_argument("--chart",  action="store_true")
+    parser.add_argument("--data_source", default="db", choices=["db", "mt5"])
     # Fix 1
     parser.add_argument("--no_failed_zone_filter", action="store_true",
                         help="Disable permanent post-loss zone blacklist (revert to cooldown)")
@@ -60,6 +61,10 @@ def main() -> None:
     parser.add_argument("--midline_pct", type=float, default=0.50)
     parser.add_argument("--no_leave_return", action="store_true")
     parser.add_argument("--cooldown_bars",   type=int, default=int(_cool["cooldown_bars"]))
+    # D1 trend filter / session window (ported from USTEC; off by default)
+    parser.add_argument("--d1_trend_filter", action="store_true")
+    parser.add_argument("--trading_hours", type=int, nargs=2, default=None, metavar=("START", "END"),
+                        help="e.g. --trading_hours 8 18")
 
     args = parser.parse_args()
 
@@ -80,6 +85,8 @@ def main() -> None:
         midline_pct=args.midline_pct,
         require_leave_and_return=not args.no_leave_return,
         cooldown_bars=args.cooldown_bars,
+        d1_trend_filter=args.d1_trend_filter,
+        trading_hours=tuple(args.trading_hours) if args.trading_hours else None,
     )
 
     run_backtest_gold(
@@ -89,6 +96,7 @@ def main() -> None:
         cash=args.cash,
         save_path=args.save,
         chart=args.chart,
+        data_source=args.data_source,
     )
 
 

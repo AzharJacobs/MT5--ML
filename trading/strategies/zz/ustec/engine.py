@@ -101,6 +101,11 @@ def run_backtest(
     use_1h_zones: bool = False,    # add 1H zone detection alongside H4
     max_rr: float = 0.0,           # skip setups with theoretical RR above this (0 = off)
     bos_msb_min1: bool = False,    # allow single bos_msb confirmation; all others still need conf>=min
+    d1_trend_filter: bool = False, # highest-priority gate: buy only above D1 EMA, sell only below
+    d1_ema_period: int = 200,
+    trading_hours: Optional[tuple] = None,  # (start_hour, end_hour) server time; None = no restriction
+    pyramid_enabled: bool = False,   # add one same-size add-on at +pyramid_trigger_r, SL->BE
+    pyramid_trigger_r: float = 1.0,
     save_path: Optional[str] = None,
     chart:  bool = False,
     silent: bool = False,
@@ -148,6 +153,21 @@ def run_backtest(
         _pr(f"  (removed {_dupes} duplicate 4H rows)")
 
     _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
+
+    df_d1 = None
+    if d1_trend_filter:
+        # D1 = H4 resampled to calendar days (6 H4 bars per day). EMA computed once
+        # on the full closed-day series — no lookahead since each day's OHLC only
+        # depends on bars up to and including that day.
+        df_d1 = (
+            df_4h.set_index("timestamp")
+            .resample("1D")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna(subset=["close"])
+            .reset_index()
+        )
+        df_d1["ema"] = df_d1["close"].ewm(span=d1_ema_period, adjust=False).mean()
+        _pr(f"D1 bars: {len(df_d1)}  (EMA{d1_ema_period})")
 
     _base_tf_cfg, _base_conf_cfg, _base_setup_cfg = _make_base_configs()
 
@@ -247,6 +267,12 @@ def run_backtest(
 
         ts_now = df_15m["timestamp"].iloc[i]
 
+        # Session window — blocks NEW entries outside trading_hours. Open positions are
+        # already flushed/managed above regardless of this gate, unaffected by it.
+        if trading_hours is not None and not (trading_hours[0] <= ts_now.hour < trading_hours[1]):
+            rejects["trading_hours"] += 1
+            continue
+
         df_h4_w = df_4h[df_4h["timestamp"] <= ts_now].tail(H4_WINDOW).reset_index(drop=True)
         if len(df_h4_w) < 20:
             continue
@@ -296,6 +322,23 @@ def run_backtest(
         direction   = tf_result["direction"]
         zk          = _zone_key(active_zone)
         zone_tf     = "1H" if _is_h1_zone else "H4"
+
+        # D1 trend filter — highest priority: buy only above D1 EMA, sell only below.
+        if d1_trend_filter and df_d1 is not None:
+            _d1_idx = df_d1["timestamp"].searchsorted(ts_now.normalize(), side="left") - 1
+            _d1_blocked = True
+            if _d1_idx >= 0:
+                _d1_ema     = df_d1["ema"].iloc[_d1_idx]
+                _price_now  = float(df_15m["close"].iloc[i])
+                _d1_blocked = (
+                    (_price_now > _d1_ema and direction != "buy") or
+                    (_price_now < _d1_ema and direction != "sell")
+                )
+            if _d1_blocked:
+                rejects["d1_trend_filter"] += 1
+                if _fresh_tap:
+                    fresh_tap_rejects["d1_trend_filter"] += 1
+                continue
 
         if zone_cooldown.get(zk, -1) >= i:
             rejects["cooldown"] += 1
@@ -384,6 +427,8 @@ def run_backtest(
         active_sl      = sl
         be_triggered   = False
         lock_triggered = False
+        pyramided          = False
+        pyramid_entry_price = None
 
         # ── Simulate trade bar-by-bar ─────────────────────────────────────────
         outcome        = 0
@@ -426,6 +471,22 @@ def run_backtest(
                 else:
                     active_sl = min(active_sl, lock_price)
 
+            # Pyramiding: at +pyramid_trigger_r, move original SL to breakeven and
+            # open one same-size add-on with SL at that same breakeven price and the
+            # same TP. Max 1 add-on per trade (pyramided flag). Add-on's own PnL is
+            # computed from pyramid_entry_price once the shared exit is known below —
+            # from this bar on both legs share SL/TP, so they always exit together.
+            if pyramid_enabled and not pyramided and bar_favor_r >= pyramid_trigger_r:
+                pyramided = True
+                pyramid_entry_price = (
+                    entry + pyramid_trigger_r * orig_sl_dist if direction == "buy"
+                    else entry - pyramid_trigger_r * orig_sl_dist
+                )
+                if direction == "buy":
+                    active_sl = max(active_sl, entry)
+                else:
+                    active_sl = min(active_sl, entry)
+
             if direction == "buy":
                 if fh >= tp:         outcome =  1; exit_price = tp;        exit_bar = j; break
                 if fl <= active_sl:  outcome = -1; exit_price = active_sl; exit_bar = j; break
@@ -437,8 +498,12 @@ def run_backtest(
 
         if direction == "buy":
             pnl = (exit_price - entry) * lot * contract_size
+            if pyramided:
+                pnl += (exit_price - pyramid_entry_price) * lot * contract_size
         else:
             pnl = (entry - exit_price) * lot * contract_size
+            if pyramided:
+                pnl += (pyramid_entry_price - exit_price) * lot * contract_size
 
         exit_ts = df_15m["timestamp"].iloc[min(exit_bar, n - 1)]
         _pending.append({
@@ -475,6 +540,8 @@ def run_backtest(
                 "entry_mode":    setup.entry_mode,
                 "tp_mode":       setup.tp_mode,
                 "managed":       managed,
+                "pyramided":     pyramided,
+                "pyramid_entry": round(pyramid_entry_price, 5) if pyramided else None,
             },
         })
 

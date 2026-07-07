@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import FrozenSet
+from typing import FrozenSet, Optional
 
 import yaml
 
@@ -75,6 +75,13 @@ class GoldZZConfig:
     fixed_lot: float = 0.0
     min_rr: float = 1.5
 
+    # ── D1 trend filter (ported from USTEC; OFF by default, untested for gold) ─
+    d1_trend_filter: bool = False
+    d1_ema_period: int = 200
+
+    # ── Session window (ported from USTEC; OFF by default, untested for gold) ──
+    trading_hours: Optional[tuple] = None
+
 
 def load_raw() -> dict:
     with open(_HERE / "config.yaml") as f:
@@ -102,6 +109,14 @@ COOLDOWN_LOSS_BARS = int(_cool["cooldown_loss_bars"])
 MAX_FORWARD_BARS = int(_cool["max_forward_bars"])
 
 TAP_TOL          = float(_cfg["zone"]["tap_tolerance_pct"])
+
+_d1_trend        = _cfg.get("d1_trend", {})
+D1_TREND_FILTER  = bool(_d1_trend.get("d1_trend_filter", False))
+D1_EMA_PERIOD    = int(_d1_trend.get("d1_ema_period", 200))
+
+_session         = _cfg.get("session", {})
+_th              = _session.get("trading_hours")
+TRADING_HOURS    = tuple(_th) if _th else None
 
 
 def make_gold_config() -> GoldZZConfig:
@@ -152,4 +167,8 @@ def make_gold_config() -> GoldZZConfig:
         spread=float(_cfg["spread_pts"]),
         fixed_lot=float(_cfg["fixed_lot"]),
         min_rr=float(_cfg["min_rr"]),
+        # D1 trend filter / session window
+        d1_trend_filter=D1_TREND_FILTER,
+        d1_ema_period=D1_EMA_PERIOD,
+        trading_hours=TRADING_HOURS,
     )

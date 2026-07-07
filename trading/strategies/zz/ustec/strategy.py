@@ -69,6 +69,18 @@ ATR_TRAIL_MULT       = float(_trail.get("atr_trail_mult", 1.5))
 _regime              = _cfg.get("regime", {})
 H4_REGIME_FILTER     = bool(_regime.get("h4_regime_filter", False))
 
+_d1_trend            = _cfg.get("d1_trend", {})
+D1_TREND_FILTER      = bool(_d1_trend.get("d1_trend_filter", False))
+D1_EMA_PERIOD        = int(_d1_trend.get("d1_ema_period", 200))
+
+_session             = _cfg.get("session", {})
+_th                  = _session.get("trading_hours")
+TRADING_HOURS        = tuple(_th) if _th else None
+
+_pyramid             = _cfg.get("pyramid", {})
+PYRAMID_ENABLED      = bool(_pyramid.get("pyramid_enabled", False))
+PYRAMID_TRIGGER_R    = float(_pyramid.get("pyramid_trigger_r", 1.0))
+
 
 def make_configs() -> tuple[TFConfig, ConfirmationConfig, TradeSetupConfig]:
     """

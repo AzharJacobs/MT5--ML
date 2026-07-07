@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-monthly_backtest.py — Month-by-month equity walk on USTEC ZZ baseline.
+monthly_backtest.py — Month-by-month equity walk on XAUUSD (Gold) ZZ baseline.
 
-Runs a single continuous backtest (equity compounds across months).
-Slices df_t by the month trades were ENTERED to report per-month stats.
-
-Sizing : 1% fixed-fractional  (lot = equity×0.01 ÷ SL_pts×contract)
-         At $150 this clamps to the 0.01-lot floor until equity grows.
+Mirrors trading/strategies/zz/ustec/monthly_backtest.py — runs a single
+continuous backtest (equity compounds across months), slices df_t by the
+month trades were ENTERED to report per-month stats, and writes the same
+standing HTML report format to trading/Reports/xauusd_monthly_report.html.
 
 Usage:
-  python trading/strategies/zz/ustec/monthly_backtest.py
-  python trading/strategies/zz/ustec/monthly_backtest.py --cash 150 --start 2023-01-01 --end 2025-01-01
+  python trading/strategies/zz/xauusd/monthly_backtest.py
+  python trading/strategies/zz/xauusd/monthly_backtest.py --cash 150 --start 2023-01-01 --end 2025-01-01
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections import defaultdict
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 
 import pandas as pd
@@ -25,42 +26,27 @@ _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from trading.strategies.zz.ustec.strategy import (
-    MIN_RR, SPREAD_PTS, MAX_FORWARD_BARS, RISK_PCT, ALLOW_NEUTRAL, MIDLINE_TP, MIDLINE_PCT,
-    SL_BUFFER_PCT, D1_TREND_FILTER, D1_EMA_PERIOD, TRADING_HOURS, PYRAMID_ENABLED, PYRAMID_TRIGGER_R,
-)
-from trading.strategies.zz.ustec.engine import run_backtest
+from trading.strategies.zz.xauusd.strategy import make_gold_config, RISK_PCT, SPREAD_PTS
+from trading.strategies.zz.xauusd.engine import run_backtest_gold
 from trading.Reports.report_html import save_html_report
 
 REPORTS_DIR = _ROOT / "trading" / "Reports"
 
 
-def run_monthly(start: str, end: str, cash: float, spread: float, min_confirmations: int,
-                 out_path: str | None = None, bos_msb_min1: bool = False,
-                 dual_tf: bool = False) -> None:
+def run_monthly(start: str, end: str, cash: float, min_confirmations: int | None = None,
+                 out_path: str | None = None) -> None:
 
-    print(f"\nMonthly backtest  {start} -> {end}")
-    print(f"  Cash=${cash:.2f}  risk={RISK_PCT*100:.2f}% (from config.yaml)  spread={spread}pts")
+    cfg = make_gold_config()
+    if min_confirmations is not None:
+        cfg = _dc_replace(cfg, min_confirmations=min_confirmations)
+
+    print(f"\nMonthly backtest (Gold)  {start} -> {end}")
+    print(f"  Cash=${cash:.2f}  risk={RISK_PCT*100:.2f}% (from config.yaml)  spread={cfg.spread}pts")
+    print(f"  D1 trend filter={cfg.d1_trend_filter}  trading_hours={cfg.trading_hours}")
     print(f"  Single continuous run - equity compounds across months...\n")
 
-    m, df = run_backtest(
-        start=start, end=end, cash=cash,
-        symbol="ustech", spread=spread,
-        fixed_lot=0,
-        min_rr=MIN_RR, max_forward_bars=MAX_FORWARD_BARS,
-        min_confirmations=min_confirmations,
-        bos_msb_min1=bos_msb_min1,
-        allow_neutral=ALLOW_NEUTRAL,
-        midline_tp=MIDLINE_TP,
-        midline_pct=MIDLINE_PCT,
-        sl_buffer_pct=SL_BUFFER_PCT,
-        use_1h_zones=dual_tf,
-        d1_trend_filter=D1_TREND_FILTER,
-        d1_ema_period=D1_EMA_PERIOD,
-        trading_hours=TRADING_HOURS,
-        pyramid_enabled=PYRAMID_ENABLED,
-        pyramid_trigger_r=PYRAMID_TRIGGER_R,
-        silent=True,
+    m, df = run_backtest_gold(
+        cfg=cfg, start=start, end=end, cash=cash, silent=True,
     )
 
     if df.empty:
@@ -73,13 +59,8 @@ def run_monthly(start: str, end: str, cash: float, spread: float, min_confirmati
     full_range = pd.period_range(start=pd.Period(start, freq="M"), end=pd.Period(end, freq="M"), freq="M")
     all_months = list(full_range)
 
-    # Track running equity: start of each month = equity after last closed trade
-    # df["equity"] = equity after each trade closes (in chronological order)
-    # We step through chronologically and assign start/end equity per month.
     df_sorted = df.sort_values("date").reset_index(drop=True)
 
-    # Build a dict: month → list of rows
-    from collections import defaultdict
     monthly = defaultdict(list)
     for _, row in df_sorted.iterrows():
         monthly[row["month"]].append(row)
@@ -143,38 +124,36 @@ def run_monthly(start: str, end: str, cash: float, spread: float, min_confirmati
     print(f"  Max drawdown    : {max_dd:.2f}%")
     print()
 
-    report_path = out_path or str(REPORTS_DIR / "ustec_monthly_report.html")
+    report_path = out_path or str(REPORTS_DIR / "xauusd_monthly_report.html")
     save_html_report(
         df, start=start, end=end, cash=cash, out_path=report_path,
+        title="Monthly Trade Report — XAUUSD",
+        eyebrow="ZONE-TO-ZONE · XAUUSD · BACKTEST",
         meta={
             "risk": f"{RISK_PCT*100:.2f}%/trade",
-            "spread": f"{spread} pts",
-            "min confirmations": str(min_confirmations),
+            "spread": f"{cfg.spread} pts",
+            "min confirmations": str(cfg.min_confirmations),
+            "d1 trend filter": str(cfg.d1_trend_filter),
+            "trading hours": str(cfg.trading_hours),
         },
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Monthly backtest - USTEC ZZ")
+    parser = argparse.ArgumentParser(description="Monthly backtest - XAUUSD (Gold) ZZ")
     parser.add_argument("--start",    default="2023-01-01")
     parser.add_argument("--end",      default="2025-01-01")
     parser.add_argument("--cash",     type=float, default=150.0)
-    parser.add_argument("--spread",   type=float, default=SPREAD_PTS)
-    parser.add_argument("--min_confirmations", type=int, default=1)
+    parser.add_argument("--min_confirmations", type=int, default=None,
+                        help="Override config.yaml's min_confirmations")
     parser.add_argument("--out", default=None,
-                        help="HTML report output path (default: trading/Reports/ustec_monthly_report.html)")
-    parser.add_argument("--bos_msb_min1", action="store_true",
-                        help="Allow single-confirmation entries when that confirmation is bos_msb")
-    parser.add_argument("--dual_tf", action="store_true",
-                        help="Watch 1H and 4H zones in parallel; 4H takes priority on overlap")
+                        help="HTML report output path (default: trading/Reports/xauusd_monthly_report.html)")
     args = parser.parse_args()
     run_monthly(
         start=args.start, end=args.end,
-        cash=args.cash, spread=args.spread,
+        cash=args.cash,
         min_confirmations=args.min_confirmations,
         out_path=args.out,
-        bos_msb_min1=args.bos_msb_min1,
-        dual_tf=args.dual_tf,
     )
 
 

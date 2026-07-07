@@ -30,6 +30,7 @@ from trading.strategies.zz.core.trade_setup import TradeSetupConfig, setup_from_
 from trading.shared.backtest.report import print_report, save_report
 from trading.shared.backtest.chart import plot_trades
 from trading.shared.data_loader import get_connection
+from trading.shared.mt5_loader import fetch_ohlcv as _mt5_fetch, disconnect as _mt5_disconnect
 
 
 # ── Inlined helpers (previously in backtest/engine_zones.py) ─────────────────
@@ -102,38 +103,66 @@ def run_backtest_gold(
     cash:  float = 10_000.0,
     save_path: Optional[str] = None,
     chart: bool = False,
+    silent: bool = False,
+    data_source: str = "db",       # "db" = PostgreSQL  |  "mt5" = live MT5 terminal
 ) -> tuple:
     """
     Run the gold-specific Zone-to-Zone backtest for [start, end).
     Returns (metrics: dict, df_trades: pd.DataFrame).
     """
     eff_spread = cfg.spread
+    _pr = (lambda *a, **kw: None) if silent else print
 
-    db = get_connection()
-    db.database = _DB_NAME
-    db.connect()
+    _pr(f"\nSymbol : XAUUSD (gold v2)  |  source: {data_source}  "
+        f"|  Contract: ${_CONTRACT}/pt/lot  |  Spread: {eff_spread} pts")
 
-    print(f"\nSymbol : XAUUSD (gold v2)  |  DB: {_DB_NAME}  "
-          f"|  Contract: ${_CONTRACT}/pt/lot  |  Spread: {eff_spread} pts")
-    print(f"Loading 15M data  {start} → {end} ...")
-    df_15m = _load_ohlcv(db, _TABLE, "15min", start, end)
-    print(f"Loading 4H  data  {start} → {end} ...")
-    df_4h  = _load_ohlcv(db, _TABLE, "4H",    start, end)
+    if data_source == "mt5":
+        _pr(f"Loading 15M data from MT5 terminal  {start} -> {end} ...")
+        df_15m = _mt5_fetch("xauusd", "15min", start, end, silent=silent)
+        _pr(f"Loading 4H  data from MT5 terminal  {start} -> {end} ...")
+        df_4h  = _mt5_fetch("xauusd", "4H",    start, end, silent=silent)
+        _mt5_disconnect()
+    else:
+        db = get_connection()
+        db.database = _DB_NAME
+        db.connect()
 
-    try:
-        db.connection.close()
-    except Exception:
-        pass
+        _pr(f"Loading 15M data  {start} -> {end} ...")
+        df_15m = _load_ohlcv(db, _TABLE, "15min", start, end)
+        _pr(f"Loading 4H  data  {start} -> {end} ...")
+        df_4h  = _load_ohlcv(db, _TABLE, "4H",    start, end)
+
+        try:
+            db.connection.close()
+        except Exception:
+            pass
 
     if df_15m.empty or df_4h.empty:
-        print("ERROR: no data returned — check DB connection and date range.")
+        src = "MT5 terminal" if data_source == "mt5" else "DB"
+        print(f"ERROR: no data returned from {src} — check connection and date range.")
         return {}, pd.DataFrame()
 
-    print(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
-    print(f"Gold fixes: failed_zone_filter={cfg.failed_zone_filter}  "
-          f"active_signals={sorted(cfg.active_signals)}  "
-          f"min_zone_atr_frac={cfg.min_zone_atr_frac}  "
-          f"sl_atr_buffer={cfg.sl_atr_buffer}\n")
+    _pr(f"15M bars: {len(df_15m)} | 4H bars: {len(df_4h)}")
+    _pr(f"Gold fixes: failed_zone_filter={cfg.failed_zone_filter}  "
+        f"active_signals={sorted(cfg.active_signals)}  "
+        f"min_zone_atr_frac={cfg.min_zone_atr_frac}  "
+        f"sl_atr_buffer={cfg.sl_atr_buffer}")
+    _pr(f"D1 trend filter: {cfg.d1_trend_filter}  |  Session window: {cfg.trading_hours}\n")
+
+    df_d1 = None
+    if cfg.d1_trend_filter:
+        # D1 = H4 resampled to calendar days (6 H4 bars per day). EMA computed once
+        # on the full closed-day series — no lookahead since each day's OHLC only
+        # depends on bars up to and including that day.
+        df_d1 = (
+            df_4h.set_index("timestamp")
+            .resample("1D")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna(subset=["close"])
+            .reset_index()
+        )
+        df_d1["ema"] = df_d1["close"].ewm(span=cfg.d1_ema_period, adjust=False).mean()
+        _pr(f"D1 bars: {len(df_d1)}  (EMA{cfg.d1_ema_period})")
 
     tf_cfg = TFConfig(
         directional_filter=cfg.directional_filter,
@@ -178,12 +207,14 @@ def run_backtest_gold(
     warmup = max(_M15_WINDOW, 30)
 
     filters = {
-        "in_position":   0,
-        "tf_neutral":    0,
-        "thin_zone":     0,
-        "conf_failed":   0,
-        "setup_invalid": 0,
-        "zone_cooldown": 0,
+        "in_position":     0,
+        "tf_neutral":      0,
+        "thin_zone":       0,
+        "conf_failed":     0,
+        "setup_invalid":   0,
+        "zone_cooldown":   0,
+        "trading_hours":   0,
+        "d1_trend_filter": 0,
     }
 
     for i in range(warmup, n - cfg.max_forward_bars):
@@ -213,6 +244,12 @@ def run_backtest_gold(
 
         ts_now = df_15m["timestamp"].iloc[i]
 
+        # Session window — blocks NEW entries outside trading_hours. Positions already
+        # open are managed above (skip_until/leave-and-return), unaffected by this gate.
+        if cfg.trading_hours is not None and not (cfg.trading_hours[0] <= ts_now.hour < cfg.trading_hours[1]):
+            filters["trading_hours"] += 1
+            continue
+
         df_h4_w = df_4h[df_4h["timestamp"] <= ts_now].tail(_H4_WINDOW).reset_index(drop=True)
         if len(df_h4_w) < 20:
             continue
@@ -234,6 +271,21 @@ def run_backtest_gold(
         zk          = _zone_key(active_zone)
         zid         = active_zone.zone_id
 
+        # D1 trend filter — highest priority: buy only above D1 EMA, sell only below.
+        if cfg.d1_trend_filter and df_d1 is not None:
+            _d1_idx = df_d1["timestamp"].searchsorted(ts_now.normalize(), side="left") - 1
+            _d1_blocked = True
+            if _d1_idx >= 0:
+                _d1_ema     = df_d1["ema"].iloc[_d1_idx]
+                _price_now  = float(df_15m["close"].iloc[i])
+                _d1_blocked = (
+                    (_price_now > _d1_ema and direction != "buy") or
+                    (_price_now < _d1_ema and direction != "sell")
+                )
+            if _d1_blocked:
+                filters["d1_trend_filter"] += 1
+                continue
+
         # Fix 3a: skip thin zones
         if h4_atr > 0:
             zone_height = active_zone.top - active_zone.bottom
@@ -246,7 +298,10 @@ def run_backtest_gold(
         # Fix 2: filter to active signals for the entry gate
         active_sigs  = [s for s in conf.signals if s in cfg.active_signals]
         active_count = len(active_sigs)
-        if active_count < cfg.min_confirmations:
+        # Fresh-zone relaxation (ported from USTEC): a fresh H4 zone only needs 1
+        # active-signal confirmation; tapped zones keep the configured min_confirmations.
+        _required_conf = 1 if active_zone.fresh else cfg.min_confirmations
+        if active_count < _required_conf:
             filters["conf_failed"] += 1
             continue
 
@@ -389,6 +444,7 @@ def run_backtest_gold(
             "zone_top":      active_zone.top,
             "zone_strength": active_zone.strength,
             "zone_kind":     active_zone.kind,
+            "zone_fresh":    active_zone.fresh,
             "zone_height_$": round(active_zone.top - active_zone.bottom, 2),
             "zone_ht_atr":   round((active_zone.top - active_zone.bottom) / h4_atr, 3)
                              if h4_atr > 0 else float("nan"),
@@ -444,70 +500,71 @@ def run_backtest_gold(
         "spread_pts":         eff_spread,
     }
 
-    print_report(metrics, run_label="Gold Z&Z v2")
+    if not silent:
+        print_report(metrics, run_label="Gold Z&Z v2")
 
-    evaluated = n - warmup - cfg.max_forward_bars
-    print(f"\n{'─'*52}")
-    print(f"  Filter breakdown  ({evaluated:,} bars evaluated)")
-    print(f"{'─'*52}")
-    for label, count in sorted(filters.items(), key=lambda x: -x[1]):
-        if count == 0:
-            continue
-        pct = count / max(evaluated, 1) * 100
-        print(f"  {label:<25} {count:>8,}  ({pct:.1f}%)")
-    print(f"  {'signals fired':<25} {total:>8,}")
-    print(f"{'─'*52}")
+        evaluated = n - warmup - cfg.max_forward_bars
+        print(f"\n{'-'*52}")
+        print(f"  Filter breakdown  ({evaluated:,} bars evaluated)")
+        print(f"{'-'*52}")
+        for label, count in sorted(filters.items(), key=lambda x: -x[1]):
+            if count == 0:
+                continue
+            pct = count / max(evaluated, 1) * 100
+            print(f"  {label:<25} {count:>8,}  ({pct:.1f}%)")
+        print(f"  {'signals fired':<25} {total:>8,}")
+        print(f"{'-'*52}")
 
-    stack_counts = df_t["confirmations"].value_counts().sort_index()
-    print(f"\n  Confirmation stacking (active signals only):")
-    for cnt, freq in stack_counts.items():
-        wr_s = (df_t[df_t["confirmations"] == cnt]["outcome"] == 1).mean() * 100
-        print(f"    {cnt} confirmations : {freq:>4} trades  WR={wr_s:.0f}%")
+        stack_counts = df_t["confirmations"].value_counts().sort_index()
+        print(f"\n  Confirmation stacking (active signals only):")
+        for cnt, freq in stack_counts.items():
+            wr_s = (df_t[df_t["confirmations"] == cnt]["outcome"] == 1).mean() * 100
+            print(f"    {cnt} confirmations : {freq:>4} trades  WR={wr_s:.0f}%")
 
-    print(f"\n  Signal breakdown (all fired, active=entry-eligible):")
-    all_fired = []
-    for row in df_t["signals_all"]:
-        all_fired.extend(row.split("|") if row else [])
-    for sig in sorted(set(s for s in all_fired if s)):
-        mask = df_t["signals_all"].str.contains(sig, na=False)
-        grp  = df_t[mask]
-        wr_s = (grp["outcome"] == 1).mean() * 100
-        tag  = "ACTIVE  " if sig in cfg.active_signals else "disabled"
-        print(f"    [{tag}] {sig:<18}: {len(grp):>3} trades  WR={wr_s:.0f}%  "
-              f"net=${grp['pnl'].sum():+.2f}")
+        print(f"\n  Signal breakdown (all fired, active=entry-eligible):")
+        all_fired = []
+        for row in df_t["signals_all"]:
+            all_fired.extend(row.split("|") if row else [])
+        for sig in sorted(set(s for s in all_fired if s)):
+            mask = df_t["signals_all"].str.contains(sig, na=False)
+            grp  = df_t[mask]
+            wr_s = (grp["outcome"] == 1).mean() * 100
+            tag  = "ACTIVE  " if sig in cfg.active_signals else "disabled"
+            print(f"    [{tag}] {sig:<18}: {len(grp):>3} trades  WR={wr_s:.0f}%  "
+                  f"net=${grp['pnl'].sum():+.2f}")
 
-    print(f"\n  H4 bias at entry:")
-    for bias_val, grp in df_t.groupby("h4_bias"):
-        wr_b = (grp["outcome"] == 1).mean() * 100
-        print(f"    {bias_val:<14} : {len(grp):>4} trades  WR={wr_b:.0f}%")
+        print(f"\n  H4 bias at entry:")
+        for bias_val, grp in df_t.groupby("h4_bias"):
+            wr_b = (grp["outcome"] == 1).mean() * 100
+            print(f"    {bias_val:<14} : {len(grp):>4} trades  WR={wr_b:.0f}%")
 
-    print(f"\n  Prior-outcome split:")
-    for pb in ("first_attempt", "post_win", "post_loss", "post_expired"):
-        g = df_t[df_t["prior_bucket"] == pb]
-        if len(g) == 0:
-            continue
-        wr  = (g["outcome"] == 1).mean() * 100
-        net = g["pnl"].sum()
-        print(f"    {pb:<16} : {len(g):>3} trades  WR={wr:.0f}%  net=${net:+.2f}")
+        print(f"\n  Prior-outcome split:")
+        for pb in ("first_attempt", "post_win", "post_loss", "post_expired"):
+            g = df_t[df_t["prior_bucket"] == pb]
+            if len(g) == 0:
+                continue
+            wr  = (g["outcome"] == 1).mean() * 100
+            net = g["pnl"].sum()
+            print(f"    {pb:<16} : {len(g):>3} trades  WR={wr:.0f}%  net=${net:+.2f}")
 
-    print(f"\n  Zone quality:")
-    print(f"    avg zone height $  : ${df_t['zone_height_$'].mean():.2f}")
-    print(f"    avg zone height ATR: {df_t['zone_ht_atr'].mean():.3f}×")
-    print(f"    avg zone strength  : {df_t['zone_strength'].mean():.2f}")
-    print(f"    avg H4 ATR at entry: ${df_t['h4_atr'].mean():.2f}")
-    print()
+        print(f"\n  Zone quality:")
+        print(f"    avg zone height $  : ${df_t['zone_height_$'].mean():.2f}")
+        print(f"    avg zone height ATR: {df_t['zone_ht_atr'].mean():.3f}x")
+        print(f"    avg zone strength  : {df_t['zone_strength'].mean():.2f}")
+        print(f"    avg H4 ATR at entry: ${df_t['h4_atr'].mean():.2f}")
+        print()
 
-    cols = ["date", "side", "h4_bias", "signals", "signals_all",
-            "confirmations", "is_retest", "prior_bucket",
-            "entry", "sl", "tp", "exit", "pnl", "outcome"]
-    print(df_t[cols].to_string(index=False))
-    print()
+        cols = ["date", "side", "h4_bias", "signals", "signals_all",
+                "confirmations", "is_retest", "prior_bucket",
+                "entry", "sl", "tp", "exit", "pnl", "outcome"]
+        print(df_t[cols].to_string(index=False))
+        print()
 
     if save_path:
         save_report(metrics, save_path)
 
     if chart:
-        title = (f"Gold Z&Z v2 — XAUUSD  |  {start} → {end}  |  "
+        title = (f"Gold Z&Z v2 - XAUUSD  |  {start} -> {end}  |  "
                  f"{tp_hits}W / {sl_hits}L / {expired}E  |  WR {win_rate:.1f}%")
         fig = plot_trades(df_15m, trades, title=title, start_cash=cash)
         fig.show()

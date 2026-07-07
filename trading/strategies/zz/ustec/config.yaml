@@ -11,7 +11,7 @@ contract_size: 1.0      # $1/pt/lot (Exness USTECm — verified; engine uses 1.0
 spread_pts: 2.0         # applied at fill in paper mode; MT5 uses real fill
 fixed_lot: 0.05         # fixed lot size per trade
 risk_pct: 0.01          # 1% equity risk (used only with dynamic lot sizing)
-min_rr: 1.5
+min_rr: 2.5
 min_sl_pct: 0.0         # disabled
 max_sl_pct: 0.0         # disabled
 max_positions: 2
@@ -83,6 +83,21 @@ cooldown:
 # Regime filter — blocks buys when price is below both H4 EMA50 and EMA200
 regime:
   h4_regime_filter: false      # not in PDF + tested net-negative over 3yrs — OFF
+
+# D1 trend filter — highest priority gate: price > D1 EMA -> buy only, price < D1 EMA -> sell only
+d1_trend:
+  d1_trend_filter: false       # tested: cut trades, cut PnL more than risk — OFF (didn't win)
+  d1_ema_period: 200           # D1 = H4 resampled to calendar days (6 H4 bars/day)
+
+# Session window — block NEW entries outside these server-time hours; open positions still managed
+session:
+  trading_hours: [8, 18]       # null/omit to disable
+
+# Pyramiding — at +pyramid_trigger_r, move original SL to breakeven and open one
+# same-size add-on (same TP, SL at position 1's entry). Max 1 add-on per trade.
+pyramid:
+  pyramid_enabled: false
+  pyramid_trigger_r: 1.0
 
 # Trailing stop (USTEC only — not shared with gold)
 trailing:

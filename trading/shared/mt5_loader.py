@@ -33,6 +33,7 @@ _TF_MAP = {
 # Symbol name in MT5 for each strategy symbol key
 MT5_SYMBOL_MAP = {
     "ustech": "USTECm",
+    "xauusd": "XAUUSDm",
 }
 
 _connected = False

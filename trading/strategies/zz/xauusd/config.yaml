@@ -60,6 +60,17 @@ cooldown:
   cooldown_loss_bars: 48    # block duration after a loss (bars = 12h in M15)
   max_forward_bars: 350     # 350 × 15 min ≈ 87 h ≈ 4 trading days
 
+# D1 trend filter — highest priority gate: price > D1 EMA -> buy only, price < D1 EMA -> sell only
+# Ported from USTEC's tuned setup; OFF by default — untested for gold, don't assume it wins here.
+d1_trend:
+  d1_trend_filter: false
+  d1_ema_period: 200           # D1 = H4 resampled to calendar days (6 H4 bars/day)
+
+# Session window — block NEW entries outside these server-time hours; open positions still managed
+# Ported from USTEC's tuned setup; OFF by default — untested for gold.
+session:
+  trading_hours: null          # e.g. [8, 18] to enable; null = disabled
+
 # Gold-specific fixes (absent in USTEC config)
 gold_fixes:
   # Fix 1: zones that produce a SL hit are permanently blacklisted.

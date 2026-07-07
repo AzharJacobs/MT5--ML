@@ -279,22 +279,36 @@ def select_h4_zone(
     bias: str,
     cfg: TFConfig,
     current_price: float,
+    h1_zone_ids: Optional[set] = None,
 ) -> Optional[Zone]:
     """
     Choose the single best H4 zone given the current bias and price.
 
     Selection logic:
       1. Filter zones by directional filter (bias_permits).
-      2. Prefer fresh zones over tapped ones.
-      3. Within the fresh pool, pick the one with the highest strength
+      2. H4 priority: a 1H zone is dropped from consideration only when its
+         price range overlaps an eligible H4 zone's price range. A 1H zone
+         at a price level with no nearby H4 zone stays tradeable.
+      3. Prefer fresh zones over tapped ones.
+      4. Within the fresh pool, pick the one with the highest strength
          that is closest to current price (proximity × strength composite).
-      4. Fall back to stale zones by the same composite if no fresh zones exist.
+      5. Fall back to stale zones by the same composite if no fresh zones exist.
 
     Returns None when no eligible zones are found.
     """
     eligible = [z for z in h4_zones if bias_permits(bias, z.kind, cfg)]
     if not eligible:
         return None
+
+    if h1_zone_ids:
+        h4_only = [z for z in eligible if z.zone_id not in h1_zone_ids]
+        h1_only = [z for z in eligible if z.zone_id in h1_zone_ids]
+
+        def _overlaps_h4(z1h: Zone) -> bool:
+            return any(z1h.bottom <= zh4.top and z1h.top >= zh4.bottom for zh4 in h4_only)
+
+        h1_kept  = [z for z in h1_only if not _overlaps_h4(z)]
+        eligible = h4_only + h1_kept
 
     def score(z: Zone) -> float:
         dist = abs(z.mid - current_price)
@@ -412,7 +426,8 @@ def analyse_timeframes(
 
     # ── Step 4: select the active H4 zone ───────────────────────────────────
     current_price = float(df_m15["close"].iloc[-1])
-    active_zone   = select_h4_zone(eligible, bias, cfg, current_price)
+    h1_zone_ids   = {z.zone_id for z in h1_zones}
+    active_zone   = select_h4_zone(eligible, bias, cfg, current_price, h1_zone_ids=h1_zone_ids)
     if active_zone is None:
         result["reason"] = "no eligible H4 zone found after selection"
         return result
