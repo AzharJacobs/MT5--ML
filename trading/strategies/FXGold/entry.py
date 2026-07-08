@@ -3,7 +3,10 @@ Entry logic for the FXGold strategy.
 
 Flow (evaluated bar-by-bar after each candle closes):
   1. Is price retesting a strong zone this bar?  (wick in, body out = rejection touch)
-  2. Does the live touch count allow entry?
+  2. Does the live touch count allow entry? The touch itself is recorded by
+     the ENGINE's per-bar pass, which runs before evaluate_entry is called,
+     on every bar, for every zone, regardless of position status or bias —
+     evaluate_entry only READS the count here, it never increments it.
        live == 1  →  guide's "2nd touch"  →  TAKE
        live == 2  →  guide's "3rd touch"  →  SKIP
        live >= 3  →  guide's "4th touch"  →  SKIP (breakout expected)
@@ -34,6 +37,7 @@ from trading.strategies.FXGold.config import FXGoldConfig
 from trading.strategies.FXGold.zones import Zone, price_in_zone, is_rejection_touch
 from trading.strategies.FXGold.confirmations import ConfirmationResult, check_confirmation
 from trading.strategies.FXGold.bias import get_aligned_bias
+from trading.strategies.FXGold.pattern import check_secret_pattern
 
 
 # ─── Result types ─────────────────────────────────────────────────────────────
@@ -47,6 +51,7 @@ class EntrySignal:
     tp_mode: Optional[str] = None     # "zone" or "fallback"
     pattern: Optional[str] = None     # confirmation pattern name
     reason: str = ""                  # acceptance or rejection reason
+    live_count: Optional[int] = None  # live touch count at Gate 3 (see TouchTracker)
 
 
 # ─── Touch tracker ────────────────────────────────────────────────────────────
@@ -58,7 +63,14 @@ class TouchTracker:
     """
     Tracks live touch counts per zone across bar-by-bar scanning.
     Instantiate once per backtest run or live session; pass the same instance
-    to every evaluate_entry call.
+    to the engine's per-bar touch-recording pass AND to every evaluate_entry
+    call.
+
+    record_touch() is called by the ENGINE, once per bar, for every zone
+    where is_rejection_touch(...) is true — regardless of position status or
+    bias. evaluate_entry() only READS the count via get_count(); it never
+    increments it. This split is what makes retests that happen while a
+    trade is open (or while bias disqualifies the zone) still count.
 
     live_touch is incremented each time a rejection touch is recorded.
     Historical rejections (used for zone grading strength) are NOT counted here.
@@ -77,7 +89,11 @@ class TouchTracker:
         return self._live.get(zone.zone_key, 0)
 
     def reset(self, zone: Zone) -> None:
-        """Call this when a zone is invalidated (flipped or broken)."""
+        """Call this when a zone is invalidated — flipped kind or died
+        (second breakout). The engine calls this whenever a zone's kind
+        changes or it drops out of the strong/non-dead list between two
+        consecutive detect_zones() calls, so a fresh retest count starts
+        after a flip rather than inheriting the old side's touches."""
         self._live.pop(zone.zone_key, None)
 
 
@@ -147,6 +163,7 @@ def evaluate_entry(
     df_d1: pd.DataFrame = None,
     df_h4: pd.DataFrame = None,
     df_h1: pd.DataFrame = None,
+    precomputed_bias: Optional[str] = None,
 ) -> EntrySignal:
     """
     Evaluate whether the just-closed bar presents a valid entry at the given zone.
@@ -164,14 +181,25 @@ def evaluate_entry(
                          All three required when cfg.bias_mode == "strict";
                          only df_d1 and df_h4 required for "loose".
                          Pass None to skip the bias gate entirely.
+        precomputed_bias: If given ("up"/"down"/"sideways"), skips the internal
+                         get_aligned_bias() call and uses this value directly.
+                         Callers scanning many zones per bar should compute the
+                         bias once per bar and pass it here instead of letting
+                         every zone recompute the same structure scan.
 
     Returns:
         EntrySignal — valid=True with direction, sl, tp, tp_mode, and pattern.
     """
     # Gate 0: directional bias filter (D1 / H4 / H1 structure).
-    if df_d1 is not None and df_h4 is not None:
+    if precomputed_bias is not None:
+        bias = precomputed_bias
+    elif df_d1 is not None and df_h4 is not None:
         _h1 = df_h1 if df_h1 is not None else pd.DataFrame()
         bias = get_aligned_bias(df_d1, df_h4, _h1, cfg)
+    else:
+        bias = None
+
+    if bias is not None:
         required_bias = "up" if zone.kind == "support" else "down"
         if bias == "sideways":
             if not cfg.allow_sideways_trades:
@@ -187,8 +215,12 @@ def evaluate_entry(
     if not is_rejection_touch(bar_high, bar_low, bar_close, zone):
         return EntrySignal(valid=False, reason="waiting_for_close_outside_zone")
 
-    # Gate 3: touch-count filter.
-    live_count = tracker.record_touch(zone)
+    # Gate 3: touch-count filter. The engine's per-bar pass already recorded
+    # THIS bar's touch (if any) for THIS zone before evaluate_entry was ever
+    # called — this only READS the count, it never increments it. live_count
+    # == 1 here means "1 historical strong-grading rejection + this live
+    # touch" == the guide's "2nd touch" == TAKE.
+    live_count = tracker.get_count(zone)
     if live_count > cfg.max_live_touches_entry:
         reason = "skip_3rd_touch" if live_count == 2 else "breakout_expected_4th_plus"
         return EntrySignal(valid=False, reason=reason)
@@ -196,12 +228,19 @@ def evaluate_entry(
     # Gate 4: direction from zone kind.
     direction = "buy" if zone.kind == "support" else "sell"
 
-    # Gate 5: reversal confirmation on the entry TF.
+    # Gate 5: SRR/RSS "secret pattern" (SOP 3) — liquidity sweep of prior
+    # swing levels before the reversal back into the zone. Disabled via
+    # cfg.secret_pattern_enabled reproduces pre-SOP-3 behaviour exactly.
+    if cfg.secret_pattern_enabled:
+        if not check_secret_pattern(df_entry_tf, direction, zone, cfg):
+            return EntrySignal(valid=False, reason="no_secret_pattern")
+
+    # Gate 6: reversal confirmation on the entry TF.
     conf: ConfirmationResult = check_confirmation(df_entry_tf, direction, cfg)
     if not conf.valid:
         return EntrySignal(valid=False, reason="no_confirmation_pattern")
 
-    # Gate 6: SL = beyond the wick tip with a small percentage buffer.
+    # Gate 7: SL = beyond the wick tip with a small percentage buffer.
     if direction == "buy":
         sl = zone.bottom * (1.0 - cfg.sl_buffer_pct)
     else:
@@ -211,7 +250,7 @@ def evaluate_entry(
     if sl_dist == 0:
         return EntrySignal(valid=False, reason="zero_sl_dist")
 
-    # Gate 7: TP from nearest opposing zone (or fallback R:R).
+    # Gate 8: TP from nearest opposing zone (or fallback R:R).
     tp, tp_mode = find_tp_zone(bar_close, direction, opposing_zones, sl_dist, cfg)
 
     rr = abs(tp - bar_close) / sl_dist
@@ -226,4 +265,5 @@ def evaluate_entry(
         tp_mode=tp_mode,
         pattern=conf.pattern,
         reason="entry_confirmed",
+        live_count=live_count,
     )

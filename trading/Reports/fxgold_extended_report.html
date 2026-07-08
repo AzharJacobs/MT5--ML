@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FXGold Extended Backtest Report</title>
+<style>
+:root {
+  --bg:#111110; --panel:#191816; --line:#2a2825;
+  --text:#e8e4dc; --dim:#8f8a80; --gold:#d9a441;
+  --green:#5fbf7a; --red:#e2685f;
+  font-size:15px;
+}
+* { box-sizing:border-box; margin:0; }
+body { background:var(--bg); color:var(--text);
+  font:400 1rem/1.5 "Segoe UI",system-ui,sans-serif; padding:40px 16px; }
+.wrap { max-width:1100px; margin:0 auto; }
+.eyebrow { color:var(--gold); letter-spacing:.14em; font-size:.72rem; font-weight:600; }
+h1 { font-size:2rem; margin:6px 0 4px; }
+h2 { font-size:1.05rem; }
+h3 { font-size:.85rem; color:var(--gold); margin:0 0 8px; letter-spacing:.04em; }
+.meta { color:var(--dim); font-size:.85rem; border-bottom:1px solid var(--line);
+  padding-bottom:18px; margin-bottom:24px; }
+.meta b { color:var(--text); font-weight:600; }
+
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:24px; }
+.card { background:var(--panel); padding:16px 18px; border-right:1px solid var(--line); }
+.card:last-child { border-right:0; }
+.card .lbl { color:var(--dim); font-size:.68rem; letter-spacing:.1em; }
+.card .val { font-size:1.35rem; font-weight:700; margin-top:4px; }
+.pos { color:var(--green); } .neg { color:var(--red); }
+
+.section { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:18px; margin-bottom:20px; }
+.section .lbl { color:var(--dim); font-size:.68rem; letter-spacing:.1em; margin-bottom:14px;
+  text-transform:uppercase; }
+
+.chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:26px; }
+.chip { color:var(--dim); text-decoration:none; font-size:.75rem;
+  border:1px solid var(--line); border-radius:6px; padding:4px 10px; }
+.chip.has { color:var(--text); border-color:var(--gold); }
+
+.month { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:18px; margin-bottom:14px; }
+.mh { display:flex; justify-content:space-between; align-items:baseline;
+  flex-wrap:wrap; gap:8px; }
+.mstats { color:var(--dim); font-size:.8rem; }
+
+.tbl { overflow-x:auto; margin-top:12px; }
+table { border-collapse:collapse; width:100%; font-size:.76rem; white-space:nowrap; }
+th { color:var(--dim); font-size:.63rem; letter-spacing:.06em; text-align:left;
+  padding:6px 10px; border-bottom:1px solid var(--line); }
+td { padding:7px 10px; border-bottom:1px solid var(--line); }
+tr:last-child td { border-bottom:0; }
+td.buy { color:var(--green); } td.sell { color:var(--red); }
+td.d { font-weight:600; }
+.empty { color:var(--dim); font-style:italic; }
+
+.bar-cell { width:200px; }
+.bar-track { background:var(--line); border-radius:4px; height:10px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:4px; }
+.bar-fill.gate-block { background:var(--red); }
+.bar-fill.gate-pass  { background:var(--green); }
+
+.reasons-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; }
+.reason-block table { font-size:.72rem; }
+</style></head><body><div class="wrap">
+<div class="eyebrow">ZONE-TO-ZONE · XAUUSD · PDF-SPEC BACKTEST</div>
+<h1>FXGold Extended Backtest Report</h1>
+<div class="meta">2020-01-01 &rarr; 2024-12-31 &middot; Start cash <b>$150.00</b> &middot; Warmup from <b>2019-07-01</b> &middot; data source <b>mt5</b> &middot; fixed lot <b>0.01</b> &middot; bias_mode <b>loose</b> &middot; d1_bias_method <b>ema</b> &middot; tf <b>1D/4H/1H</b></div>
+
+<div class="cards">
+  <div class="card"><div class="lbl">START EQUITY</div><div class="val">$150.00</div></div>
+  <div class="card"><div class="lbl">FINAL EQUITY</div><div class="val">$66.22</div></div>
+  <div class="card"><div class="lbl">NET PNL</div><div class="val neg">-83.78</div></div>
+  <div class="card"><div class="lbl">TRADES</div><div class="val">20</div></div>
+  <div class="card"><div class="lbl">WIN RATE</div><div class="val">15.0%</div></div>
+  <div class="card"><div class="lbl">PROFIT FACTOR</div><div class="val">0.42</div></div>
+  <div class="card"><div class="lbl">MAX DRAWDOWN</div><div class="val neg">-79.78%</div></div>
+</div>
+
+<div class="section"><div class="lbl">Per-year summary</div><table><thead><tr><th>YEAR</th><th>TRADES</th><th>WINS</th><th>WR</th><th>PF</th><th>MAX DD</th><th>NET PNL</th><th>EQUITY</th></tr></thead><tbody><tr><td class='d'>2020</td><td>0</td><td>0</td><td>0.0%</td><td>&mdash;</td><td class='neg'>0.00%</td><td class='pos'>+0.00</td><td>$150.00 &rarr; $150.00</td></tr><tr><td class='d'>2021</td><td>6</td><td>1</td><td>16.7%</td><td>0.21</td><td class='neg'>-21.88%</td><td class='neg'>-27.13</td><td>$150.00 &rarr; $122.87</td></tr><tr><td class='d'>2022</td><td>6</td><td>0</td><td>0.0%</td><td>0.00</td><td class='neg'>-50.17%</td><td class='neg'>-44.49</td><td>$122.87 &rarr; $78.38</td></tr><tr><td class='d'>2023</td><td>3</td><td>0</td><td>0.0%</td><td>0.00</td><td class='neg'>-62.59%</td><td class='neg'>-19.54</td><td>$78.38 &rarr; $58.84</td></tr><tr><td class='d'>2024</td><td>5</td><td>2</td><td>40.0%</td><td>1.16</td><td class='neg'>-79.78%</td><td class='pos'>+7.38</td><td>$58.84 &rarr; $66.22</td></tr></tbody></table></div>
+
+<div class="section"><div class="lbl">Gate attrition funnel &mdash; 4,591 candidate touches
+  (334,877 total evaluate_entry() calls, 330,286 not a touch this bar)</div><table><thead><tr><th>GATE</th><th>COUNT</th><th>% OF CANDIDATE TOUCHES</th><th>&nbsp;</th></tr></thead><tbody><tr><td class='d'>Bias (D1/H4 alignment)</td><td>2,762</td><td>60.2%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-block' style='width:60.2%'></div></div></td></tr><tr><td class='d'>Touch count</td><td>1,449</td><td>31.6%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-block' style='width:31.6%'></div></div></td></tr><tr><td class='d'>Secret pattern (SOP 3)</td><td>202</td><td>4.4%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-block' style='width:4.4%'></div></div></td></tr><tr><td class='d'>Candlestick confirmation</td><td>131</td><td>2.9%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-block' style='width:2.9%'></div></div></td></tr><tr><td class='d'>SL geometry</td><td>0</td><td>0.0%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-block' style='width:1.0%'></div></div></td></tr><tr><td class='d'>Min R:R</td><td>27</td><td>0.6%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-block' style='width:1.0%'></div></div></td></tr><tr><td class='d'>Entry confirmed (trade taken)</td><td>20</td><td>0.4%</td><td class='bar-cell'><div class='bar-track'><div class='bar-fill gate-pass' style='width:1.0%'></div></div></td></tr></tbody></table></div>
+
+<div class="section"><div class="lbl">Reasons blocked, per gate</div>
+  <div class="reasons-grid"><div class='reason-block'><h3>Bias (D1/H4 alignment)</h3><table><thead><tr><th>REASON</th><th>COUNT</th></tr></thead><tbody><tr><td>bias_up_not_aligned</td><td>1,010</td></tr><tr><td>bias_sideways_not_allowed</td><td>890</td></tr><tr><td>bias_down_not_aligned</td><td>862</td></tr></tbody></table></div><div class='reason-block'><h3>Touch count</h3><table><thead><tr><th>REASON</th><th>COUNT</th></tr></thead><tbody><tr><td>breakout_expected_4th_plus</td><td>1,142</td></tr><tr><td>skip_3rd_touch</td><td>307</td></tr></tbody></table></div><div class='reason-block'><h3>Secret pattern (SOP 3)</h3><table><thead><tr><th>REASON</th><th>COUNT</th></tr></thead><tbody><tr><td>no_secret_pattern</td><td>202</td></tr></tbody></table></div><div class='reason-block'><h3>Candlestick confirmation</h3><table><thead><tr><th>REASON</th><th>COUNT</th></tr></thead><tbody><tr><td>no_confirmation_pattern</td><td>131</td></tr></tbody></table></div><div class='reason-block'><h3>Min R:R</h3><table><thead><tr><th>REASON</th><th>COUNT</th></tr></thead><tbody><tr><td>sub_min_rr_0.21</td><td>2</td></tr><tr><td>sub_min_rr_0.47</td><td>2</td></tr><tr><td>sub_min_rr_1.23</td><td>2</td></tr><tr><td>sub_min_rr_0.35</td><td>2</td></tr><tr><td>sub_min_rr_0.06</td><td>1</td></tr><tr><td>sub_min_rr_0.64</td><td>1</td></tr><tr><td>sub_min_rr_0.11</td><td>1</td></tr><tr><td>sub_min_rr_0.70</td><td>1</td></tr><tr><td>sub_min_rr_0.97</td><td>1</td></tr><tr><td>sub_min_rr_0.76</td><td>1</td></tr><tr><td>sub_min_rr_0.85</td><td>1</td></tr><tr><td>sub_min_rr_1.07</td><td>1</td></tr><tr><td>sub_min_rr_1.16</td><td>1</td></tr><tr><td>sub_min_rr_1.04</td><td>1</td></tr><tr><td>sub_min_rr_0.37</td><td>1</td></tr><tr><td>sub_min_rr_1.42</td><td>1</td></tr><tr><td>sub_min_rr_0.16</td><td>1</td></tr><tr><td>sub_min_rr_0.10</td><td>1</td></tr><tr><td>sub_min_rr_1.48</td><td>1</td></tr><tr><td>sub_min_rr_1.27</td><td>1</td></tr><tr><td>sub_min_rr_0.89</td><td>1</td></tr><tr><td>sub_min_rr_0.44</td><td>1</td></tr><tr><td>sub_min_rr_1.38</td><td>1</td></tr></tbody></table></div></div>
+</div>
+
+<div class="section"><div class="lbl">TP mode split</div><b>zone</b>: 18 &middot; <b>fallback</b>: 2</div>
+
+<div class="chips"><a class="chip has" href="#y2021">2021</a><a class="chip has" href="#y2022">2022</a><a class="chip has" href="#y2023">2023</a><a class="chip has" href="#y2024">2024</a></div>
+<section class='month' id='y2021'><div class='mh'><h2>2021</h2><div class='mstats'>6 trades &middot; 1/6 won &middot; 17% WR &middot; PnL <b class='neg'>-27.13</b></div></div><div class='tbl'><table><thead><tr><th>ENTRY DATE</th><th>SIDE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>EXIT DATE</th><th>OUTCOME</th><th>PNL</th><th>PATTERN</th><th>TP MODE</th><th>ZONE TF</th><th>ZONE KIND</th><th>ZONE TOP</th><th>ZONE BOT</th><th>ZONE SCORE</th><th>TOUCH #</th><th>D1 BIAS</th><th>H4 BIAS</th></tr></thead><tbody><tr><td class='d'>2021-07-26 07:00</td><td class='sell'>sell</td><td>1,807.76</td><td>1,812.07</td><td>1,800.48</td><td>1,800.48</td><td>2021-07-26 13:00</td><td>TP</td><td class='pos'>+7.28</td><td>pin_bar</td><td>zone</td><td>4H</td><td>resistance</td><td>1,810.26</td><td>1,809.25</td><td>4.00</td><td>1</td><td>down</td><td>down</td></tr><tr><td class='d'>2021-08-02 02:00</td><td class='buy'>buy</td><td>1,812.06</td><td>1,805.90</td><td>1,829.45</td><td>1,805.90</td><td>2021-08-02 12:00</td><td>SL</td><td class='neg'>-6.15</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>1,811.45</td><td>1,807.71</td><td>4.00</td><td>1</td><td>up</td><td>sideways</td></tr><tr><td class='d'>2021-08-23 11:00</td><td class='sell'>sell</td><td>1,790.80</td><td>1,797.31</td><td>1,779.88</td><td>1,797.31</td><td>2021-08-23 12:00</td><td>SL</td><td class='neg'>-6.52</td><td>pin_bar</td><td>zone</td><td>4H</td><td>resistance</td><td>1,795.52</td><td>1,792.87</td><td>5.00</td><td>1</td><td>down</td><td>down</td></tr><tr><td class='d'>2021-09-07 11:00</td><td class='buy'>buy</td><td>1,810.84</td><td>1,802.83</td><td>1,829.26</td><td>1,802.83</td><td>2021-09-07 14:00</td><td>SL</td><td class='neg'>-8.02</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>1,808.91</td><td>1,804.63</td><td>5.00</td><td>1</td><td>up</td><td>up</td></tr><tr><td class='d'>2021-09-22 13:00</td><td class='sell'>sell</td><td>1,774.23</td><td>1,783.39</td><td>1,754.75</td><td>1,783.39</td><td>2021-09-22 18:00</td><td>SL</td><td class='neg'>-9.17</td><td>pin_bar</td><td>zone</td><td>4H</td><td>resistance</td><td>1,781.61</td><td>1,777.37</td><td>6.00</td><td>1</td><td>down</td><td>down</td></tr><tr><td class='d'>2021-09-30 15:00</td><td class='sell'>sell</td><td>1,758.00</td><td>1,762.56</td><td>1,719.05</td><td>1,762.56</td><td>2021-10-01 14:00</td><td>SL</td><td class='neg'>-4.55</td><td>pin_bar</td><td>zone</td><td>4H</td><td>resistance</td><td>1,760.80</td><td>1,759.25</td><td>4.00</td><td>1</td><td>down</td><td>down</td></tr></tbody></table></div></section><section class='month' id='y2022'><div class='mh'><h2>2022</h2><div class='mstats'>6 trades &middot; 0/6 won &middot; 0% WR &middot; PnL <b class='neg'>-44.49</b></div></div><div class='tbl'><table><thead><tr><th>ENTRY DATE</th><th>SIDE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>EXIT DATE</th><th>OUTCOME</th><th>PNL</th><th>PATTERN</th><th>TP MODE</th><th>ZONE TF</th><th>ZONE KIND</th><th>ZONE TOP</th><th>ZONE BOT</th><th>ZONE SCORE</th><th>TOUCH #</th><th>D1 BIAS</th><th>H4 BIAS</th></tr></thead><tbody><tr><td class='d'>2022-01-06 06:00</td><td class='buy'>buy</td><td>1,801.96</td><td>1,796.51</td><td>1,830.62</td><td>1,796.51</td><td>2022-01-06 08:00</td><td>SL</td><td class='neg'>-5.45</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>1,801.65</td><td>1,798.30</td><td>5.00</td><td>1</td><td>up</td><td>up</td></tr><tr><td class='d'>2022-01-06 10:00</td><td class='buy'>buy</td><td>1,801.19</td><td>1,787.42</td><td>1,830.62</td><td>1,787.42</td><td>2022-01-06 13:00</td><td>SL</td><td class='neg'>-13.76</td><td>morning_star</td><td>zone</td><td>4H</td><td>support</td><td>1,796.93</td><td>1,789.21</td><td>4.00</td><td>1</td><td>up</td><td>up</td></tr><tr><td class='d'>2022-01-21 20:00</td><td class='buy'>buy</td><td>1,831.84</td><td>1,821.45</td><td>1,862.36</td><td>1,821.45</td><td>2022-01-26 19:00</td><td>SL</td><td class='neg'>-10.39</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>1,829.59</td><td>1,823.27</td><td>4.00</td><td>1</td><td>up</td><td>sideways</td></tr><tr><td class='d'>2022-06-02 14:00</td><td class='sell'>sell</td><td>1,865.43</td><td>1,871.53</td><td>1,829.71</td><td>1,871.53</td><td>2022-06-03 00:00</td><td>SL</td><td class='neg'>-6.10</td><td>pin_bar</td><td>zone</td><td>1D</td><td>resistance</td><td>1,869.66</td><td>1,867.33</td><td>5.00</td><td>1</td><td>down</td><td>down</td></tr><tr><td class='d'>2022-06-13 22:00</td><td class='buy'>buy</td><td>1,821.12</td><td>1,784.59</td><td>1,877.77</td><td>1,821.12</td><td>2022-06-23 08:00</td><td>EXP</td><td class='pos'>+0.00</td><td>pin_bar</td><td>zone</td><td>1D</td><td>support</td><td>1,813.19</td><td>1,786.38</td><td>7.00</td><td>1</td><td>up</td><td>sideways</td></tr><tr><td class='d'>2022-10-23 23:00</td><td class='sell'>sell</td><td>1,661.22</td><td>1,670.01</td><td>1,628.80</td><td>1,670.01</td><td>2022-10-26 07:00</td><td>SL</td><td class='neg'>-8.79</td><td>pin_bar</td><td>zone</td><td>4H</td><td>resistance</td><td>1,668.34</td><td>1,663.28</td><td>4.00</td><td>1</td><td>down</td><td>down</td></tr></tbody></table></div></section><section class='month' id='y2023'><div class='mh'><h2>2023</h2><div class='mstats'>3 trades &middot; 0/3 won &middot; 0% WR &middot; PnL <b class='neg'>-19.54</b></div></div><div class='tbl'><table><thead><tr><th>ENTRY DATE</th><th>SIDE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>EXIT DATE</th><th>OUTCOME</th><th>PNL</th><th>PATTERN</th><th>TP MODE</th><th>ZONE TF</th><th>ZONE KIND</th><th>ZONE TOP</th><th>ZONE BOT</th><th>ZONE SCORE</th><th>TOUCH #</th><th>D1 BIAS</th><th>H4 BIAS</th></tr></thead><tbody><tr><td class='d'>2023-03-22 07:00</td><td class='buy'>buy</td><td>1,939.76</td><td>1,925.26</td><td>2,003.41</td><td>1,939.76</td><td>2023-03-31 14:00</td><td>EXP</td><td class='pos'>+0.00</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>1,937.29</td><td>1,927.18</td><td>4.00</td><td>1</td><td>up</td><td>up</td></tr><tr><td class='d'>2023-10-10 10:00</td><td class='sell'>sell</td><td>1,856.68</td><td>1,866.58</td><td>1,830.54</td><td>1,866.58</td><td>2023-10-11 07:00</td><td>SL</td><td class='neg'>-9.90</td><td>evening_star</td><td>zone</td><td>4H</td><td>resistance</td><td>1,864.72</td><td>1,857.49</td><td>4.00</td><td>1</td><td>down</td><td>down</td></tr><tr><td class='d'>2023-10-31 18:00</td><td class='buy'>buy</td><td>1,984.48</td><td>1,974.84</td><td>2,006.94</td><td>1,974.84</td><td>2023-11-01 16:00</td><td>SL</td><td class='neg'>-9.64</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>1,979.90</td><td>1,976.82</td><td>4.00</td><td>1</td><td>up</td><td>up</td></tr></tbody></table></div></section><section class='month' id='y2024'><div class='mh'><h2>2024</h2><div class='mstats'>5 trades &middot; 2/5 won &middot; 40% WR &middot; PnL <b class='pos'>+7.38</b></div></div><div class='tbl'><table><thead><tr><th>ENTRY DATE</th><th>SIDE</th><th>ENTRY</th><th>SL</th><th>TP</th><th>EXIT</th><th>EXIT DATE</th><th>OUTCOME</th><th>PNL</th><th>PATTERN</th><th>TP MODE</th><th>ZONE TF</th><th>ZONE KIND</th><th>ZONE TOP</th><th>ZONE BOT</th><th>ZONE SCORE</th><th>TOUCH #</th><th>D1 BIAS</th><th>H4 BIAS</th></tr></thead><tbody><tr><td class='d'>2024-07-25 03:00</td><td class='buy'>buy</td><td>2,374.70</td><td>2,358.40</td><td>2,468.27</td><td>2,358.40</td><td>2024-07-25 14:00</td><td>SL</td><td class='neg'>-16.30</td><td>pin_bar</td><td>zone</td><td>1D</td><td>support</td><td>2,368.74</td><td>2,360.76</td><td>5.00</td><td>1</td><td>up</td><td>sideways</td></tr><tr><td class='d'>2024-08-02 15:00</td><td class='buy'>buy</td><td>2,433.07</td><td>2,422.33</td><td>2,468.27</td><td>2,422.33</td><td>2024-08-05 00:00</td><td>SL</td><td class='neg'>-10.74</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>2,431.95</td><td>2,424.76</td><td>4.00</td><td>1</td><td>up</td><td>sideways</td></tr><tr><td class='d'>2024-10-23 15:00</td><td class='buy'>buy</td><td>2,721.69</td><td>2,711.46</td><td>2,742.25</td><td>2,742.25</td><td>2024-10-24 13:00</td><td>TP</td><td class='pos'>+20.56</td><td>pin_bar</td><td>fallback</td><td>4H</td><td>support</td><td>2,719.85</td><td>2,714.18</td><td>4.00</td><td>1</td><td>up</td><td>up</td></tr><tr><td class='d'>2024-10-25 10:00</td><td class='buy'>buy</td><td>2,722.22</td><td>2,705.90</td><td>2,754.86</td><td>2,754.86</td><td>2024-10-29 02:00</td><td>TP</td><td class='pos'>+32.64</td><td>pin_bar</td><td>fallback</td><td>4H</td><td>support</td><td>2,721.73</td><td>2,708.60</td><td>4.00</td><td>1</td><td>up</td><td>sideways</td></tr><tr><td class='d'>2024-12-13 15:00</td><td class='buy'>buy</td><td>2,659.81</td><td>2,641.03</td><td>2,719.76</td><td>2,641.03</td><td>2024-12-17 09:00</td><td>SL</td><td class='neg'>-18.78</td><td>pin_bar</td><td>zone</td><td>4H</td><td>support</td><td>2,655.66</td><td>2,643.67</td><td>4.00</td><td>1</td><td>up</td><td>sideways</td></tr></tbody></table></div></section>
+</div></body></html>

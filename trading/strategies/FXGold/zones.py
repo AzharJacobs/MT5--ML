@@ -100,12 +100,21 @@ def _grade(zones: List[Zone], df: pd.DataFrame, cfg: FXGoldConfig) -> None:
     """
     Scan all bars AFTER each zone's origin candle to count touches and detect
     breakouts. Mutates each Zone in place.
+
+    Reads OHLC once into numpy arrays — this runs on every H4/D1 bar close via
+    detect_zones, and per-scalar df.iloc[i] access here was the dominant cost
+    of a backtest (each pandas scalar lookup is ~100x a numpy array index).
     """
+    highs  = df["high"].to_numpy()
+    lows   = df["low"].to_numpy()
+    closes = df["close"].to_numpy()
+    n = len(df)
+
     for zone in zones:
-        for i in range(zone.bar_index + 1, len(df)):
-            bh = float(df["high"].iloc[i])
-            bl = float(df["low"].iloc[i])
-            bc = float(df["close"].iloc[i])
+        for i in range(zone.bar_index + 1, n):
+            bh = float(highs[i])
+            bl = float(lows[i])
+            bc = float(closes[i])
 
             if is_breakout(bc, zone):
                 if zone.flipped:                  # single-flip guard: second breakout kills zone

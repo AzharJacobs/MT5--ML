@@ -1,0 +1,2 @@
+date,exit_date,side,entry,sl,tp,exit,outcome,lot,pnl,equity,pattern,tp_mode,zone_tf,zone_kind,zone_top,zone_bottom,zone_score
+2024-10-23 15:00:00,2024-10-24 13:00:00,buy,2721.69,2711.46,2742.25,2742.25,1,0.01,20.56,170.56,pin_bar,fallback,4H,support,2719.85,2714.18,4.0
