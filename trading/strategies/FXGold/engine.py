@@ -288,26 +288,58 @@ def run_backtest(
             if not signal.valid:
                 continue
 
-            # Enter at next H1 bar's open
-            entry     = float(df_h1["open"].iloc[i + 1])
-            sl        = signal.sl
-            tp        = signal.tp
             direction = signal.direction
+            sl, tp    = signal.sl, signal.tp
 
-            # Simulate forward bar-by-bar
-            outcome     = 0
-            exit_price  = entry
-            exit_bar    = i + cfg.max_forward_bars
+            if cfg.entry_mode == "pullback":
+                limit        = signal.limit_price
+                filled       = False
+                fill_bar     = None
+                last_checked = i
+                for j in range(i + 1, min(i + 1 + cfg.pullback_max_wait_bars, n)):
+                    last_checked = j
+                    fh = float(df_h1["high"].iloc[j])
+                    fl = float(df_h1["low"].iloc[j])
+                    fc = float(df_h1["close"].iloc[j])
+                    # cancel if a body closes through the zone (breakout = zone invalid)
+                    if (direction == "buy" and fc < zone.bottom) or \
+                       (direction == "sell" and fc > zone.top):
+                        skip_until = j
+                        break
+                    if (direction == "buy" and fl <= limit) or \
+                       (direction == "sell" and fh >= limit):
+                        filled, fill_bar = True, j
+                        break
+                if not filled:
+                    skip_until = max(skip_until, last_checked)
+                    break   # exit zone loop; no trade this signal
+                entry     = limit
+                sim_start = fill_bar
+                # same-bar ambiguity: if the fill bar also pierced SL, assume worst case
+                same_bar_sl = (direction == "buy"  and float(df_h1["low"].iloc[fill_bar])  <= sl) or \
+                              (direction == "sell" and float(df_h1["high"].iloc[fill_bar]) >= sl)
+                if same_bar_sl:
+                    outcome, exit_price, exit_bar = -1, sl, fill_bar
+            else:
+                entry       = float(df_h1["open"].iloc[i + 1])
+                sim_start   = i + 1
+                same_bar_sl = False
 
-            for j in range(i + 1, min(i + 1 + cfg.max_forward_bars, n)):
-                fh = float(df_h1["high"].iloc[j])
-                fl = float(df_h1["low"].iloc[j])
-                if direction == "buy":
-                    if fh >= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                    if fl <= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
-                else:
-                    if fl <= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
-                    if fh >= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
+            # Simulate forward bar-by-bar (skipped if same-bar SL already resolved the trade)
+            if not same_bar_sl:
+                outcome     = 0
+                exit_price  = entry
+                exit_bar    = sim_start + cfg.max_forward_bars - 1
+
+                for j in range(sim_start, min(sim_start + cfg.max_forward_bars, n)):
+                    fh = float(df_h1["high"].iloc[j])
+                    fl = float(df_h1["low"].iloc[j])
+                    if direction == "buy":
+                        if fh >= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
+                        if fl <= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
+                    else:
+                        if fl <= tp:  outcome =  1; exit_price = tp; exit_bar = j; break
+                        if fh >= sl:  outcome = -1; exit_price = sl; exit_bar = j; break
 
             if direction == "buy":
                 pnl = (exit_price - entry) * fixed_lot * _CONTRACT

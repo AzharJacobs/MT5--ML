@@ -61,6 +61,10 @@ class FXGoldConfig:
     secret_pattern_fractal_window: int  = 3    # pivot window used for the sweep scan (smaller/tighter than fractal_window)
     secret_pattern_min_breakouts:  int  = 2    # consecutive prior swing levels that must be swept before the reversal
 
+    # ─── SOP 4: pullback entry ────────────────────────────────────────────────
+    entry_mode: str = "pullback"        # "pullback" = wait for retrace to zone edge; "market" = old next-bar-open
+    pullback_max_wait_bars: int = 12    # entry-TF bars to wait for the pullback before cancelling
+
     # ─── Engine / backtest ────────────────────────────────────────────────────
     # Window sizes carry the SAME calendar span as the pre-PDF low-TF config
     # (see FXGoldConfigLowTF below) — only the bar size changed, so bar counts

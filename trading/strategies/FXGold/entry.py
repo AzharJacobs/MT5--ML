@@ -52,6 +52,7 @@ class EntrySignal:
     pattern: Optional[str] = None     # confirmation pattern name
     reason: str = ""                  # acceptance or rejection reason
     live_count: Optional[int] = None  # live touch count at Gate 3 (see TouchTracker)
+    limit_price: Optional[float] = None   # SOP 4: zone-edge entry level
 
 
 # ─── Touch tracker ────────────────────────────────────────────────────────────
@@ -246,14 +247,18 @@ def evaluate_entry(
     else:
         sl = zone.top * (1.0 + cfg.sl_buffer_pct)
 
-    sl_dist = abs(bar_close - sl)
+    # SOP 4: entry at the SNR edge, not at current close
+    limit_price = zone.top if direction == "buy" else zone.bottom
+
+    signal_price = limit_price if cfg.entry_mode == "pullback" else bar_close
+    sl_dist = abs(signal_price - sl)
     if sl_dist == 0:
         return EntrySignal(valid=False, reason="zero_sl_dist")
 
     # Gate 8: TP from nearest opposing zone (or fallback R:R).
-    tp, tp_mode = find_tp_zone(bar_close, direction, opposing_zones, sl_dist, cfg)
+    tp, tp_mode = find_tp_zone(signal_price, direction, opposing_zones, sl_dist, cfg)
 
-    rr = abs(tp - bar_close) / sl_dist
+    rr = abs(tp - signal_price) / sl_dist
     if rr < cfg.min_rr:
         return EntrySignal(valid=False, reason=f"sub_min_rr_{rr:.2f}")
 
@@ -266,4 +271,5 @@ def evaluate_entry(
         pattern=conf.pattern,
         reason="entry_confirmed",
         live_count=live_count,
+        limit_price=round(limit_price, 5),
     )
